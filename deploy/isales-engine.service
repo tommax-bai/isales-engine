@@ -1,0 +1,32 @@
+[Unit]
+Description=isales-engine — real-time call engine
+After=network.target postgresql.service redis.service
+
+[Service]
+Type=simple
+ExecStart=/opt/isales-engine/.venv/bin/isales-engine
+Restart=on-failure
+RestartSec=5
+# Match ISALES_ENGINE_GRACEFUL_SHUTDOWN_TIMEOUT_S in app config (default 30s)
+# plus a small head room so systemd doesn't kill mid-finalize.
+TimeoutStopSec=35
+EnvironmentFile=/etc/isales/engine.env
+User=isales
+Group=isales
+WorkingDirectory=/opt/isales-engine
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
