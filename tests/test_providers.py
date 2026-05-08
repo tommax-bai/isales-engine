@@ -35,7 +35,7 @@ def test_factory_rejects_real_providers_without_credentials() -> None:
     with pytest.raises(NotImplementedError):
         build_llm("openai", settings=empty)
     with pytest.raises(NotImplementedError):
-        build_asr("volcengine")
+        build_asr("volcengine", settings=empty)
     with pytest.raises(NotImplementedError):
         build_tts("alibaba")
 

@@ -157,9 +157,31 @@ def test_build_asr_mock_works() -> None:
     assert build_asr("mock") is not None
 
 
-def test_build_asr_volcengine_signals_pending_pr() -> None:
-    with pytest.raises(NotImplementedError, match="PR #4"):
-        build_asr("volcengine")
+def test_build_asr_volcengine_requires_credentials() -> None:
+    """PR #4 wired the real provider; missing credentials still raises NotImplementedError."""
+
+    from isales_engine.settings import Settings
+
+    empty = Settings(
+        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
+        ISALES_REDIS_URL="redis://localhost:6379/0",
+    )
+    with pytest.raises(NotImplementedError, match="VOLCENGINE_APP_KEY"):
+        build_asr("volcengine", settings=empty)
+
+
+def test_build_asr_volcengine_with_credentials() -> None:
+    from isales_engine.providers.asr_volcengine import VolcengineASRProvider
+    from isales_engine.settings import Settings
+
+    s = Settings(
+        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
+        ISALES_REDIS_URL="redis://localhost:6379/0",
+        ISALES_VOLCENGINE_APP_KEY="k",
+        ISALES_VOLCENGINE_APP_TOKEN="t",
+    )
+    provider = build_asr("volcengine", settings=s)
+    assert isinstance(provider, VolcengineASRProvider)
 
 
 def test_build_tts_volcengine_requires_credentials() -> None:

@@ -80,17 +80,29 @@ def build_llm(
     )
 
 
-def build_asr(name: str) -> ASRProvider:
+def build_asr(name: str, *, settings: Settings | None = None) -> ASRProvider:
     if name == "mock":
         return ScriptedMockASR()
-    if name == "volcengine":
+    if name not in KNOWN_ASR_PROVIDERS:
         raise NotImplementedError(
-            "ASR provider 'volcengine' not yet wired — see "
-            "impl-engine-providers PR #4"
+            f"ASR provider {name!r} not supported (known: {sorted(KNOWN_ASR_PROVIDERS)})"
         )
-    raise NotImplementedError(
-        f"ASR provider {name!r} not supported (known: {sorted(KNOWN_ASR_PROVIDERS)})"
-    )
+    if settings is None:
+        settings = Settings()
+    if name == "volcengine":
+        if not (settings.volcengine_app_key and settings.volcengine_app_token):
+            raise NotImplementedError(
+                "ASR provider 'volcengine' requires "
+                "ISALES_VOLCENGINE_APP_KEY + ISALES_VOLCENGINE_APP_TOKEN"
+            )
+        from isales_engine.providers.asr_volcengine import VolcengineASRProvider
+
+        return VolcengineASRProvider(
+            endpoint=settings.volcengine_asr_endpoint,
+            app_key=settings.volcengine_app_key,
+            app_token=settings.volcengine_app_token,
+        )
+    raise NotImplementedError(name)
 
 
 def build_tts(name: str, *, settings: Settings | None = None) -> TTSProvider:
