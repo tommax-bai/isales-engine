@@ -39,6 +39,48 @@ class Settings(BaseSettings):
         default="isales:concurrency:active", alias="ISALES_ENGINE_CONCURRENCY_KEY"
     )
 
+    # ---- impl-engine-providers (stage 5) --------------------------------
+
+    # Token budget per call: emit a WARN log when exceeded. Hook for a
+    # future EngineEvent.TokenBudgetExceeded notification (out of scope for
+    # this change).
+    engine_token_budget_per_call: int = Field(
+        default=50_000, alias="ISALES_ENGINE_TOKEN_BUDGET_PER_CALL"
+    )
+
+    # Volcengine (火山引擎) shared credentials for ASR / TTS / LLM (豆包).
+    volcengine_app_key: str | None = Field(
+        default=None, alias="ISALES_VOLCENGINE_APP_KEY"
+    )
+    volcengine_app_token: str | None = Field(
+        default=None, alias="ISALES_VOLCENGINE_APP_TOKEN"
+    )
+    volcengine_llm_model: str = Field(
+        default="doubao-pro-32k", alias="ISALES_VOLCENGINE_LLM_MODEL"
+    )
+    volcengine_asr_endpoint: str = Field(
+        default="wss://openspeech.bytedance.com/api/v3/asr",
+        alias="ISALES_VOLCENGINE_ASR_ENDPOINT",
+    )
+    volcengine_tts_voice_id_default: str = Field(
+        default="BV001_streaming", alias="ISALES_VOLCENGINE_TTS_VOICE_ID_DEFAULT"
+    )
+
+    # OpenAI (chat completions; supports OpenAI-compatible base URLs incl.
+    # Azure OpenAI / 第三方兼容服务).
+    openai_api_key: str | None = Field(default=None, alias="ISALES_OPENAI_API_KEY")
+    openai_base_url: str = Field(
+        default="https://api.openai.com/v1", alias="ISALES_OPENAI_BASE_URL"
+    )
+    openai_llm_model: str = Field(
+        default="gpt-4o-mini", alias="ISALES_OPENAI_LLM_MODEL"
+    )
+
+    # Live-API integration tests opt-in. CI must NOT set this.
+    live_provider_tests: bool = Field(
+        default=False, alias="ISALES_LIVE_PROVIDER_TESTS"
+    )
+
 
 def load_settings() -> Settings:
     return Settings()
