@@ -17,7 +17,11 @@ from isales_common.providers.tts import TTSProvider
 
 from isales_engine.providers.asr_mock import ScriptedMockASR
 from isales_engine.providers.llm_mock import KeywordDrivenMockLLM
+from isales_engine.providers.llm_openai_compatible import (
+    OpenAICompatibleLLMProvider,
+)
 from isales_engine.providers.tts_mock import TextLengthMockTTS
+from isales_engine.settings import Settings
 
 # Provider names known to the factory. Adding a new vendor MUST update this
 # constant + the corresponding build_* branch + the impl-engine-providers
@@ -27,24 +31,49 @@ KNOWN_ASR_PROVIDERS: frozenset[str] = frozenset({"mock", "volcengine"})
 KNOWN_TTS_PROVIDERS: frozenset[str] = frozenset({"mock", "volcengine"})
 
 
-def build_llm(name: str, *, model: str | None = None) -> LLMProvider:
+def build_llm(
+    name: str,
+    *,
+    model: str | None = None,
+    settings: Settings | None = None,
+) -> LLMProvider:
     """Return a LLM provider instance.
 
-    ``model`` is currently advisory — real implementations will use it to
-    select the vendor-specific endpoint / payload (PR #8 of
-    impl-engine-providers). The mock provider ignores it.
+    ``model`` overrides the env-configured default model when provided
+    (used for Campaign-level model selection — PR #8). When ``settings``
+    is omitted the factory loads it once from env; tests can pass an
+    explicit ``Settings`` to avoid env contamination.
     """
 
     if name == "mock":
         return KeywordDrivenMockLLM()
-    if name == "volcengine":
+    if name not in KNOWN_LLM_PROVIDERS:
         raise NotImplementedError(
-            "LLM provider 'volcengine' not yet wired — see "
-            "impl-engine-providers PR #2"
+            f"LLM provider {name!r} not supported (known: {sorted(KNOWN_LLM_PROVIDERS)})"
+        )
+    if settings is None:
+        settings = Settings()
+    if name == "volcengine":
+        if not settings.volcengine_app_token:
+            raise NotImplementedError(
+                "LLM provider 'volcengine' requires ISALES_VOLCENGINE_APP_TOKEN"
+            )
+        return OpenAICompatibleLLMProvider(
+            provider="volcengine",
+            api_key=settings.volcengine_app_token,
+            base_url="https://ark.cn-beijing.volces.com/api/v3",
+            model=model or settings.volcengine_llm_model,
         )
     if name == "openai":
-        raise NotImplementedError(
-            "LLM provider 'openai' not yet wired — see impl-engine-providers PR #3"
+        if not settings.openai_api_key:
+            raise NotImplementedError(
+                "LLM provider 'openai' requires ISALES_OPENAI_API_KEY"
+            )
+        return OpenAICompatibleLLMProvider(
+            provider="openai",
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url,
+            model=model or settings.openai_llm_model,
         )
     raise NotImplementedError(
         f"LLM provider {name!r} not supported (known: {sorted(KNOWN_LLM_PROVIDERS)})"

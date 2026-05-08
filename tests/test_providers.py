@@ -22,9 +22,18 @@ def test_factory_returns_mock_implementations() -> None:
     assert isinstance(build_tts("mock"), TextLengthMockTTS)
 
 
-def test_factory_rejects_real_providers_until_stage5() -> None:
+def test_factory_rejects_real_providers_without_credentials() -> None:
+    """LLM real providers raise NotImplementedError when credentials are
+    missing (PR #1 wired the stub; PR #2/#3 added real impls)."""
+
+    from isales_engine.settings import Settings
+
+    empty = Settings(
+        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
+        ISALES_REDIS_URL="redis://localhost:6379/0",
+    )
     with pytest.raises(NotImplementedError):
-        build_llm("openai")
+        build_llm("openai", settings=empty)
     with pytest.raises(NotImplementedError):
         build_asr("volcengine")
     with pytest.raises(NotImplementedError):

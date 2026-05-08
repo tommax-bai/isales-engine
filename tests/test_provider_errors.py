@@ -96,11 +96,61 @@ def test_build_llm_mock_works() -> None:
     assert isinstance(build_llm("mock"), KeywordDrivenMockLLM)
 
 
-def test_build_llm_real_providers_signal_pending_pr() -> None:
-    with pytest.raises(NotImplementedError, match="PR #2"):
-        build_llm("volcengine")
-    with pytest.raises(NotImplementedError, match="PR #3"):
-        build_llm("openai")
+def test_build_llm_real_providers_require_credentials() -> None:
+    from isales_engine.settings import Settings
+
+    empty = Settings(
+        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
+        ISALES_REDIS_URL="redis://localhost:6379/0",
+    )
+    with pytest.raises(NotImplementedError, match="VOLCENGINE_APP_TOKEN"):
+        build_llm("volcengine", settings=empty)
+    with pytest.raises(NotImplementedError, match="OPENAI_API_KEY"):
+        build_llm("openai", settings=empty)
+
+
+def test_build_llm_volcengine_with_credentials() -> None:
+    from isales_engine.providers.llm_openai_compatible import (
+        OpenAICompatibleLLMProvider,
+    )
+    from isales_engine.settings import Settings
+
+    s = Settings(
+        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
+        ISALES_REDIS_URL="redis://localhost:6379/0",
+        ISALES_VOLCENGINE_APP_TOKEN="t",
+    )
+    provider = build_llm("volcengine", settings=s)
+    assert isinstance(provider, OpenAICompatibleLLMProvider)
+
+
+def test_build_llm_openai_with_credentials() -> None:
+    from isales_engine.providers.llm_openai_compatible import (
+        OpenAICompatibleLLMProvider,
+    )
+    from isales_engine.settings import Settings
+
+    s = Settings(
+        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
+        ISALES_REDIS_URL="redis://localhost:6379/0",
+        ISALES_OPENAI_API_KEY="sk-x",
+    )
+    provider = build_llm("openai", settings=s)
+    assert isinstance(provider, OpenAICompatibleLLMProvider)
+
+
+def test_build_llm_with_explicit_model_override() -> None:
+    """PR #8 use-case: Campaign-level model selection."""
+
+    from isales_engine.settings import Settings
+
+    s = Settings(
+        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
+        ISALES_REDIS_URL="redis://localhost:6379/0",
+        ISALES_OPENAI_API_KEY="sk-x",
+    )
+    provider = build_llm("openai", model="gpt-4o", settings=s)
+    assert provider._model == "gpt-4o"  # type: ignore[attr-defined]
 
 
 def test_build_asr_mock_works() -> None:
