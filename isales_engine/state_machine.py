@@ -43,6 +43,10 @@ LEGAL_TRANSITIONS: dict[CallState, set[CallState]] = {
         CallState.ACTIVATING,
         CallState.TRANSFERRING,
         CallState.WRAPPING_UP,  # rare: explicit goal_achieved before any user speech
+        # SPEAKING reachable from LISTENING for listen_only continuous-
+        # interruption protection (AI plays a cue without going through
+        # PROCESSING).
+        CallState.SPEAKING,
         CallState.END,
     },
     CallState.SPEAKING: {
@@ -54,6 +58,9 @@ LEGAL_TRANSITIONS: dict[CallState, set[CallState]] = {
     },
     CallState.INTERRUPTED: {
         CallState.PROCESSING,
+        # SPEAKING reachable from INTERRUPTED for the "listen_only" continuous-
+        # interruption protection: AI plays a short prompt before yielding.
+        CallState.SPEAKING,
         CallState.END,
     },
     CallState.FILLER: {

@@ -51,6 +51,12 @@ class RuntimeConfig:
     voice_id: str
     fixed_greeting: str | None
     max_no_progress_seconds: int | None
+    # Continuous-interruption protection (ai-pipeline spec delta). Read by
+    # run_loop._decide_protection. Stored at RuntimeConfig level (not on
+    # InterruptionConfig) because the strategy is a campaign-level policy,
+    # not a detector parameter.
+    _max_continuous_interruptions: int = 3
+    _continuous_interruption_strategy: str = "short_reply"
 
 
 async def load_runtime_config(
@@ -240,6 +246,12 @@ async def load_runtime_config(
     # has no greeting columns at v0.1.2).
     fixed_greeting: str | None = None
 
+    strategy_value = (
+        campaign.continuous_interruption_strategy
+        if isinstance(campaign.continuous_interruption_strategy, str)
+        else campaign.continuous_interruption_strategy.value
+    )
+
     return RuntimeConfig(
         pipeline=pipeline,
         fillers=fillers,
@@ -250,4 +262,6 @@ async def load_runtime_config(
         voice_id="default",
         fixed_greeting=fixed_greeting,
         max_no_progress_seconds=campaign.max_no_progress_seconds,
+        _max_continuous_interruptions=campaign.max_continuous_interruptions,
+        _continuous_interruption_strategy=strategy_value,
     )

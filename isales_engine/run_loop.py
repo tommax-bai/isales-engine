@@ -3,20 +3,19 @@
 Spec: cross-cut — wires state machine + pipeline + filler + transfer + wrap-up
 + silence + telephony + event publishing into a single async loop.
 
-Stage-4 scope notes (read me before extending):
+Stage-5 (impl-engine-providers PR #6) added:
 
-* The "real-time interruption during SPEAKING" path requires monitoring ASR
-  partials concurrently with TTS playback; this stage 4 implementation
-  performs a *post-speaking* check (the user can interrupt during LISTENING
-  but the in-flight TTS is not preempted by mid-speech). Stage-5/6 work
-  re-enables the parallel partial monitor by spawning an audio_in→ASR
-  consumer task while ``audio_out`` runs.
-* Same caveat for silence: we treat LISTENING as a single ``await ASR final``
-  with a ``silence_threshold_ms`` timeout; the multi-step
-  ACTIVATE → reset → REACTIVATE cycle is folded into the same loop.
-* ``no_progress_timer`` is enforced as a global wall-clock check after each
-  user turn that is judged "non-progress" (we count user speeches whose
-  ASR result is empty / whitelist-only).
+* **Real-time interruption during SPEAKING / FILLER.** The ASR pump now
+  multiplexes partials → ``asr_partials_q`` and finals → ``asr_finals_q``.
+  ``_partial_monitor`` consumes partials, runs ``evaluate_partial``, and on
+  ``triggered`` cancels ``session.current_speaking_task`` (which is set by
+  ``_play_tts``).
+* **Continuous-interruption protection** per ai-pipeline spec delta: counter
+  ≥ ``max_continuous_interruptions`` triggers ``short_reply`` (prompt-side
+  hint to keep the next reply terse) or ``listen_only`` (skip PROCESSING,
+  play a short cue, return to LISTENING).
+* ``audio_out`` MUST be cancel-aware on every TelephonyClient implementation
+  (contract test exercises this).
 """
 
 from __future__ import annotations
@@ -28,7 +27,12 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
-from isales_common.enums import CallStatus, HangupCause, TransferStatus
+from isales_common.enums import (
+    CallStatus,
+    ContinuousInterruptionStrategy,
+    HangupCause,
+    TransferStatus,
+)
 from isales_common.providers._models import ASRResult
 from isales_common.providers.asr import ASRProvider
 from isales_common.providers.llm import LLMProvider
@@ -47,6 +51,7 @@ from isales_engine.pipeline.orchestrator import run_pipeline
 from isales_engine.realtime.filler_manager import FillerManager
 from isales_engine.realtime.interruption_detector import (
     InterruptionConfig,
+    evaluate_partial,
 )
 from isales_engine.realtime.no_progress_timer import is_no_progress_exceeded
 from isales_engine.realtime.silence_detector import SilenceConfig, evaluate_silence
@@ -120,7 +125,6 @@ async def run_session(
         )
 
     except _ManualHangupRequested:
-        # API-driven manual hangup (EngineControl).
         await _attempt_hangup(telephony, session.call_record_id)
         if session.state is not CallStatus.END:
             sm.transition_to(CallStatus.END, reason="manual_hangup", force=True)
@@ -139,6 +143,20 @@ async def run_session(
         session.append_event(
             "hangup", reason=session.hangup_cause, initiated_by="ai"
         )
+    finally:
+        # Token-budget warning (impl-engine-providers PR #7). Default 50k
+        # if not configured; runtime sets ``_token_budget_per_call`` on the
+        # session at construction time.
+        budget = getattr(session, "_token_budget_per_call", 50_000)
+        if session.total_tokens_in + session.total_tokens_out > budget:
+            logger.warning(
+                "token_budget_exceeded call_record_id=%s tokens_in=%s "
+                "tokens_out=%s budget=%s",
+                session.call_record_id,
+                session.total_tokens_in,
+                session.total_tokens_out,
+                budget,
+            )
 
 
 # ---- Manual-hangup signal -------------------------------------------------
@@ -213,14 +231,22 @@ async def _main_turn_loop(
     events_iter = telephony.events(session.call_record_id)
 
     asr_finals_q: asyncio.Queue[ASRResult] = asyncio.Queue()
+    asr_partials_q: asyncio.Queue[ASRResult] = asyncio.Queue()
     hangup_event = asyncio.Event()
     asr_finished = asyncio.Event()
 
     async def _asr_pump() -> None:
         try:
             async for r in asr_iter:
-                if r.is_final and r.text:
+                if not r.text:
+                    continue
+                if r.is_final:
                     await asr_finals_q.put(r)
+                    # A final closes the current utterance — clear the
+                    # partial-monitor's speech-start anchor.
+                    session.current_user_speech_started_ms = None
+                else:
+                    await asr_partials_q.put(r)
         except asyncio.CancelledError:
             pass
         finally:
@@ -238,8 +264,17 @@ async def _main_turn_loop(
 
     pump_asr = asyncio.create_task(_asr_pump(), name="asr_pump")
     pump_ev = asyncio.create_task(_ev_pump(), name="ev_pump")
+    pump_partial_monitor = asyncio.create_task(
+        _partial_monitor(
+            session,
+            asr_partials_q=asr_partials_q,
+            interruption_cfg=config.interruption,
+        ),
+        name="partial_monitor",
+    )
     session.tasks["asr_pump"] = pump_asr
     session.tasks["ev_pump"] = pump_ev
+    session.tasks["partial_monitor"] = pump_partial_monitor
 
     no_progress_started = time.monotonic()
     last_progress_ms = _to_ms(no_progress_started)
@@ -357,6 +392,28 @@ async def _main_turn_loop(
                 return
 
             is_wrap_up = session.state is CallStatus.WRAPPING_UP
+
+            # Continuous-interruption protection (ai-pipeline spec delta).
+            protection = _decide_protection(session, config)
+            if protection == "listen_only":
+                # Skip PROCESSING this turn. Play a short cue + return to
+                # LISTENING; counter resets so we give the user a clean slate.
+                sm.transition_to(CallStatus.SPEAKING, reason="listen_only_cue")
+                await _play_tts(
+                    session, telephony, providers.tts,
+                    "您请说。",
+                    voice_id=config.voice_id,
+                    interruptible=False,
+                )
+                session.consecutive_interruption_count = 0
+                config.pipeline.short_reply_active = False
+                sm.transition_to(CallStatus.LISTENING, reason="listen_only_done")
+                continue
+            elif protection == "short_reply":
+                config.pipeline.short_reply_active = True
+            else:
+                config.pipeline.short_reply_active = False
+
             sm.transition_to(CallStatus.PROCESSING, reason="speech_end")
             _publish_status(publisher, session, "speech_end")
 
@@ -382,8 +439,14 @@ async def _main_turn_loop(
             if filler is not None:
                 await filler.wait_finished()
 
+            # Token budget bookkeeping (PR #7 wires accumulation; PR #6 just
+            # ensures the trace records persist token fields).
+            for cand in session.pipeline_trace_records[-1]["role_candidates"]:
+                session.total_tokens_in += int(cand.get("prompt_tokens") or 0)
+                session.total_tokens_out += int(cand.get("completion_tokens") or 0)
+
             sm.transition_to(CallStatus.SPEAKING, reason="pipeline_done")
-            await _play_tts(
+            played = await _play_tts(
                 session, telephony, providers.tts, result.reply,
                 voice_id=config.voice_id,
             )
@@ -402,7 +465,20 @@ async def _main_turn_loop(
                 goal_type=result.goal_type,
                 extracted=result.extracted,
                 is_wrap_up=is_wrap_up,
+                interrupted=not played,
             )
+
+            if not played:
+                # Real-time interruption fired: SPEAKING got cancelled.
+                session.consecutive_interruption_count += 1
+                session.interruption_signaled = False
+                sm.transition_to(
+                    CallStatus.INTERRUPTED, reason="speaking_interrupted"
+                )
+                # Next loop iteration will await the user's interrupting final.
+                continue
+            # Successful SPEAKING — clear the counter per spec.
+            session.consecutive_interruption_count = 0
 
             if result.goal_achieved and not is_wrap_up:
                 sm.transition_to(CallStatus.WRAPPING_UP, reason="goal_achieved")
@@ -452,13 +528,15 @@ async def _main_turn_loop(
 
             sm.transition_to(CallStatus.LISTENING, reason="tts_done")
     finally:
-        for t in (pump_asr, pump_ev):
+        for t in (pump_asr, pump_ev, pump_partial_monitor):
             t.cancel()
-        await asyncio.gather(pump_asr, pump_ev, return_exceptions=True)
-        # remove from session.tasks so SessionManager.cancel_all doesn't double-cancel
+        await asyncio.gather(
+            pump_asr, pump_ev, pump_partial_monitor, return_exceptions=True
+        )
         session.tasks.pop("asr_pump", None)
         session.tasks.pop("ev_pump", None)
-        _ = asr_finished  # silence unused
+        session.tasks.pop("partial_monitor", None)
+        _ = asr_finished
 
 
 
@@ -544,15 +622,96 @@ async def _play_tts(
     text: str,
     *,
     voice_id: str,
-) -> None:
-    """Stream TTS PCM out via the telephony client. Updates ``last_tts_end_at``."""
+    interruptible: bool = True,
+) -> bool:
+    """Stream TTS PCM out via the telephony client.
+
+    Returns ``True`` on full playback, ``False`` if cancelled mid-stream by
+    the partial monitor (real-time interruption). The audio_out implementation
+    on every TelephonyClient MUST honour ``CancelledError`` and stop pushing
+    chunks (contract test enforces this).
+
+    When ``interruptible=False`` the partial monitor is bypassed for this
+    playback (used for protection cues like "您请说" that MUST complete).
+    """
 
     async def chunks() -> AsyncIterator[bytes]:
         async for chunk in tts.synthesize_stream(text, voice_id):
             yield chunk
 
-    await telephony.audio_out(session.call_record_id, chunks())
+    play_task = asyncio.create_task(
+        telephony.audio_out(session.call_record_id, chunks()), name="audio_out"
+    )
+    if interruptible:
+        session.current_speaking_task = play_task
+    try:
+        await play_task
+    except asyncio.CancelledError:
+        if play_task.cancelled():
+            session.last_tts_end_at = time.monotonic()
+            return False
+        raise
+    finally:
+        if interruptible and session.current_speaking_task is play_task:
+            session.current_speaking_task = None
+
     session.last_tts_end_at = time.monotonic()
+    return True
+
+
+async def _partial_monitor(
+    session: CallSession,
+    *,
+    asr_partials_q: asyncio.Queue[ASRResult],
+    interruption_cfg: InterruptionConfig,
+) -> None:
+    """Long-running task: watch ASR partials during SPEAKING / FILLER.
+
+    On a verdict of ``triggered`` the monitor cancels the in-flight
+    ``current_speaking_task`` (if any) and sets
+    ``session.interruption_signaled``. Once signaled it stays True until the
+    main loop reads + clears it (per spec § "打断判定不可撤销").
+    """
+
+    while True:
+        try:
+            partial = await asr_partials_q.get()
+        except asyncio.CancelledError:
+            return
+
+        if session.current_speaking_task is None or session.interruption_signaled:
+            # Not in SPEAKING / FILLER — partials are just status updates.
+            continue
+
+        # Track the speech-start anchor on the first non-empty partial of an
+        # utterance so evaluate_partial can apply the duration condition.
+        text = partial.text.strip()
+        if not text:
+            continue
+        if session.current_user_speech_started_ms is None:
+            session.current_user_speech_started_ms = partial.timestamp_ms
+
+        verdict = evaluate_partial(
+            text=text,
+            speech_started_ts_ms=session.current_user_speech_started_ms,
+            now_ts_ms=partial.timestamp_ms,
+            config=interruption_cfg,
+        )
+        if verdict.verdict != "triggered":
+            continue
+
+        # Lock in the interruption: signal first, then cancel. If cancellation
+        # arrives while the play_task hasn't started awaiting yet, the signal
+        # makes _play_tts honour it.
+        session.interruption_signaled = True
+        session.append_event(
+            "interruption",
+            interrupted_event_id=session.current_turn_id,
+            user_text_at_interruption=text,
+        )
+        speaking_task = session.current_speaking_task
+        if speaking_task is not None and not speaking_task.done():
+            speaking_task.cancel()
 
 
 async def _attempt_hangup(telephony: TelephonyClient, call_id: int) -> None:
@@ -579,6 +738,21 @@ def _publish_status(
 
 def _to_ms(value: float) -> int:
     return int(value * 1000)
+
+
+def _decide_protection(
+    session: CallSession, config: RuntimeConfig
+) -> str | None:
+    """Return ``'short_reply'`` / ``'listen_only'`` / ``None`` per ai-pipeline spec."""
+
+    if session.consecutive_interruption_count < config._max_continuous_interruptions:
+        return None
+    if (
+        config._continuous_interruption_strategy
+        == ContinuousInterruptionStrategy.LISTEN_ONLY.value
+    ):
+        return "listen_only"
+    return "short_reply"
 
 
 def _publish_transcript_appended(

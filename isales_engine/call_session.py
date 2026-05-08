@@ -106,6 +106,22 @@ class CallSession:
     # Active asyncio tasks owned by the session (filler / pipeline / TTS).
     tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
 
+    # The currently-running SPEAKING / FILLER playback task. The partial
+    # monitor cancels this on real-time interruption (impl-engine-providers
+    # PR #6).
+    current_speaking_task: asyncio.Task[Any] | None = None
+    # Set by the partial monitor right before cancelling current_speaking_task;
+    # the main loop reads + clears it to drive INTERRUPTED→PROCESSING.
+    interruption_signaled: bool = False
+    # Per-utterance speech-start timestamp (relative ms). Set when partial
+    # monitor sees first non-whitelist partial; cleared on speech_end /
+    # interruption.
+    current_user_speech_started_ms: int | None = None
+
+    # Token budget bookkeeping (impl-engine-providers PR #7).
+    total_tokens_in: int = 0
+    total_tokens_out: int = 0
+
     # Wallclock + monotonic anchors. ``ts`` in transcript events is relative
     # to ``call_started_at_monotonic`` in milliseconds (transcript spec §
     # Requirement: 通用事件结构).
