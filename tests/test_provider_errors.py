@@ -162,9 +162,17 @@ def test_build_asr_volcengine_signals_pending_pr() -> None:
         build_asr("volcengine")
 
 
-def test_build_tts_volcengine_signals_pending_pr() -> None:
-    with pytest.raises(NotImplementedError, match="PR #5"):
-        build_tts("volcengine")
+def test_build_tts_volcengine_requires_credentials() -> None:
+    """PR #5 wired the real provider; missing credentials still raises NotImplementedError."""
+
+    from isales_engine.settings import Settings
+
+    empty = Settings(
+        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
+        ISALES_REDIS_URL="redis://localhost:6379/0",
+    )
+    with pytest.raises(NotImplementedError, match="VOLCENGINE_APP_KEY"):
+        build_tts("volcengine", settings=empty)
 
 
 def test_unknown_provider_lists_known_set() -> None:

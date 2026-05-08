@@ -93,14 +93,29 @@ def build_asr(name: str) -> ASRProvider:
     )
 
 
-def build_tts(name: str) -> TTSProvider:
+def build_tts(name: str, *, settings: Settings | None = None) -> TTSProvider:
     if name == "mock":
         return TextLengthMockTTS()
-    if name == "volcengine":
+    if name not in KNOWN_TTS_PROVIDERS:
         raise NotImplementedError(
-            "TTS provider 'volcengine' not yet wired — see "
-            "impl-engine-providers PR #5"
+            f"TTS provider {name!r} not supported (known: {sorted(KNOWN_TTS_PROVIDERS)})"
         )
-    raise NotImplementedError(
-        f"TTS provider {name!r} not supported (known: {sorted(KNOWN_TTS_PROVIDERS)})"
-    )
+    if settings is None:
+        settings = Settings()
+    if name == "volcengine":
+        if not (settings.volcengine_app_key and settings.volcengine_app_token):
+            raise NotImplementedError(
+                "TTS provider 'volcengine' requires "
+                "ISALES_VOLCENGINE_APP_KEY + ISALES_VOLCENGINE_APP_TOKEN"
+            )
+        # Volcengine streaming TTS endpoint (HTTP). Override via env if the
+        # account is on a different region.
+        from isales_engine.providers.tts_volcengine import VolcengineTTSProvider
+
+        endpoint = "https://openspeech.bytedance.com/api/v1"
+        return VolcengineTTSProvider(
+            endpoint=endpoint,
+            app_key=settings.volcengine_app_key,
+            app_token=settings.volcengine_app_token,
+        )
+    raise NotImplementedError(name)
