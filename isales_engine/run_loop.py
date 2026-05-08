@@ -82,8 +82,13 @@ async def run_session(
     publisher: EventPublisher | None = None,
     pipeline_timeout_ms: int = 8000,
     connect_timeout_s: float = 30.0,
+    token_budget_per_call: int = 50_000,
 ) -> None:
     """Drive one call from dial to END. Errors become hangup_cause sentinels."""
+
+    # Stash budget on session so the finally block reads it without needing a
+    # separate parameter plumbed through every helper.
+    session._token_budget_per_call = token_budget_per_call
 
     sm = StateMachine(session)
     session.call_started_at_monotonic = time.monotonic()

@@ -121,6 +121,10 @@ class CallSession:
     # Token budget bookkeeping (impl-engine-providers PR #7).
     total_tokens_in: int = 0
     total_tokens_out: int = 0
+    # Configured per call by ``run_session``. Used by the END finally block
+    # to emit the WARN log on overage; default of 0 disables the check (we
+    # use 50k as the live default in run_session itself).
+    _token_budget_per_call: int = 0
 
     # Wallclock + monotonic anchors. ``ts`` in transcript events is relative
     # to ``call_started_at_monotonic`` in milliseconds (transcript spec §

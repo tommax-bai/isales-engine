@@ -112,6 +112,7 @@ def _make_runner(
             providers=providers,
             publisher=publisher,
             pipeline_timeout_ms=settings.engine_pipeline_default_timeout_ms,
+            token_budget_per_call=settings.engine_token_budget_per_call,
         )
 
     return _run
