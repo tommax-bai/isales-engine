@@ -214,8 +214,10 @@ class RealTelephonyClient(TelephonyClient):
             return
         sid = msg.get("session_id")
         if not isinstance(sid, str):
-            # Pre-PR-#8 telephony stage may not echo session_id on every
-            # frame; we drop those — engine can't route them anyway.
+            # Per spec § engine ↔ modem-controller IPC 协议, every event
+            # MUST carry session_id. A frame without one is malformed;
+            # engine can't route it anyway, so drop and warn.
+            logger.warning("real_telephony_event_missing_session_id", extra={"msg": msg})
             return
         self._ensure_session(sid)
         try:

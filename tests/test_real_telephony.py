@@ -63,8 +63,7 @@ class _FakeServer:
                 if msg.get("cmd") == "dial":
                     sid = msg["session_id"]
                     await self._send(
-                        writer,
-                        {"event": "dial_ack", "call_id": "uuid-x", "session_id": sid},
+                        writer, {"event": "dial_ack", "session_id": sid}
                     )
                     if self._on_dial is not None:
                         await self._on_dial(writer, sid)
@@ -115,7 +114,7 @@ async def test_dial_emits_connected_event(server_and_client) -> None:  # type: i
 
     async def script(writer, sid):  # type: ignore[no-untyped-def]
         await server._send(
-            writer, {"event": "connected", "session_id": sid, "call_id": "uuid-x"}
+            writer, {"event": "connected", "session_id": sid}
         )
 
     server.script_on_dial(script)
