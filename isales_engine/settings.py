@@ -16,6 +16,12 @@ class Settings(BaseSettings):
     engine_asr_provider: str = Field(default="mock", alias="ISALES_ENGINE_ASR_PROVIDER")
     engine_tts_provider: str = Field(default="mock", alias="ISALES_ENGINE_TTS_PROVIDER")
     engine_telephony_mode: str = Field(default="mock", alias="ISALES_ENGINE_TELEPHONY_MODE")
+    engine_telephony_socket_path: str = Field(
+        default="/var/run/isales/modem.sock", alias="ISALES_ENGINE_TELEPHONY_SOCKET_PATH"
+    )
+    engine_telephony_dial_timeout_s: float = Field(
+        default=60.0, alias="ISALES_ENGINE_TELEPHONY_DIAL_TIMEOUT_S"
+    )
 
     engine_pipeline_default_timeout_ms: int = Field(
         default=8000, alias="ISALES_ENGINE_PIPELINE_DEFAULT_TIMEOUT_MS"

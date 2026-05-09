@@ -30,6 +30,7 @@ from isales_engine.event_consumer import subscribe_loop
 from isales_engine.event_publisher import EventPublisher
 from isales_engine.providers.factory import build_asr, build_llm, build_tts
 from isales_engine.realtime.mock_telephony import MockTelephonyClient
+from isales_engine.realtime.real_telephony import RealTelephonyClient
 from isales_engine.realtime.telephony_client import TelephonyClient
 from isales_engine.redis_client import get_redis
 from isales_engine.run_loop import (
@@ -49,8 +50,13 @@ def _build_telephony(settings: Settings) -> TelephonyClient:
         return MockTelephonyClient(
             connect_delay_ms=settings.engine_mock_connect_delay_ms
         )
+    if settings.engine_telephony_mode == "real":
+        return RealTelephonyClient(
+            settings.engine_telephony_socket_path,
+            dial_timeout_s=settings.engine_telephony_dial_timeout_s,
+        )
     raise NotImplementedError(
-        f"telephony_mode {settings.engine_telephony_mode!r} not wired — stage 6"
+        f"telephony_mode {settings.engine_telephony_mode!r} not wired"
     )
 
 
