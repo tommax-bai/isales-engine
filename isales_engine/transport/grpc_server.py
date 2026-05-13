@@ -221,6 +221,14 @@ class CloudEdgeGrpcServer(CloudEdgeServer):
             # Authenticate already aborted the context.
             return
 
+        # Bidi servers don't normally yield until they have something to
+        # send, but the grpc.aio client uses `call.initial_metadata()` to
+        # know the RPC was accepted. Flush metadata eagerly so the edge's
+        # CloudEdgeGrpcClient.start() can race-free transition to
+        # is_connected=True instead of waiting for an arbitrary first
+        # response.
+        await context.send_initial_metadata([])
+
         stream = _ServerStream(identity)
         await self._register_stream(stream)
 
