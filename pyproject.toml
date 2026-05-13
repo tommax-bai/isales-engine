@@ -20,6 +20,7 @@ dependencies = [
     "structlog>=24.1",
     "httpx>=0.27",
     "websockets>=12.0",
+    "grpcio>=1.60",
 ]
 
 [project.optional-dependencies]
@@ -64,6 +65,18 @@ strict = true
 plugins = ["pydantic.mypy"]
 disallow_untyped_defs = true
 warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# grpcio has no first-party type stubs (types-grpcio package is community-
+# maintained and lags upstream). Treat the import surface as untyped.
+module = ["grpc.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Generated gRPC service stubs in isales-common don't carry type annotations
+# on the bridge helpers; skip strict checks at their call sites here.
+module = ["isales_common.proto.*"]
+ignore_errors = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
