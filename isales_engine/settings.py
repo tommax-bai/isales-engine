@@ -15,12 +15,36 @@ class Settings(BaseSettings):
     engine_llm_provider: str = Field(default="mock", alias="ISALES_ENGINE_LLM_PROVIDER")
     engine_asr_provider: str = Field(default="mock", alias="ISALES_ENGINE_ASR_PROVIDER")
     engine_tts_provider: str = Field(default="mock", alias="ISALES_ENGINE_TTS_PROVIDER")
+    # mock | real | rtc — rtc = cloud-edge gRPC + Aliyun RTC (arch-cloud-edge-split A2).
     engine_telephony_mode: str = Field(default="mock", alias="ISALES_ENGINE_TELEPHONY_MODE")
     engine_telephony_socket_path: str = Field(
         default="/var/run/isales/modem.sock", alias="ISALES_ENGINE_TELEPHONY_SOCKET_PATH"
     )
     engine_telephony_dial_timeout_s: float = Field(
         default=60.0, alias="ISALES_ENGINE_TELEPHONY_DIAL_TIMEOUT_S"
+    )
+
+    # ---- arch-cloud-edge-split (mode="rtc") -----------------------------
+
+    engine_cloud_edge_grpc_bind: str = Field(
+        default="0.0.0.0:50051", alias="ISALES_ENGINE_CLOUD_EDGE_GRPC_BIND"
+    )
+    # A2 assumes a single edge_device_id per engine process (single-tenant);
+    # multi-edge → engine routing arrives with C2.
+    engine_edge_device_id: str = Field(
+        default="", alias="ISALES_ENGINE_EDGE_DEVICE_ID"
+    )
+    engine_rtc_app_id: str = Field(default="", alias="ISALES_RTC_APP_ID")
+    # Cloud-only secret; never crosses the cloud-edge boundary.
+    engine_rtc_app_key: str = Field(default="", alias="ISALES_RTC_APP_KEY")
+    # vendor → real ARTC SDK via LD_LIBRARY_PATH/PYTHONPATH;
+    # in_memory → InMemorySdkChannel test double (local dev / smoke).
+    engine_rtc_sdk_kind: str = Field(
+        default="vendor", alias="ISALES_ENGINE_RTC_SDK_KIND"
+    )
+    # Shared with isales-api edge-token mint (same secret, audience=cloud-edge).
+    engine_edge_token_jwt_secret: str = Field(
+        default="", alias="ISALES_JWT_SECRET"
     )
 
     engine_pipeline_default_timeout_ms: int = Field(

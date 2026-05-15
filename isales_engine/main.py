@@ -9,8 +9,9 @@ Wires the four long-running coroutines:
 * ``session_manager.cancel_all`` — invoked in the SIGTERM finally block to
   let in-flight calls finalize cleanly (PR #13 deepens this further).
 
-Real LLM/ASR/TTS providers and the modem-controller IPC arrive in stages 5
-and 6; the factory still wires the mock variants by default.
+For ``ISALES_ENGINE_TELEPHONY_MODE=rtc`` (arch-cloud-edge-split A2) the
+cloud-edge gRPC server is also started here, with its inbound callback
+routed through :class:`EngineSessionDispatcher` to per-call sessions.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import logging
 import signal
 from collections.abc import Awaitable, Callable
 
+from isales_common.transport.cloud_edge import CloudEdgeServer
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from isales_engine.call_session import CallSession
@@ -31,6 +33,7 @@ from isales_engine.event_publisher import EventPublisher
 from isales_engine.providers.factory import build_asr, build_llm, build_tts
 from isales_engine.realtime.mock_telephony import MockTelephonyClient
 from isales_engine.realtime.real_telephony import RealTelephonyClient
+from isales_engine.realtime.rtc_telephony import RtcTelephonyClient
 from isales_engine.realtime.telephony_client import TelephonyClient
 from isales_engine.redis_client import get_redis
 from isales_engine.run_loop import (
@@ -41,23 +44,67 @@ from isales_engine.run_loop import (
 from isales_engine.runtime_config import load_runtime_config
 from isales_engine.session_manager import SessionManager
 from isales_engine.settings import Settings, load_settings
+from isales_engine.transport.aliyun_rtc import AliyunRtcSession, InMemorySdkChannel
+from isales_engine.transport.grpc_server import CloudEdgeGrpcServer
+from isales_engine.transport.hardware_alert_handler import log_hardware_alert
+from isales_engine.transport.heartbeat_handler import make_heartbeat_handler
+from isales_engine.transport.jwt_token_verifier import JwtTokenVerifier
+from isales_engine.transport.rtc_token import RtcTokenIssuer
+from isales_engine.transport.session_dispatcher import EngineSessionDispatcher
 
 logger = logging.getLogger(__name__)
 
 
-def _build_telephony(settings: Settings) -> TelephonyClient:
-    if settings.engine_telephony_mode == "mock":
+def _build_telephony(
+    settings: Settings,
+    *,
+    dispatcher: EngineSessionDispatcher | None = None,
+    grpc_server: CloudEdgeServer | None = None,
+) -> TelephonyClient:
+    mode = settings.engine_telephony_mode
+    if mode == "mock":
         return MockTelephonyClient(
             connect_delay_ms=settings.engine_mock_connect_delay_ms
         )
-    if settings.engine_telephony_mode == "real":
+    if mode == "real":
         return RealTelephonyClient(
             settings.engine_telephony_socket_path,
             dial_timeout_s=settings.engine_telephony_dial_timeout_s,
         )
-    raise NotImplementedError(
-        f"telephony_mode {settings.engine_telephony_mode!r} not wired"
-    )
+    if mode == "rtc":
+        if dispatcher is None or grpc_server is None:
+            raise RuntimeError(
+                "rtc telephony requires dispatcher + grpc_server",
+            )
+        if not settings.engine_edge_device_id:
+            raise RuntimeError(
+                "ISALES_ENGINE_EDGE_DEVICE_ID must be set for rtc mode",
+            )
+        issuer = RtcTokenIssuer(
+            app_id=settings.engine_rtc_app_id,
+            app_key=settings.engine_rtc_app_key,
+        )
+        sdk_kind = settings.engine_rtc_sdk_kind
+        if sdk_kind == "vendor":
+            def rtc_factory() -> AliyunRtcSession:
+                return AliyunRtcSession.production(
+                    app_id=settings.engine_rtc_app_id,
+                )
+        elif sdk_kind == "in_memory":
+            def rtc_factory() -> AliyunRtcSession:
+                return AliyunRtcSession(channel=InMemorySdkChannel())
+        else:
+            raise RuntimeError(
+                f"unknown engine_rtc_sdk_kind: {sdk_kind!r}",
+            )
+        return RtcTelephonyClient(
+            edge_device_id=settings.engine_edge_device_id,
+            grpc_server=grpc_server,
+            dispatcher=dispatcher,
+            token_issuer=issuer,
+            rtc_session_factory=rtc_factory,
+        )
+    raise NotImplementedError(f"telephony_mode {mode!r} not wired")
 
 
 def _make_runner(
@@ -96,7 +143,7 @@ def _make_runner(
                     **session.prompt_versions_snapshot
                 ),
                 caller_id=session.caller_id,
-                device_id=0,
+                device_id=session.device_id,
             )
             runtime = await load_runtime_config(
                 db,
@@ -109,6 +156,14 @@ def _make_runner(
             asr=build_asr(settings.engine_asr_provider),
             tts=build_tts(settings.engine_tts_provider),
         )
+
+        # The DialCommand on the edge carries the scheduler-selected
+        # device_id; the modem-controller picks the right serial port from
+        # it. Real + Rtc implementations both expose this hint surface;
+        # Mock doesn't need it.
+        hint = getattr(telephony, "set_device_for_session", None)
+        if callable(hint):
+            hint(session.call_record_id, session.device_id)
 
         await run_session(
             session,
@@ -124,6 +179,31 @@ def _make_runner(
     return _run
 
 
+async def _build_rtc_transport(
+    settings: Settings,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> tuple[EngineSessionDispatcher, CloudEdgeGrpcServer]:
+    """Build + start the cloud-edge gRPC server for rtc mode.
+
+    Returns the dispatcher + server pair so the caller can pass the
+    dispatcher into :func:`_build_telephony` and the server into the
+    shutdown path.
+    """
+    if not settings.engine_edge_token_jwt_secret:
+        raise RuntimeError(
+            "ISALES_JWT_SECRET must be set for rtc mode "
+            "(shared with isales-api edge-token mint)",
+        )
+    verifier = JwtTokenVerifier(secret=settings.engine_edge_token_jwt_secret)
+    grpc_server = CloudEdgeGrpcServer(token_verifier=verifier)
+    dispatcher = EngineSessionDispatcher()
+    dispatcher.on_hardware_alert(log_hardware_alert)
+    dispatcher.on_heartbeat(make_heartbeat_handler(sessionmaker))
+    grpc_server.on_edge_message(dispatcher.handle_edge_message)
+    await grpc_server.start(settings.engine_cloud_edge_grpc_bind)
+    return dispatcher, grpc_server
+
+
 async def _main() -> None:
     settings = load_settings()
     db_engine = get_engine(settings.database_url)
@@ -132,7 +212,17 @@ async def _main() -> None:
 
     session_manager = SessionManager()
     publisher = EventPublisher(redis)
-    telephony = _build_telephony(settings)
+
+    dispatcher: EngineSessionDispatcher | None = None
+    grpc_server: CloudEdgeGrpcServer | None = None
+    if settings.engine_telephony_mode == "rtc":
+        dispatcher, grpc_server = await _build_rtc_transport(settings, sessionmaker)
+
+    telephony = _build_telephony(
+        settings,
+        dispatcher=dispatcher,
+        grpc_server=grpc_server,
+    )
 
     runner = _make_runner(
         sessionmaker=sessionmaker,
@@ -199,6 +289,8 @@ async def _main() -> None:
         await session_manager.cancel_all(
             timeout_s=float(settings.engine_graceful_shutdown_timeout_s)
         )
+        if grpc_server is not None:
+            await grpc_server.stop(grace_seconds=5.0)
         await publisher.drain()
         await redis.close()
         await db_engine.dispose()

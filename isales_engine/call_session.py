@@ -70,6 +70,11 @@ class CallSession:
     # Snapshot pinned at dispatch time (DialRequest.prompt_versions).
     prompt_versions_snapshot: dict[str, Any]
 
+    # Scheduler-selected device for this call (DialRequest.device_id).
+    # Threaded through to RtcTelephonyClient.set_device_for_session so
+    # DialCommand.device_id reaches the edge.
+    device_id: int = 0
+
     # Mutable state.
     state: CallStatus = CallStatus.INIT
     previous_state: CallStatus | None = None

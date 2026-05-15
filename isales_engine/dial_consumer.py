@@ -99,6 +99,7 @@ async def handle_dial(
         lead_id=request.lead.lead_id,
         caller_id=request.caller_id,
         prompt_versions_snapshot=request.prompt_versions.model_dump(mode="json"),
+        device_id=request.device_id,
     )
     session_manager.register(session)
 
