@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 CallEventCallback: TypeAlias = Callable[[pb.CallEvent], Awaitable[None]]
 DialAckCallback: TypeAlias = Callable[[pb.DialAck], Awaitable[None]]
 HardwareAlertCallback: TypeAlias = Callable[[EdgeIdentity, pb.HardwareAlert], Awaitable[None]]
+HeartbeatCallback: TypeAlias = Callable[[EdgeIdentity, pb.Heartbeat], Awaitable[None]]
 
 
 @dataclass
@@ -83,6 +84,7 @@ class EngineSessionDispatcher:
     def __init__(self) -> None:
         self._sessions: dict[str, _SessionEntry] = {}
         self._hardware_alert_cb: HardwareAlertCallback | None = None
+        self._heartbeat_cb: HeartbeatCallback | None = None
 
     # ----- session registry -----------------------------------------------
 
@@ -134,6 +136,19 @@ class EngineSessionDispatcher:
         """
         self._hardware_alert_cb = callback
 
+    def on_heartbeat(self, callback: HeartbeatCallback) -> None:
+        """Register the process-wide heartbeat handler.
+
+        Heartbeat frames carry per-device liveness summaries (see
+        arch-cloud-edge-split § device-hardware "modem-controller 心跳与失联
+        探测"). The handler is responsible for updating
+        ``device.last_seen_at`` so the worker watchdog can flip stale
+        devices to ``offline``. Only one handler is supported; a second
+        call replaces the first. Missing handler is a hard no-op (early
+        bring-up before task 9.4 wires this).
+        """
+        self._heartbeat_cb = callback
+
     # ----- inbound dispatch ----------------------------------------------
 
     async def handle_edge_message(
@@ -156,9 +171,7 @@ class EngineSessionDispatcher:
         elif kind == "hardware_alert":
             await self._dispatch_hardware_alert(identity, msg.hardware_alert)
         elif kind == "heartbeat":
-            # Liveness is the transport layer's concern; the dispatcher
-            # has no per-call work on heartbeats.
-            return
+            await self._dispatch_heartbeat(identity, msg.heartbeat)
         elif kind is None:
             logger.warning(
                 "edge_message with empty payload",
@@ -239,10 +252,22 @@ class EngineSessionDispatcher:
             return
         await self._hardware_alert_cb(identity, alert)
 
+    async def _dispatch_heartbeat(
+        self,
+        identity: EdgeIdentity,
+        heartbeat: pb.Heartbeat,
+    ) -> None:
+        if self._heartbeat_cb is None:
+            # Liveness is the transport layer's concern when no handler
+            # is wired — the gRPC bidi keeps itself alive regardless.
+            return
+        await self._heartbeat_cb(identity, heartbeat)
+
 
 __all__ = [
     "CallEventCallback",
     "DialAckCallback",
     "EngineSessionDispatcher",
     "HardwareAlertCallback",
+    "HeartbeatCallback",
 ]
