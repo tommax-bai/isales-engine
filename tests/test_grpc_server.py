@@ -328,3 +328,75 @@ async def test_handler_exception_does_not_kill_stream() -> None:
         assert call_count == 2
     finally:
         await server.stop(grace_seconds=0.1)
+
+
+# ---------------------------------------------------------------------------
+# cloud-edge-grpc-keepalive
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_server_constructed_with_keepalive_options(
+    monkeypatch,
+) -> None:
+    """Spec: cloud-edge-grpc-keepalive § "cloud gRPC server 对称配置不踢
+    client ping". Refactor-guard: ensures the 6 keepalive entries stay
+    on the server's grpc.aio.server() options.
+    """
+    captured: list[dict[str, object]] = []
+    real_server = grpc.aio.server
+
+    def _spy_server(*args, **kwargs):
+        captured.append({"args": args, **kwargs})
+        return real_server(*args, **kwargs)
+
+    monkeypatch.setattr(grpc.aio, "server", _spy_server)
+
+    server, _ = await _start_server()
+    try:
+        assert captured, "grpc.aio.server() was not invoked"
+        options = dict(captured[0].get("options") or [])
+        assert options.get("grpc.keepalive_time_ms") == 30000
+        assert options.get("grpc.keepalive_timeout_ms") == 10000
+        assert options.get("grpc.keepalive_permit_without_calls") == 1
+        assert options.get("grpc.http2.max_ping_strikes") == 0
+        assert options.get("grpc.http2.min_time_between_pings_ms") == 10000
+        assert options.get(
+            "grpc.http2.min_ping_interval_without_data_ms",
+        ) == 10000
+    finally:
+        await server.stop(grace_seconds=0.1)
+
+
+@pytest.mark.asyncio
+async def test_stream_opened_log_fires_after_send_initial_metadata(
+    caplog,
+) -> None:
+    """Spec: cloud-edge-grpc-keepalive § "stream 上线 + 上线时分别打 INFO 日志".
+
+    Server SHALL log ``cloud_edge_stream_opened`` with the resolved
+    ``edge_device_id`` extra, right after ``send_initial_metadata`` and
+    before the stream is registered. Lets dev/ops correlate against the
+    client's matching ``cloud_edge_stream_connected``.
+    """
+    import logging
+
+    caplog.set_level(
+        logging.INFO, logger="isales_engine.transport.grpc_server",
+    )
+    server, target = await _start_server(edge_id="edge-keepalive-test")
+    try:
+        async with _GrpcEdgeProbe(target, token="good-token") as probe:
+            await probe.send(
+                pb.Edge2Cloud(heartbeat=pb.Heartbeat()),
+            )
+            await asyncio.sleep(0.1)
+    finally:
+        await server.stop(grace_seconds=0.1)
+
+    opened_logs = [
+        r for r in caplog.records
+        if r.getMessage() == "cloud_edge_stream_opened"
+    ]
+    assert opened_logs, "expected cloud_edge_stream_opened INFO line"
+    assert getattr(opened_logs[-1], "edge_device_id", None) == "edge-keepalive-test"

@@ -57,6 +57,23 @@ logger = logging.getLogger(__name__)
 __all__ = ["CloudEdgeGrpcServer"]
 
 
+#: HTTP/2 keepalive server options. Symmetric to the client-side options
+#: in isales-telephony's grpc_client. Server SHALL accept the edge's 30 s
+#: keepalive pings without striking them as "too frequent" (default gRPC
+#: server policy boots client streams that ping more often than every
+#: 5 minutes). Cloud-edge is a low-fanout, fully trusted-by-JWT channel,
+#: so the anti-DDoS defaults are wrong here.
+#: Spec: openspec/changes/cloud-edge-grpc-keepalive/.
+_KEEPALIVE_SERVER_OPTIONS: list[tuple[str, int]] = [
+    ("grpc.keepalive_time_ms", 30000),
+    ("grpc.keepalive_timeout_ms", 10000),
+    ("grpc.keepalive_permit_without_calls", 1),
+    ("grpc.http2.max_ping_strikes", 0),
+    ("grpc.http2.min_time_between_pings_ms", 10000),
+    ("grpc.http2.min_ping_interval_without_data_ms", 10000),
+]
+
+
 # Sentinel pushed onto an outbound queue to signal "drain and close".
 # Using a typed sentinel rather than None lets the outbound iterator
 # distinguish between "no item yet" and "shut down".
@@ -169,7 +186,10 @@ class CloudEdgeGrpcServer(CloudEdgeServer):
         if self._server is not None:
             raise RuntimeError("server already started")
         servicer = _Servicer(self)
-        self._server = grpc.aio.server(interceptors=list(interceptors or []))
+        self._server = grpc.aio.server(
+            interceptors=list(interceptors or []),
+            options=_KEEPALIVE_SERVER_OPTIONS,
+        )
         cloud_edge_pb2_grpc.add_CloudEdgeServicer_to_server(  # type: ignore[no-untyped-call]
             servicer,
             self._server,
@@ -228,6 +248,10 @@ class CloudEdgeGrpcServer(CloudEdgeServer):
         # is_connected=True instead of waiting for an arbitrary first
         # response.
         await context.send_initial_metadata([])
+        logger.info(
+            "cloud_edge_stream_opened",
+            extra={"edge_device_id": identity.edge_device_id},
+        )
 
         stream = _ServerStream(identity)
         await self._register_stream(stream)
