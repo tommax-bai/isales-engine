@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 license = { text = "Proprietary" }
 authors = [{ name = "iSales" }]
 dependencies = [
-    "isales-common>=0.2.0,<0.3",
+    "isales-common>=0.3.0,<0.4",
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.29",
     "redis>=5.0",
