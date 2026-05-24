@@ -47,36 +47,47 @@ def test_non_positive_default_ttl_raises() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_token_matches_aliyun_sha256_formula() -> None:
-    """Independently compute the expected token and compare.
+def test_token_matches_aliyun_v3_base64_json_formula() -> None:
+    """Independently compute the expected v3 token and compare.
 
-    The doc says::
-
-        token = sha256(app_id + app_key + channel_id + user_id + nonce + timestamp).hexdigest()
+    Per https://help.aliyun.com/zh/live/token-based-authentication:
+        sha = sha256(app_id + app_key + channel + user_id + timestamp).hex()
+              ← NOTE: nonce 不在 hash 内
+        token = base64(json({appid, channelid, userid, nonce, timestamp, token: sha}))
 
     Pin every input so the assertion is reproducible.
     """
+    import base64 as _b64
+    import json as _json
+
     issuer = RtcTokenIssuer(app_id="my-app", app_key="secret-key")
     creds = issuer.sign(
         channel="call-001",
         user_id="engine-call-001",
         now=1_700_000_000,
         ttl_seconds=3600,
-        nonce="AK-abc123",
+        nonce="",  # v3 default
     )
 
-    # Hand-rolled expected value following the exact published ordering.
-    expected_raw = (
-        "my-app" + "secret-key" + "call-001" + "engine-call-001" + "AK-abc123" + "1700003600"
-    )
-    expected = hashlib.sha256(expected_raw.encode("utf-8")).hexdigest()
+    # Hand-rolled expected hash (no nonce):
+    expected_sha = hashlib.sha256(
+        ("my-app" + "secret-key" + "call-001" + "engine-call-001" + "1700003600").encode()
+    ).hexdigest()
 
-    assert creds.token == expected
+    # Decode the base64 wrapper:
+    decoded = _json.loads(_b64.b64decode(creds.token).decode("utf-8"))
+    assert decoded["appid"] == "my-app"
+    assert decoded["channelid"] == "call-001"
+    assert decoded["userid"] == "engine-call-001"
+    assert decoded["nonce"] == ""
+    assert decoded["timestamp"] == 1_700_003_600
+    assert decoded["token"] == expected_sha
+
     assert creds.expires_at == 1_700_003_600
     assert creds.app_id == "my-app"
     assert creds.channel == "call-001"
     assert creds.user_id == "engine-call-001"
-    assert creds.nonce == "AK-abc123"
+    assert creds.nonce == ""
 
 
 def test_same_inputs_same_token() -> None:

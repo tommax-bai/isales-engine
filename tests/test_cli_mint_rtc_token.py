@@ -43,9 +43,19 @@ class TestSignHappyPath:
         assert payload["channel"] == "smoke-channel"
         assert payload["user_id"] == "edge-1"
         assert payload["nonce"] == ""  # v3 默认 nonce 空 (Aliyun doc 推荐)
-        assert len(payload["token"]) == 64  # sha256 hex digest length
+        # v3 token is base64(json{含 sha256 hex}), length 远超 64
+        assert len(payload["token"]) > 100
+        import base64 as _b64
+        import json as _json
+        decoded = _json.loads(_b64.b64decode(payload["token"]).decode())
+        assert decoded["appid"] == "app-test"
+        assert decoded["channelid"] == "smoke-channel"
+        assert decoded["userid"] == "edge-1"
+        assert decoded["nonce"] == ""
+        assert len(decoded["token"]) == 64  # 内嵌 sha256 hex
         # token 不包含明文 app_key
         assert "key-test" not in payload["token"]
+        assert "key-test" not in decoded["token"]
         # expires_at ≈ now + ttl，宽容 5s 时钟漂移
         assert before + 60 <= payload["expires_at"] <= before + 60 + 5
 

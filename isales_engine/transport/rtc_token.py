@@ -36,7 +36,9 @@ cloud-edge boundary. Edges receive only the **signed token** via
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import secrets
 import string
 import time
@@ -165,16 +167,29 @@ class RtcTokenIssuer:
 
         now_ts = int(now) if now is not None else int(time.time())
         expires_at = now_ts + effective_ttl
-        # Default nonce="" per current Aliyun v3 doc; SDK 4-arg JoinChannel
-        # form does not pass nonce so server-side validation uses "".
+        # Default nonce="" per current Aliyun v3 doc (Base64 Token form).
         nonce_val = nonce if nonce is not None else ""
-        token = self._compute_token(channel, user_id, nonce_val, expires_at)
+        sha = self._compute_token(channel, user_id, expires_at)
+        # v3 应用 SDK 4-arg JoinChannel 要 Base64(JSON) token (per
+        # https://help.aliyun.com/zh/live/token-based-authentication
+        # § "Base64 Token")，不是 raw sha256 hex (那是老 v2 form)。
+        payload = {
+            "appid": self._app_id,
+            "channelid": channel,
+            "userid": user_id,
+            "nonce": nonce_val,
+            "timestamp": expires_at,
+            "token": sha,
+        }
+        token_b64 = base64.b64encode(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
         return RtcCredentials(
             app_id=self._app_id,
             channel=channel,
             user_id=user_id,
             nonce=nonce_val,
-            token=token,
+            token=token_b64,
             expires_at=expires_at,
         )
 
@@ -212,13 +227,19 @@ class RtcTokenIssuer:
         self,
         channel: str,
         user_id: str,
-        nonce: str,
         expires_at: int,
     ) -> str:
-        # The exact ordering pinned by the Aliyun doc — do NOT reorder.
-        # See https://help.aliyun.com/document_detail/159037.html.
-        raw = f"{self._app_id}{self._app_key}{channel}{user_id}{nonce}{expires_at}"
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        # Hash 内**不含 nonce**，per Aliyun v3 doc Python example:
+        # h = sha256(); h.update(app_id); h.update(app_key);
+        # h.update(channel); h.update(user_id); h.update(timestamp).
+        # See https://help.aliyun.com/zh/live/token-based-authentication.
+        h = hashlib.sha256()
+        h.update(self._app_id.encode("utf-8"))
+        h.update(self._app_key.encode("utf-8"))
+        h.update(channel.encode("utf-8"))
+        h.update(user_id.encode("utf-8"))
+        h.update(str(expires_at).encode("utf-8"))
+        return h.hexdigest()
 
 
 __all__ = ["RtcCredentials", "RtcTokenIssuer"]
