@@ -1,31 +1,52 @@
-"""Aliyun RTC token signing (cloud-side only).
+"""Aliyun ARTC RTC token signing (cloud-side only).
 
 Spec: arch-cloud-edge-split / design.md Decision 1 (Aliyun RTC PaaS) +
 Decision 5 (control plane); device-hardware § Requirement: 云端 engine 的
 ARTC SDK 接入 — "云端 engine 自己生成 token + 通过 cloud-edge gRPC
 DialCommand.rtc_token 下发给边缘".
 
-Algorithm per Aliyun official docs
-(https://help.aliyun.com/zh/live/token-based-authentication)::
+Algorithm: authoritative Python 3 reference is
+``github.com/aliyun/AliRTCSample/Server/python3/`` (linked from
+help.aliyun.com/zh/document_detail/2689025.html — the only correct doc).
+The simpler ``sha256(appid+appkey+ch+uid+nonce+ts)`` algorithm published
+elsewhere (e.g. the old ``aliyunvideo/AliRtcAppServer`` repo) is for the
+deprecated 直播 (Live) product and is rejected by ARTC RTC roomserver
+with HTTP 401 "auth invalid" (实测踩坑过 2026-05-24)。
 
-    token = sha256(app_id + app_key + channel_id + user_id + nonce + timestamp).hexdigest()
+Token format::
 
-The ``timestamp`` is the **expiration** Unix epoch seconds (not issuance
-time).
+    VERSION_0 ("000") + base64(zlib(_pad256(uint32(sig_len) || sig || _pad256(body))))
 
-``nonce`` defaults to empty string ``""`` per the current Aliyun doc
-(v3 应用 + ARTC SDK 7.x) — "Nonce 推荐为空"。SDK 4-arg
-``JoinChannel(token, channel, uid, name)`` form does NOT pass nonce
-explicitly, so the SDK server-side validation re-computes hash with
-``nonce=""``. If our signer uses any other nonce value (e.g. legacy
-"AK-..." prefix used by Aliyun 2.x docs), the hashes diverge and the
-service rejects with error 0x01037D81 (discovered 2026-05-24 via
-windows-artc-pybind11-join-config §4 实测)。
+Body layout (big-endian)::
 
-If a non-empty nonce is required (e.g. SDK 8.x), callers MUST pass it
-via the ``JoinChannel(AliEngineAuthInfo, name)`` 2-arg form which
-carries the nonce alongside the token; pybind binding does not yet
-expose that overload.
+    uint32 app_id_len + app_id_bytes
+    uint32 issue_timestamp
+    uint32 salt
+    uint32 expire_timestamp
+    service:
+        uint32 channel_id_len + channel_id_bytes
+        uint32 user_id_len + user_id_bytes
+        bool has_privilege [+ uint32 privilege]
+    options:
+        bool has_engine_options [+ uint32 count + (uint32 klen + k + uint32 vlen + v) ...]
+
+Signing key derivation (sign_utils.generate_sign)::
+
+    sign_key_1 = HMAC-SHA256(key=uint32(issue_ts), msg=app_key)
+    sign_key   = HMAC-SHA256(key=uint32(salt),    msg=sign_key_1)
+
+Signature::
+
+    sig = HMAC-SHA256(key=sign_key, msg=pad256(body))
+
+The ``_pad256`` helper pads to the smallest power-of-2 multiple of 256
+≥ len(input) (e.g. 200B → 256B; 300B → 512B; 600B → 1024B).
+
+No ``nonce`` field — entropy is the random ``salt`` (uint32, embedded
+in the body and hashed into the signing key derivation).
+
+Timestamps are Unix epoch **seconds**. Token TTL is capped at 24 h
+server-side per Aliyun spec; this module defaults to 12 h.
 
 This module is the ONLY place in the iSales codebase that accepts the
 RTC AppKey. AppKey is a cloud-only secret (loaded from the
@@ -38,55 +59,119 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
+import hmac
+import io
 import secrets
-import string
+import struct
 import time
-from dataclasses import dataclass
+import zlib
+from dataclasses import dataclass, field
+
+
+_VERSION_0 = "000"
+
+# Privilege bits (Service.add_*_publish_privilege). v1.0 ARTC RTC iSales
+# 用 audio-only push/pull，留 None (= ENABLE_PRIVILEGE 默认 = allow all)
+# 跟 sample example0 ("full privileges as default") 行为一致。
+_ENABLE_PRIVILEGE = 1
+_ENABLE_AUDIO_PRIVILEGE = 2
+_ENABLE_VIDEO_PRIVILEGE = 4
+_ENABLE_SCREEN_PRIVILEGE = 8
 
 
 @dataclass(frozen=True)
 class RtcCredentials:
-    """One signed RTC token + the metadata an SDK ``JoinChannel`` call needs.
+    """Signed RTC token + the metadata an SDK ``JoinChannel`` call needs.
 
-    Both fields the SDK actually reads (``channel`` / ``user_id`` /
-    ``token``) plus bookkeeping (``app_id`` / ``nonce`` / ``expires_at``)
-    that simplifies logging, token-refresh logic, and tests.
+    No ``nonce`` field — v3.0 binary token format doesn't use one; entropy
+    is the internal random ``salt`` (not surfaced to callers).
     """
 
     app_id: str
     channel: str
     user_id: str
-    nonce: str
     token: str
     expires_at: int  # Unix epoch seconds; the moment the token stops working
 
+    # AuthInfo struct still needs a nonce field — SDK header AliEngineAuthInfo
+    # has ``char* nonce`` even though the binary token format embeds entropy
+    # internally. Pass empty string; SDK won't recompute hash from it.
+    nonce: str = ""
 
-# Nonce default: empty string (per https://help.aliyun.com/zh/live/
-# token-based-authentication "Nonce 推荐为空"). The legacy "AK-xxxx"
-# format was from Aliyun 2.x docs; with v3 apps + ARTC SDK 7.x the
-# server expects nonce="" for the 4-arg JoinChannel(token, ch, uid,
-# name) form. See module docstring.
-_NONCE_ALPHABET = string.ascii_letters + string.digits
-_NONCE_PREFIX = "AK-"  # kept for explicit-nonce callers (AuthInfo form)
+    # Optional: pin issue_ts/salt for reproducible-token tests.
+    issue_ts: int = field(default=0, compare=False)
+    salt: int = field(default=0, compare=False)
 
 
-def _generate_nonce(body_length: int = 16) -> str:
-    """Legacy "AK-<random>" nonce (Aliyun 2.x docs).
+def _pack_u32(n: int) -> bytes:
+    return struct.pack(">I", n)
 
-    Kept for callers that explicitly opt in via ``sign(nonce=...)``;
-    NOT used as default (default is empty string per current v3 docs).
-    """
-    body = "".join(secrets.choice(_NONCE_ALPHABET) for _ in range(body_length))
-    return _NONCE_PREFIX + body
+
+def _next_pow2_multiple_of_256(n: int) -> int:
+    if n <= 0:
+        return 0
+    fixed = 256
+    while fixed < n:
+        fixed *= 2
+    return fixed
+
+
+def _pad256(src: bytes) -> bytes:
+    target = _next_pow2_multiple_of_256(len(src))
+    if len(src) >= target:
+        return src[:target]
+    return src + b"\x00" * (target - len(src))
+
+
+def _zlib_compress(data: bytes) -> bytes:
+    c = zlib.compressobj(wbits=zlib.MAX_WBITS)
+    return c.compress(data) + c.flush()
+
+
+def _generate_sign_key(app_key: str, issue_ts: int, salt: int) -> bytes:
+    """Two-step HMAC-SHA256 key derivation per sign_utils.generate_sign."""
+    sign_key_1 = hmac.new(
+        _pack_u32(issue_ts), app_key.encode("utf-8"), hashlib.sha256
+    ).digest()
+    return hmac.new(_pack_u32(salt), sign_key_1, hashlib.sha256).digest()
+
+
+def _pack_service(channel_id: str, user_id: str, privilege: int | None) -> bytes:
+    buf = io.BytesIO()
+    cid = channel_id.encode("utf-8")
+    buf.write(_pack_u32(len(cid)))
+    buf.write(cid)
+    uid = user_id.encode("utf-8")
+    buf.write(_pack_u32(len(uid)))
+    buf.write(uid)
+    if privilege is not None:
+        buf.write(struct.pack(">?I", True, privilege))
+    else:
+        buf.write(struct.pack(">?", False))
+    return buf.getvalue()
+
+
+def _pack_options(engine_options: dict[str, str] | None) -> bytes:
+    buf = io.BytesIO()
+    if not engine_options:
+        buf.write(struct.pack(">?", False))
+        return buf.getvalue()
+    buf.write(struct.pack(">?I", True, len(engine_options)))
+    for k, v in sorted(engine_options.items()):
+        kb = k.encode("utf-8")
+        vb = v.encode("utf-8")
+        buf.write(_pack_u32(len(kb)))
+        buf.write(kb)
+        buf.write(_pack_u32(len(vb)))
+        buf.write(vb)
+    return buf.getvalue()
 
 
 class RtcTokenIssuer:
     """Signs Aliyun RTC tokens using the AppKey.
 
     Designed to be constructed once per engine process from env vars and
-    re-used for every call. Stateless aside from the bound AppId / AppKey;
-    the only "time" input flows through ``sign``'s ``now`` parameter.
+    re-used for every call. Stateless aside from the bound AppId / AppKey.
 
     Usage::
 
@@ -95,13 +180,8 @@ class RtcTokenIssuer:
             app_key=os.environ["ISALES_RTC_APP_KEY"],
         )
         engine_creds, edge_creds = issuer.sign_for_call(call_id="c-001")
-        # engine_creds → cloud engine JoinChannel
-        # edge_creds.token → Cloud2Edge.DialCommand.rtc_token
 
-    Token TTL: defaults to 24 h, more than enough for any v1.0 call
-    duration. The :class:`RtcCredentials.RtcCredentials` (sic) downstream
-    proto message carries an ``expires_at`` field for future refresh
-    logic, but A2 does not exercise mid-call token refresh.
+    Token TTL defaults to 12 h (sample example uses 12 h, max is 24 h).
     """
 
     def __init__(
@@ -109,7 +189,7 @@ class RtcTokenIssuer:
         *,
         app_id: str,
         app_key: str,
-        default_ttl_seconds: int = 24 * 3600,
+        default_ttl_seconds: int = 12 * 3600,
     ) -> None:
         if not app_id:
             raise ValueError("app_id must be non-empty")
@@ -123,7 +203,6 @@ class RtcTokenIssuer:
 
     @property
     def app_id(self) -> str:
-        """The bound RTC AppId (safe to expose; AppKey is not)."""
         return self._app_id
 
     def sign(
@@ -133,30 +212,15 @@ class RtcTokenIssuer:
         user_id: str,
         ttl_seconds: int | None = None,
         now: int | None = None,
+        issue_ts: int | None = None,
+        salt: int | None = None,
+        engine_options: dict[str, str] | None = None,
+        privilege: int | None = None,
+        # legacy compat: callers from the old algorithm may pass nonce —
+        # ignored (no longer in the protocol). Keep param so we don't
+        # break callers mid-deploy.
         nonce: str | None = None,
     ) -> RtcCredentials:
-        """Sign a token for ``user_id`` to join ``channel``.
-
-        Args:
-            channel: RTC channel name. iSales convention: ``call_id``.
-            user_id: RTC participant uid, e.g. ``"engine-{call_id}"`` or
-                ``"edge-{call_id}"``.
-            ttl_seconds: token lifetime in seconds. Defaults to the
-                instance's ``default_ttl_seconds``.
-            now: override current Unix epoch seconds. Tests use this to
-                get deterministic ``expires_at``; production callers leave
-                this ``None``.
-            nonce: override the nonce. Tests use this for reproducible
-                token hashes; production callers leave this ``None`` and
-                let the issuer generate a fresh one per call.
-
-        Returns:
-            :class:`RtcCredentials` with the signed token + metadata.
-
-        Raises:
-            ValueError: if ``channel`` / ``user_id`` is empty, or
-                ``ttl_seconds`` is non-positive.
-        """
         if not channel:
             raise ValueError("channel must be non-empty")
         if not user_id:
@@ -164,37 +228,35 @@ class RtcTokenIssuer:
         effective_ttl = ttl_seconds if ttl_seconds is not None else self._default_ttl_seconds
         if effective_ttl <= 0:
             raise ValueError("ttl_seconds must be positive")
+        del nonce  # accepted for backwards compat, not used
 
         now_ts = int(now) if now is not None else int(time.time())
         expires_at = now_ts + effective_ttl
-        # Default nonce="" per current Aliyun v3 doc (Base64 Token form).
-        nonce_val = nonce if nonce is not None else ""
-        sha = self._compute_token(channel, user_id, expires_at)
-        # v3 应用 SDK 4-arg JoinChannel 要 Base64(JSON) token (per
-        # https://help.aliyun.com/zh/live/token-based-authentication
-        # § "Base64 Token")，不是 raw sha256 hex (那是老 v2 form)。
-        payload = {
-            "appid": self._app_id,
-            "channelid": channel,
-            "userid": user_id,
-            "nonce": nonce_val,
-            "timestamp": expires_at,
-            "token": sha,
-        }
-        # NOTE: 不传 separators — Aliyun 官方 Python 示例用 json.dumps()
-        # 默认 separator (", ", ": ") 含空格；服务端 byte-match 期望该
-        # 格式。紧凑 separators=(",", ":") 会导致 401 auth invalid
-        # (实测 2026-05-24 windows-artc-pybind11-join-config §4)。
-        token_b64 = base64.b64encode(
-            json.dumps(payload).encode("utf-8")
-        ).decode("ascii")
+        issue_ts_v = int(issue_ts) if issue_ts is not None else now_ts
+        # salt MUST be in [1, issue_ts] per sample (random.randint(1,
+        # issue_timestamp)). 用 secrets.randbelow + 1 取 [1, issue_ts]。
+        salt_v = (
+            int(salt) if salt is not None
+            else (secrets.randbelow(max(issue_ts_v, 1)) + 1)
+        )
+
+        token = self._build_token(
+            channel=channel,
+            user_id=user_id,
+            expires_at=expires_at,
+            issue_ts=issue_ts_v,
+            salt=salt_v,
+            engine_options=engine_options,
+            privilege=privilege,
+        )
         return RtcCredentials(
             app_id=self._app_id,
             channel=channel,
             user_id=user_id,
-            nonce=nonce_val,
-            token=token_b64,
+            token=token,
             expires_at=expires_at,
+            issue_ts=issue_ts_v,
+            salt=salt_v,
         )
 
     def sign_for_call(
@@ -203,16 +265,6 @@ class RtcTokenIssuer:
         *,
         ttl_seconds: int | None = None,
     ) -> tuple[RtcCredentials, RtcCredentials]:
-        """Sign both the engine-side and edge-side credentials for one call.
-
-        Returns ``(engine_creds, edge_creds)``. Channel is the ``call_id``;
-        the engine joins as ``"engine-{call_id}"`` and subscribes filtering
-        on the edge uid ``"edge-{call_id}"`` — the convention pinned by
-        arch-cloud-edge-split design Decision 2.
-
-        The two credentials share the same ``call_id`` channel but have
-        independent ``nonce`` / ``token``: each uid signs its own.
-        """
         if not call_id:
             raise ValueError("call_id must be non-empty")
         engine_creds = self.sign(
@@ -227,23 +279,39 @@ class RtcTokenIssuer:
         )
         return engine_creds, edge_creds
 
-    def _compute_token(
+    def _build_token(
         self,
+        *,
         channel: str,
         user_id: str,
         expires_at: int,
+        issue_ts: int,
+        salt: int,
+        engine_options: dict[str, str] | None,
+        privilege: int | None,
     ) -> str:
-        # Hash 内**不含 nonce**，per Aliyun v3 doc Python example:
-        # h = sha256(); h.update(app_id); h.update(app_key);
-        # h.update(channel); h.update(user_id); h.update(timestamp).
-        # See https://help.aliyun.com/zh/live/token-based-authentication.
-        h = hashlib.sha256()
-        h.update(self._app_id.encode("utf-8"))
-        h.update(self._app_key.encode("utf-8"))
-        h.update(channel.encode("utf-8"))
-        h.update(user_id.encode("utf-8"))
-        h.update(str(expires_at).encode("utf-8"))
-        return h.hexdigest()
+        sign_key = _generate_sign_key(self._app_key, issue_ts, salt)
+
+        body = io.BytesIO()
+        aid = self._app_id.encode("utf-8")
+        body.write(_pack_u32(len(aid)))
+        body.write(aid)
+        body.write(_pack_u32(issue_ts))
+        body.write(_pack_u32(salt))
+        body.write(_pack_u32(expires_at))
+        body.write(_pack_service(channel, user_id, privilege))
+        body.write(_pack_options(engine_options))
+
+        body_padded = _pad256(body.getvalue())
+        signature = hmac.new(sign_key, body_padded, hashlib.sha256).digest()
+
+        outer = io.BytesIO()
+        outer.write(_pack_u32(len(signature)))
+        outer.write(signature)
+        outer.write(body_padded)
+
+        outer_padded = _pad256(outer.getvalue())
+        return _VERSION_0 + base64.b64encode(_zlib_compress(outer_padded)).decode("ascii")
 
 
 __all__ = ["RtcCredentials", "RtcTokenIssuer"]
