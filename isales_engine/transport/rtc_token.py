@@ -181,8 +181,12 @@ class RtcTokenIssuer:
             "timestamp": expires_at,
             "token": sha,
         }
+        # NOTE: 不传 separators — Aliyun 官方 Python 示例用 json.dumps()
+        # 默认 separator (", ", ": ") 含空格；服务端 byte-match 期望该
+        # 格式。紧凑 separators=(",", ":") 会导致 401 auth invalid
+        # (实测 2026-05-24 windows-artc-pybind11-join-config §4)。
         token_b64 = base64.b64encode(
-            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            json.dumps(payload).encode("utf-8")
         ).decode("ascii")
         return RtcCredentials(
             app_id=self._app_id,
