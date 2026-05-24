@@ -150,26 +150,23 @@ async def test_4xx_raises_invalid_request() -> None:
 
 
 def test_factory_volcengine_requires_credentials() -> None:
-    from isales_engine.providers.factory import build_tts
-    from isales_engine.settings import Settings
+    """缺 app_key 字段 = NotImplementedError (provider-credential SSOT)."""
+    from isales_common.credentials import CredentialStore
 
-    empty = Settings(
-        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
-        ISALES_REDIS_URL="redis://localhost:6379/0",
-    )
-    with pytest.raises(NotImplementedError, match="VOLCENGINE_APP_KEY"):
-        build_tts("volcengine", settings=empty)
+    from isales_engine.providers.factory import build_tts
+
+    empty_store = CredentialStore()
+    with pytest.raises(NotImplementedError, match="app_key"):
+        build_tts("volcengine", store=empty_store)
 
 
 def test_factory_volcengine_with_credentials() -> None:
-    from isales_engine.providers.factory import build_tts
-    from isales_engine.settings import Settings
+    from isales_common.credentials import CredentialStore
 
-    s = Settings(
-        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
-        ISALES_REDIS_URL="redis://localhost:6379/0",
-        ISALES_VOLCENGINE_APP_KEY="k",
-        ISALES_VOLCENGINE_APP_TOKEN="t",
+    from isales_engine.providers.factory import build_tts
+
+    store = CredentialStore(
+        {"volcengine": {"app_key": "k", "app_token": "t"}}
     )
-    provider = build_tts("volcengine", settings=s)
+    provider = build_tts("volcengine", store=store)
     assert isinstance(provider, VolcengineTTSProvider)

@@ -1,4 +1,11 @@
-"""Process-level settings loaded from environment variables."""
+"""Process-level settings loaded from environment variables.
+
+provider 凭据 (volcengine app_key/app_token, openai api_key 等) 不再
+从 env 读取，转走 provider_credential 表 + CredentialStore。本 Settings
+对象只持有非凭据配置 (DB URL、provider 名字、telephony 模式等)。
+
+凭据 SSOT 切换历史: impl-provider-credential-db-ssot (2026-05-24)。
+"""
 
 from __future__ import annotations
 
@@ -35,7 +42,9 @@ class Settings(BaseSettings):
         default="", alias="ISALES_ENGINE_EDGE_DEVICE_ID"
     )
     engine_rtc_app_id: str = Field(default="", alias="ISALES_RTC_APP_ID")
-    # Cloud-only secret; never crosses the cloud-edge boundary.
+    # ARTC RTC AppKey — NOT a model provider credential, NOT under
+    # provider_credential SSOT. Stays in env (engine-only, never crosses
+    # cloud-edge). See impl-provider-credential-db-ssot design § Non-Goals.
     engine_rtc_app_key: str = Field(default="", alias="ISALES_RTC_APP_KEY")
     # vendor → real ARTC SDK via LD_LIBRARY_PATH/PYTHONPATH;
     # in_memory → InMemorySdkChannel test double (local dev / smoke).
@@ -78,32 +87,19 @@ class Settings(BaseSettings):
         default=50_000, alias="ISALES_ENGINE_TOKEN_BUDGET_PER_CALL"
     )
 
-    # Volcengine (火山引擎) shared credentials for ASR / TTS / LLM (豆包).
-    volcengine_app_key: str | None = Field(
-        default=None, alias="ISALES_VOLCENGINE_APP_KEY"
-    )
-    volcengine_app_token: str | None = Field(
-        default=None, alias="ISALES_VOLCENGINE_APP_TOKEN"
-    )
-    volcengine_llm_model: str = Field(
-        default="doubao-pro-32k", alias="ISALES_VOLCENGINE_LLM_MODEL"
-    )
-    volcengine_asr_endpoint: str = Field(
-        default="wss://openspeech.bytedance.com/api/v3/asr",
-        alias="ISALES_VOLCENGINE_ASR_ENDPOINT",
-    )
+    # 非凭据 — 默认音色 ID (volcengine TTS-specific 配置，不属密钥)；
+    # 留 env 兼容 sample 化部署 (后续 voice_id 可考虑也移到 DB)。
     volcengine_tts_voice_id_default: str = Field(
         default="BV001_streaming", alias="ISALES_VOLCENGINE_TTS_VOICE_ID_DEFAULT"
     )
 
-    # OpenAI (chat completions; supports OpenAI-compatible base URLs incl.
-    # Azure OpenAI / 第三方兼容服务).
-    openai_api_key: str | None = Field(default=None, alias="ISALES_OPENAI_API_KEY")
-    openai_base_url: str = Field(
-        default="https://api.openai.com/v1", alias="ISALES_OPENAI_BASE_URL"
-    )
-    openai_llm_model: str = Field(
-        default="gpt-4o-mini", alias="ISALES_OPENAI_LLM_MODEL"
+    # ---- impl-provider-credential-db-ssot (2026-05-24) ------------------
+
+    # True (default) — engine startup MUST 从 DB 装载 provider 凭据；装载
+    # 失败 (DB 不可达 / Fernet 解密失败 / 表空) → 进程退出。
+    # False — 仅 dev/CI 用；装载失败时强制走 mock provider。
+    credentials_required: bool = Field(
+        default=True, alias="ISALES_CREDENTIALS_REQUIRED"
     )
 
     # Live-API integration tests opt-in. CI must NOT set this.

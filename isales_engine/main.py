@@ -22,7 +22,9 @@ import logging
 import signal
 from collections.abc import Awaitable, Callable
 
+from isales_common.credentials import CredentialStore
 from isales_common.transport.cloud_edge import CloudEdgeServer
+from isales_common.utils.crypto import CryptoConfigError, CryptoError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from isales_engine.call_session import CallSession
@@ -107,12 +109,57 @@ def _build_telephony(
     raise NotImplementedError(f"telephony_mode {mode!r} not wired")
 
 
+async def _load_credentials(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> CredentialStore:
+    """Load provider credentials from DB at startup.
+
+    Failure handling per provider-credential spec § "装载失败时硬失败":
+    - credentials_required=True (default): exit (let systemd restart-loop
+      reveal the problem).
+    - credentials_required=False (dev/CI): warn + return empty store so
+      every non-mock build_* path will NotImplementedError when invoked;
+      pipeline can still run with engine_*_provider=mock.
+    """
+    try:
+        async with sessionmaker() as db:
+            store = await CredentialStore.from_db(db)
+        logger.info(
+            "credentials_loaded count=%d providers=%s",
+            store.row_count(),
+            sorted(store.providers()),
+        )
+        return store
+    except (CryptoConfigError, CryptoError) as exc:
+        if settings.credentials_required:
+            logger.error("cred_load_failed reason=%s", exc)
+            raise SystemExit(
+                f"cred_load_failed: {exc}. See RUNBOOK § '凭据轮换 / 主密钥'."
+            ) from exc
+        logger.warning(
+            "cred_load_failed_falling_back_to_mock reason=%s (CREDENTIALS_REQUIRED=false)",
+            exc,
+        )
+        return CredentialStore()
+    except Exception as exc:  # pragma: no cover - DB unreachable
+        if settings.credentials_required:
+            logger.error("cred_load_failed reason=db_unreachable: %s", exc)
+            raise SystemExit(f"cred_load_failed: {exc}") from exc
+        logger.warning(
+            "cred_load_failed_falling_back_to_mock reason=%s (CREDENTIALS_REQUIRED=false)",
+            exc,
+        )
+        return CredentialStore()
+
+
 def _make_runner(
     *,
     sessionmaker: async_sessionmaker[AsyncSession],
     telephony: TelephonyClient,
     publisher: EventPublisher,
     settings: Settings,
+    credentials: CredentialStore,
 ) -> Callable[[CallSession], Awaitable[None]]:
     """Return the ``runner`` callable consumed by ``dial_consumer.dial_loop``."""
 
@@ -152,9 +199,9 @@ def _make_runner(
             )
 
         providers = Providers(
-            llm=build_llm(settings.engine_llm_provider),
-            asr=build_asr(settings.engine_asr_provider),
-            tts=build_tts(settings.engine_tts_provider),
+            llm=build_llm(settings.engine_llm_provider, store=credentials),
+            asr=build_asr(settings.engine_asr_provider, store=credentials),
+            tts=build_tts(settings.engine_tts_provider, store=credentials),
         )
 
         # The DialCommand on the edge carries the scheduler-selected
@@ -224,11 +271,14 @@ async def _main() -> None:
         grpc_server=grpc_server,
     )
 
+    credentials = await _load_credentials(sessionmaker, settings)
+
     runner = _make_runner(
         sessionmaker=sessionmaker,
         telephony=telephony,
         publisher=publisher,
         settings=settings,
+        credentials=credentials,
     )
 
     async def _on_manual_hangup(call_record_id: int, _operator: str | None) -> None:

@@ -1,9 +1,15 @@
-"""Tests for providers/_errors.py + factory routing."""
+"""Tests for providers/_errors.py + factory routing.
+
+impl-provider-credential-db-ssot (2026-05-24) 把 provider 凭据从 env 切
+到 DB-backed CredentialStore；factory.build_* 不再接 Settings，改接
+CredentialStore。本测试同步更新。
+"""
 
 from __future__ import annotations
 
 import httpx
 import pytest
+from isales_common.credentials import CredentialStore
 
 from isales_engine.providers._errors import (
     ProviderInvalidRequest,
@@ -97,30 +103,23 @@ def test_build_llm_mock_works() -> None:
 
 
 def test_build_llm_real_providers_require_credentials() -> None:
-    from isales_engine.settings import Settings
-
-    empty = Settings(
-        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
-        ISALES_REDIS_URL="redis://localhost:6379/0",
-    )
-    with pytest.raises(NotImplementedError, match="VOLCENGINE_APP_TOKEN"):
-        build_llm("volcengine", settings=empty)
-    with pytest.raises(NotImplementedError, match="OPENAI_API_KEY"):
-        build_llm("openai", settings=empty)
+    """store=None 或 store 缺字段 = NotImplementedError."""
+    empty_store = CredentialStore()
+    with pytest.raises(NotImplementedError, match="app_token"):
+        build_llm("volcengine", store=empty_store)
+    with pytest.raises(NotImplementedError, match="api_key"):
+        build_llm("openai", store=empty_store)
 
 
 def test_build_llm_volcengine_with_credentials() -> None:
     from isales_engine.providers.llm_openai_compatible import (
         OpenAICompatibleLLMProvider,
     )
-    from isales_engine.settings import Settings
 
-    s = Settings(
-        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
-        ISALES_REDIS_URL="redis://localhost:6379/0",
-        ISALES_VOLCENGINE_APP_TOKEN="t",
+    store = CredentialStore(
+        {"volcengine": {"app_token": "t", "app_key": "k"}}
     )
-    provider = build_llm("volcengine", settings=s)
+    provider = build_llm("volcengine", store=store)
     assert isinstance(provider, OpenAICompatibleLLMProvider)
 
 
@@ -128,28 +127,18 @@ def test_build_llm_openai_with_credentials() -> None:
     from isales_engine.providers.llm_openai_compatible import (
         OpenAICompatibleLLMProvider,
     )
-    from isales_engine.settings import Settings
 
-    s = Settings(
-        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
-        ISALES_REDIS_URL="redis://localhost:6379/0",
-        ISALES_OPENAI_API_KEY="sk-x",
-    )
-    provider = build_llm("openai", settings=s)
+    store = CredentialStore({"openai": {"api_key": "sk-x"}})
+    provider = build_llm("openai", store=store)
     assert isinstance(provider, OpenAICompatibleLLMProvider)
 
 
 def test_build_llm_with_explicit_model_override() -> None:
-    """PR #8 use-case: Campaign-level model selection."""
-
-    from isales_engine.settings import Settings
-
-    s = Settings(
-        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
-        ISALES_REDIS_URL="redis://localhost:6379/0",
-        ISALES_OPENAI_API_KEY="sk-x",
+    """Campaign-level model selection: 显式 model 参数覆盖 store default。"""
+    store = CredentialStore(
+        {"openai": {"api_key": "sk-x", "default_model": "gpt-4o-mini"}}
     )
-    provider = build_llm("openai", model="gpt-4o", settings=s)
+    provider = build_llm("openai", store=store, model="gpt-4o")
     assert provider._model == "gpt-4o"  # type: ignore[attr-defined]
 
 
@@ -158,43 +147,26 @@ def test_build_asr_mock_works() -> None:
 
 
 def test_build_asr_volcengine_requires_credentials() -> None:
-    """PR #4 wired the real provider; missing credentials still raises NotImplementedError."""
-
-    from isales_engine.settings import Settings
-
-    empty = Settings(
-        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
-        ISALES_REDIS_URL="redis://localhost:6379/0",
-    )
-    with pytest.raises(NotImplementedError, match="VOLCENGINE_APP_KEY"):
-        build_asr("volcengine", settings=empty)
+    """缺 app_key / app_token 任一字段 = NotImplementedError."""
+    empty_store = CredentialStore()
+    with pytest.raises(NotImplementedError, match="app_key"):
+        build_asr("volcengine", store=empty_store)
 
 
 def test_build_asr_volcengine_with_credentials() -> None:
     from isales_engine.providers.asr_volcengine import VolcengineASRProvider
-    from isales_engine.settings import Settings
 
-    s = Settings(
-        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
-        ISALES_REDIS_URL="redis://localhost:6379/0",
-        ISALES_VOLCENGINE_APP_KEY="k",
-        ISALES_VOLCENGINE_APP_TOKEN="t",
+    store = CredentialStore(
+        {"volcengine": {"app_key": "k", "app_token": "t"}}
     )
-    provider = build_asr("volcengine", settings=s)
+    provider = build_asr("volcengine", store=store)
     assert isinstance(provider, VolcengineASRProvider)
 
 
 def test_build_tts_volcengine_requires_credentials() -> None:
-    """PR #5 wired the real provider; missing credentials still raises NotImplementedError."""
-
-    from isales_engine.settings import Settings
-
-    empty = Settings(
-        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
-        ISALES_REDIS_URL="redis://localhost:6379/0",
-    )
-    with pytest.raises(NotImplementedError, match="VOLCENGINE_APP_KEY"):
-        build_tts("volcengine", settings=empty)
+    empty_store = CredentialStore()
+    with pytest.raises(NotImplementedError, match="app_key"):
+        build_tts("volcengine", store=empty_store)
 
 
 def test_unknown_provider_lists_known_set() -> None:
@@ -205,21 +177,24 @@ def test_unknown_provider_lists_known_set() -> None:
 # ---- Settings -------------------------------------------------------------
 
 
-def test_settings_loads_new_env_vars(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_settings_no_longer_carries_provider_secrets(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """SSOT 切换后 Settings 不再持有 provider 密钥；env 变量被读取但不
+    expose 在 Settings 属性上 (pydantic-settings 默认 ignore extra)。"""
     monkeypatch.setenv("ISALES_DATABASE_URL", "postgresql+asyncpg://x/y")
     monkeypatch.setenv("ISALES_REDIS_URL", "redis://localhost:6379/0")
-    monkeypatch.setenv("ISALES_VOLCENGINE_APP_KEY", "k")
-    monkeypatch.setenv("ISALES_VOLCENGINE_APP_TOKEN", "t")
-    monkeypatch.setenv("ISALES_OPENAI_API_KEY", "sk-x")
+    # 老 env 字段即使设置也不该 expose 在 Settings 上
+    monkeypatch.setenv("ISALES_VOLCENGINE_APP_KEY", "should-be-ignored")
+    monkeypatch.setenv("ISALES_OPENAI_API_KEY", "should-also-be-ignored")
 
     from isales_engine.settings import Settings
 
     s = Settings()
-    assert s.volcengine_app_key == "k"
-    assert s.volcengine_app_token == "t"
-    assert s.volcengine_llm_model == "doubao-pro-32k"
-    assert s.openai_api_key == "sk-x"
-    assert s.openai_base_url == "https://api.openai.com/v1"
-    assert s.openai_llm_model == "gpt-4o-mini"
+    assert not hasattr(s, "volcengine_app_key")
+    assert not hasattr(s, "volcengine_app_token")
+    assert not hasattr(s, "openai_api_key")
+    assert not hasattr(s, "openai_base_url")
+    # 保留的非密字段
     assert s.engine_token_budget_per_call == 50_000
     assert s.live_provider_tests is False
+    assert s.credentials_required is True  # 新加字段，默认 True
+    assert s.volcengine_tts_voice_id_default == "BV001_streaming"

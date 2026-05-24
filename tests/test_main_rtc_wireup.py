@@ -186,17 +186,19 @@ async def test_runner_forwards_device_id_hint_to_rtc_client(
         "isales_engine.main.Providers",
         _NoopProviders,
     )
-    monkeypatch.setattr("isales_engine.main.build_llm", lambda _name: None)
-    monkeypatch.setattr("isales_engine.main.build_asr", lambda _name: None)
-    monkeypatch.setattr("isales_engine.main.build_tts", lambda _name: None)
+    monkeypatch.setattr("isales_engine.main.build_llm", lambda _name, **_kw: None)
+    monkeypatch.setattr("isales_engine.main.build_asr", lambda _name, **_kw: None)
+    monkeypatch.setattr("isales_engine.main.build_tts", lambda _name, **_kw: None)
 
     publisher = MagicMock()
     sessionmaker = _StubSessionmaker(lead=_StubLead(lead_id=1, phone="+1"))
+    from isales_common.credentials import CredentialStore
     runner = _make_runner(
         sessionmaker=sessionmaker,
         telephony=client,
         publisher=publisher,
         settings=s,
+        credentials=CredentialStore(),
     )
 
     session = CallSession(
@@ -242,17 +244,19 @@ async def test_runner_skips_hint_for_mock_telephony(
         "isales_engine.main.Providers",
         _NoopProviders,
     )
-    monkeypatch.setattr("isales_engine.main.build_llm", lambda _name: None)
-    monkeypatch.setattr("isales_engine.main.build_asr", lambda _name: None)
-    monkeypatch.setattr("isales_engine.main.build_tts", lambda _name: None)
+    monkeypatch.setattr("isales_engine.main.build_llm", lambda _name, **_kw: None)
+    monkeypatch.setattr("isales_engine.main.build_asr", lambda _name, **_kw: None)
+    monkeypatch.setattr("isales_engine.main.build_tts", lambda _name, **_kw: None)
 
     publisher = MagicMock()
     sessionmaker = _StubSessionmaker(lead=_StubLead(lead_id=1, phone="+1"))
+    from isales_common.credentials import CredentialStore
     runner = _make_runner(
         sessionmaker=sessionmaker,
         telephony=client,
         publisher=publisher,
         settings=s,
+        credentials=CredentialStore(),
     )
 
     session = CallSession(

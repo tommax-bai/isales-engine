@@ -23,21 +23,64 @@ def test_factory_returns_mock_implementations() -> None:
 
 
 def test_factory_rejects_real_providers_without_credentials() -> None:
-    """LLM real providers raise NotImplementedError when credentials are
-    missing (PR #1 wired the stub; PR #2/#3 added real impls)."""
+    """Non-mock providers raise NotImplementedError when:
+    - store is None (caller didn't load credentials);
+    - or the required field is missing from the store.
 
-    from isales_engine.settings import Settings
+    impl-provider-credential-db-ssot 切换 SSOT 后，settings 不再持密钥；
+    凭据走 CredentialStore (DB-backed)。
+    """
+    from isales_common.credentials import CredentialStore
 
-    empty = Settings(
-        ISALES_DATABASE_URL="postgresql+asyncpg://x/y",
-        ISALES_REDIS_URL="redis://localhost:6379/0",
-    )
+    # 1) store=None → 任何非 mock provider 都报错。
     with pytest.raises(NotImplementedError):
-        build_llm("openai", settings=empty)
+        build_llm("openai")
     with pytest.raises(NotImplementedError):
-        build_asr("volcengine", settings=empty)
+        build_asr("volcengine")
     with pytest.raises(NotImplementedError):
         build_tts("alibaba")
+
+    # 2) store 在但缺字段 → 同样报错。
+    empty_store = CredentialStore()
+    with pytest.raises(NotImplementedError):
+        build_llm("openai", store=empty_store)
+    with pytest.raises(NotImplementedError):
+        build_asr("volcengine", store=empty_store)
+
+
+def test_factory_builds_openai_llm_from_store() -> None:
+    """Smoke: store 含 api_key → build_llm 不抛。
+
+    实际 HTTP 调用走 live-provider-tests gate；这里仅验证 store 装载路径。
+    """
+    from isales_common.credentials import CredentialStore
+
+    store = CredentialStore(
+        {
+            "openai": {
+                "api_key": "sk-test-1234",
+                "endpoint": "https://api.openai.com/v1",
+                "default_model": "gpt-4o-mini",
+            }
+        }
+    )
+    provider = build_llm("openai", store=store)
+    assert provider is not None
+
+
+def test_factory_builds_dashscope_llm_from_store() -> None:
+    """dashscope 是新加入的 LLM provider (OpenAI 兼容模式)。"""
+    from isales_common.credentials import CredentialStore
+
+    store = CredentialStore(
+        {
+            "dashscope": {
+                "api_key": "sk-dashscope-test",
+            }
+        }
+    )
+    provider = build_llm("dashscope", store=store)
+    assert provider is not None
 
 
 # ---- KeywordDrivenMockLLM --------------------------------------------------
