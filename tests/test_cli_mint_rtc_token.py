@@ -42,7 +42,7 @@ class TestSignHappyPath:
         assert payload["app_id"] == "app-test"
         assert payload["channel"] == "smoke-channel"
         assert payload["user_id"] == "edge-1"
-        assert payload["nonce"].startswith("AK-")
+        assert payload["nonce"] == ""  # v3 默认 nonce 空 (Aliyun doc 推荐)
         assert len(payload["token"]) == 64  # sha256 hex digest length
         # token 不包含明文 app_key
         assert "key-test" not in payload["token"]

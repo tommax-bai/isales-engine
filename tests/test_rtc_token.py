@@ -88,14 +88,33 @@ def test_same_inputs_same_token() -> None:
     assert a.token == b.token
 
 
-def test_different_nonce_yields_different_token() -> None:
-    """Two signings of the same call/uid get different tokens because
-    the random nonce differs — this is what makes replay attacks hard."""
+def test_default_nonce_is_empty() -> None:
+    """Default nonce 改为 "" 以匹配 v3 应用 + SDK 4-arg JoinChannel form
+    (per https://help.aliyun.com/zh/live/token-based-authentication
+    "Nonce 推荐为空"). 老 AK- 前缀只在 explicit-nonce 路径保留 (AuthInfo
+    form 显式传)。
+
+    副作用: 同 channel+uid+timestamp 两次 sign 得同 token (无随机
+    熵)。安全性靠 expires_at 短 TTL + AppKey 保密 + (将来) AuthInfo
+    传额外 nonce 增加 replay 难度。
+    """
     issuer = RtcTokenIssuer(app_id="a", app_key="k")
     a = issuer.sign(channel="c", user_id="u", now=100)
     b = issuer.sign(channel="c", user_id="u", now=100)
-    assert a.nonce != b.nonce
-    assert a.token != b.token
+    assert a.nonce == ""
+    assert b.nonce == ""
+    assert a.token == b.token  # 同输入 → 同 hash
+
+
+def test_explicit_nonce_still_supported_for_authinfo_form() -> None:
+    """显式传 nonce (如未来 JoinChannel(AuthInfo) form) 仍可用 AK- 前缀
+    或任意字符串。"""
+    issuer = RtcTokenIssuer(app_id="a", app_key="k")
+    a = issuer.sign(channel="c", user_id="u", now=100, nonce="AK-x")
+    b = issuer.sign(channel="c", user_id="u", now=100, nonce="AK-y")
+    assert a.nonce == "AK-x"
+    assert b.nonce == "AK-y"
+    assert a.token != b.token  # 不同 nonce → 不同 hash
 
 
 def test_app_key_never_leaked_via_creds() -> None:
@@ -156,12 +175,16 @@ def test_sign_for_call_returns_engine_and_edge_pair() -> None:
     assert edge_creds.user_id == "edge-call-007"
 
 
-def test_sign_for_call_engine_and_edge_have_independent_nonces() -> None:
+def test_sign_for_call_engine_and_edge_have_distinct_tokens() -> None:
+    """engine 和 edge user_id 不同 → SHA256 输入不同 → token 不同；
+    nonce 默认 "" 不再贡献熵 (per v3 应用 algorithm) — 区分来自 user_id."""
     issuer = RtcTokenIssuer(app_id="a", app_key="k")
     engine_creds, edge_creds = issuer.sign_for_call("c-1")
-    # Each is signed independently with its own freshly-generated nonce.
-    assert engine_creds.nonce != edge_creds.nonce
-    assert engine_creds.token != edge_creds.token
+    assert engine_creds.user_id == "engine-c-1"
+    assert edge_creds.user_id == "edge-c-1"
+    assert engine_creds.nonce == ""
+    assert edge_creds.nonce == ""
+    assert engine_creds.token != edge_creds.token  # 不同 user_id → 不同 hash
 
 
 def test_sign_for_call_empty_call_id_raises() -> None:

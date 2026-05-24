@@ -6,13 +6,26 @@ ARTC SDK 接入 — "云端 engine 自己生成 token + 通过 cloud-edge gRPC
 DialCommand.rtc_token 下发给边缘".
 
 Algorithm per Aliyun official docs
-(https://help.aliyun.com/document_detail/159037.html)::
+(https://help.aliyun.com/zh/live/token-based-authentication)::
 
     token = sha256(app_id + app_key + channel_id + user_id + nonce + timestamp).hexdigest()
 
 The ``timestamp`` is the **expiration** Unix epoch seconds (not issuance
-time). ``nonce`` is required by the spec to start with the ``AK-`` prefix
-followed by alphanumeric characters, max 64 bytes total.
+time).
+
+``nonce`` defaults to empty string ``""`` per the current Aliyun doc
+(v3 应用 + ARTC SDK 7.x) — "Nonce 推荐为空"。SDK 4-arg
+``JoinChannel(token, channel, uid, name)`` form does NOT pass nonce
+explicitly, so the SDK server-side validation re-computes hash with
+``nonce=""``. If our signer uses any other nonce value (e.g. legacy
+"AK-..." prefix used by Aliyun 2.x docs), the hashes diverge and the
+service rejects with error 0x01037D81 (discovered 2026-05-24 via
+windows-artc-pybind11-join-config §4 实测)。
+
+If a non-empty nonce is required (e.g. SDK 8.x), callers MUST pass it
+via the ``JoinChannel(AliEngineAuthInfo, name)`` 2-arg form which
+carries the nonce alongside the token; pybind binding does not yet
+expose that overload.
 
 This module is the ONLY place in the iSales codebase that accepts the
 RTC AppKey. AppKey is a cloud-only secret (loaded from the
@@ -47,17 +60,20 @@ class RtcCredentials:
     expires_at: int  # Unix epoch seconds; the moment the token stops working
 
 
-# Nonce alphabet: ASCII letters + digits, satisfying the docs'
-# "alphanumeric" constraint without any URL-safe-base64 quirks.
+# Nonce default: empty string (per https://help.aliyun.com/zh/live/
+# token-based-authentication "Nonce 推荐为空"). The legacy "AK-xxxx"
+# format was from Aliyun 2.x docs; with v3 apps + ARTC SDK 7.x the
+# server expects nonce="" for the 4-arg JoinChannel(token, ch, uid,
+# name) form. See module docstring.
 _NONCE_ALPHABET = string.ascii_letters + string.digits
-_NONCE_PREFIX = "AK-"
+_NONCE_PREFIX = "AK-"  # kept for explicit-nonce callers (AuthInfo form)
 
 
 def _generate_nonce(body_length: int = 16) -> str:
-    """Produce a ``AK-<random alphanumerics>`` nonce per Aliyun's spec.
+    """Legacy "AK-<random>" nonce (Aliyun 2.x docs).
 
-    Default body length 16 keeps the total well under the 64-byte cap
-    while providing ample uniqueness (62**16 ≈ 4.8e28).
+    Kept for callers that explicitly opt in via ``sign(nonce=...)``;
+    NOT used as default (default is empty string per current v3 docs).
     """
     body = "".join(secrets.choice(_NONCE_ALPHABET) for _ in range(body_length))
     return _NONCE_PREFIX + body
@@ -149,7 +165,9 @@ class RtcTokenIssuer:
 
         now_ts = int(now) if now is not None else int(time.time())
         expires_at = now_ts + effective_ttl
-        nonce_val = nonce if nonce is not None else _generate_nonce()
+        # Default nonce="" per current Aliyun v3 doc; SDK 4-arg JoinChannel
+        # form does not pass nonce so server-side validation uses "".
+        nonce_val = nonce if nonce is not None else ""
         token = self._compute_token(channel, user_id, nonce_val, expires_at)
         return RtcCredentials(
             app_id=self._app_id,
