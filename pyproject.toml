@@ -36,6 +36,7 @@ dev = [
 
 [project.scripts]
 isales-engine = "isales_engine.main:run"
+isales-engine-mint-rtc-token = "isales_engine.cli.mint_rtc_token:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["isales_engine"]
