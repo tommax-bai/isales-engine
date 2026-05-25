@@ -116,11 +116,14 @@ class AliyunRtcSession(RtcSession):
         self._channel.on_inbound_frame(self._on_inbound_frame)
         self._channel.on_buffer_state(self._on_buffer_state)
 
-        # Run the (blocking) SDK join off the event loop to avoid stalling
-        # other engine work; the vendor wrapper is a thin C binding so we
-        # don't want it on the main thread.
-        await asyncio.to_thread(
-            self._channel.join,
+        # Vendor SDK's CreateAliRTCEngine (called inside _channel.join)
+        # invokes asyncio.get_event_loop() to cache a loop reference for
+        # its async callbacks. That call raises in Python 3.10+ when run
+        # from a worker thread without a current loop, so we MUST call it
+        # from the asyncio main thread (vendor's demo.py does the same).
+        # CreateAliRTCEngine is IPC setup to the AliRtcCoreService sidecar
+        # process, not heavy compute — keep it on the loop.
+        self._channel.join(
             channel,
             token,
             uid,
