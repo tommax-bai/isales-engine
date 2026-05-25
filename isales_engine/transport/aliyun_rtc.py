@@ -116,20 +116,30 @@ class AliyunRtcSession(RtcSession):
         self._channel.on_inbound_frame(self._on_inbound_frame)
         self._channel.on_buffer_state(self._on_buffer_state)
 
-        # Vendor SDK's CreateAliRTCEngine (called inside _channel.join)
-        # invokes asyncio.get_event_loop() to cache a loop reference for
-        # its async callbacks. That call raises in Python 3.10+ when run
-        # from a worker thread without a current loop, so we MUST call it
-        # from the asyncio main thread (vendor's demo.py does the same).
-        # CreateAliRTCEngine is IPC setup to the AliRtcCoreService sidecar
-        # process, not heavy compute — keep it on the loop.
-        self._channel.join(
-            channel,
-            token,
-            uid,
-            send_sample_rate=send_sample_rate,
-            send_channels=send_channels,
-        )
+        # Vendor SDK's CreateAliRTCEngine internally calls:
+        #   loop = asyncio.get_event_loop()
+        #   loop.run_until_complete(engine.InitializeEngine(...))
+        # This requires the current thread to have an event loop **that
+        # is not currently running**. Two failure modes:
+        #   - call from running main loop → "event loop is already running"
+        #   - call from to_thread worker (no loop) → "no current event loop"
+        # Right path: run SDK init in a worker thread that has its OWN
+        # fresh loop, used only for vendor's run_until_complete during
+        # init. Post-init callbacks come via the AliRtcCoreService sidecar
+        # process (IPC), which marshals onto our cached main loop via
+        # ``self._loop.call_soon_threadsafe`` in the handler — independent
+        # of this init-time loop.
+        def _do_join() -> None:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            self._channel.join(
+                channel,
+                token,
+                uid,
+                send_sample_rate=send_sample_rate,
+                send_channels=send_channels,
+            )
+
+        await asyncio.to_thread(_do_join)
         self._joined = True
 
     async def leave(self) -> None:
