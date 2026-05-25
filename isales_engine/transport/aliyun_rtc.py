@@ -116,39 +116,27 @@ class AliyunRtcSession(RtcSession):
         self._channel.on_inbound_frame(self._on_inbound_frame)
         self._channel.on_buffer_state(self._on_buffer_state)
 
-        # Vendor SDK's CreateAliRTCEngine internally calls:
-        #   loop = asyncio.get_event_loop()
-        #   loop.run_until_complete(engine.InitializeEngine(...))
-        # This requires the current thread to have an event loop **that
-        # is not currently running**. Two failure modes:
-        #   - call from running main loop → "event loop is already running"
-        #   - call from to_thread worker (no loop) → "no current event loop"
-        # Right path: run SDK init in a worker thread that has its OWN
-        # fresh loop, used only for vendor's run_until_complete during
-        # init. Post-init callbacks come via the AliRtcCoreService sidecar
-        # process (IPC), which marshals onto our cached main loop via
-        # ``self._loop.call_soon_threadsafe`` in the handler — independent
-        # of this init-time loop.
-        def _do_join() -> None:
-            asyncio.set_event_loop(asyncio.new_event_loop())
-            self._channel.join(
-                channel,
-                token,
-                uid,
-                send_sample_rate=send_sample_rate,
-                send_channels=send_channels,
-            )
-
-        await asyncio.to_thread(_do_join)
+        # The vendor SDK's threading model is owned by the SdkChannel
+        # adaptor (see _AliyunArtcChannel + _ArtcDriverThread). The
+        # adaptor spawns its own driver thread and dispatches vendor
+        # calls onto it; we just await the resulting future. No
+        # to_thread / set_event_loop here.
+        await self._channel.join(
+            channel,
+            token,
+            uid,
+            send_sample_rate=send_sample_rate,
+            send_channels=send_channels,
+        )
         self._joined = True
 
     async def leave(self) -> None:
         if not self._joined:
             return
         self._joined = False
-        # Tell the SDK to release the channel; off-loop because the vendor
-        # call can block.
-        await asyncio.to_thread(self._channel.leave)
+        # Tell the SDK to release the channel. The adaptor blocks
+        # internally on its driver thread cleanup; await it directly.
+        await self._channel.leave()
         # Sentinel ends any in-flight audio_frames() iterator.
         await self._inbound.put(None)
         # Release anyone waiting on outbound drain.
@@ -214,7 +202,13 @@ class AliyunRtcSession(RtcSession):
         # Try once. If the SDK accepts but reports full (a transient
         # signal — the frame still went in but no more space), clear the
         # drain event so the NEXT push awaits.
-        ret = self._channel.push_audio(pcm, timestamp_ms=timestamp_ms)
+        #
+        # The adaptor MAY raise :class:`RtcPushBackpressure` when its
+        # driver-thread command queue is at cap; in that case we surface
+        # it directly (caller is expected to slow down TTS chunking).
+        # The MUST-NOT-block-main-loop guarantee comes from the adaptor's
+        # non-blocking enqueue (queue.put_nowait), not from this layer.
+        ret = await self._channel.push_audio(pcm, timestamp_ms=timestamp_ms)
         if ret != 0:
             # Vendor's ERR_AUDIO_BUFFER_FULL convention: the frame was
             # rejected; signal backpressure for the next call.
@@ -261,8 +255,14 @@ class InMemorySdkChannel(SdkChannel):
         self.reject_next_push = False
 
     # ----- SdkChannel surface --------------------------------------------
+    #
+    # Lifecycle methods are ``async def`` to match the protocol — the
+    # production adaptor dispatches through a driver thread; this test
+    # double just flips a flag inline. The ``async`` ceremony has no
+    # behavioural impact for tests but keeps mypy + the abstract Protocol
+    # happy.
 
-    def join(
+    async def join(
         self,
         channel: str,
         token: str,
@@ -273,10 +273,10 @@ class InMemorySdkChannel(SdkChannel):
     ) -> None:
         self._joined = True
 
-    def leave(self) -> None:
+    async def leave(self) -> None:
         self._joined = False
 
-    def push_audio(self, pcm: bytes, *, timestamp_ms: int) -> int:
+    async def push_audio(self, pcm: bytes, *, timestamp_ms: int) -> int:
         if not self._joined:
             raise RuntimeError("push_audio() before join() (test setup bug)")
         if self.reject_next_push:

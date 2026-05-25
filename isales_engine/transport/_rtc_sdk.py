@@ -43,14 +43,21 @@ unpacked ``Python/`` directory. Default is the deploy-script convention
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import logging
 import os
 import sys
-import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol
+
+from isales_common.audio.rtc import RtcPushBackpressure
+
+from isales_engine.transport._rtc_driver import (
+    DriverQueueFull,
+    _ArtcDriverThread,
+)
 
 if TYPE_CHECKING:
     pass
@@ -79,12 +86,21 @@ BufferStateCallback = Callable[[bool], None]
 class SdkChannel(Protocol):
     """Minimum surface a vendor RTC SDK must expose for cloud-side use.
 
-    Implementations are NOT asyncio-aware; the engine wrapper
-    (:class:`AliyunRtcSession`) bridges callbacks to asyncio via
+    Lifecycle methods (:meth:`join`, :meth:`leave`, :meth:`push_audio`)
+    are async because the production adaptor (:class:`_AliyunArtcChannel`)
+    dispatches vendor SDK calls onto a dedicated driver thread (see
+    :mod:`isales_engine.transport._rtc_driver`). Test doubles can
+    implement them as trivial ``async def`` (no await) since their work
+    is in-memory.
+
+    Callback registration is sync; callbacks themselves fire on the
+    driver thread (production) or the caller thread (in-memory test
+    double). :class:`AliyunRtcSession` is responsible for marshaling
+    those callbacks onto the engine event loop via
     ``loop.call_soon_threadsafe``.
     """
 
-    def join(
+    async def join(
         self,
         channel: str,
         token: str,
@@ -95,21 +111,27 @@ class SdkChannel(Protocol):
     ) -> None:
         """Open a channel and join as ``uid`` with ``publisher_subscriber`` role.
 
-        Blocks until the SDK reports the channel joined. Raises on
-        auth / network failure.
+        Resolves once the SDK reports the channel joined (vendor's
+        ``OnJoinChannelResult`` callback fires). Raises on auth / network
+        failure.
         """
         ...
 
-    def leave(self) -> None:
+    async def leave(self) -> None:
         """Leave the channel, release SDK resources. Idempotent."""
         ...
 
-    def push_audio(self, pcm: bytes, *, timestamp_ms: int) -> int:
+    async def push_audio(self, pcm: bytes, *, timestamp_ms: int) -> int:
         """Push outbound PCM. Returns 0 on success.
 
         Returns a positive int when the SDK's outbound buffer is full
         (vendor's ``ERR_AUDIO_BUFFER_FULL``); callers SHOULD await a
         :data:`BufferStateCallback` with ``is_full=False`` before retrying.
+
+        MAY raise :class:`RtcPushBackpressure` when the driver-thread
+        command queue is at its cap — that's a stronger backpressure
+        signal than vendor's per-frame return code (queue saturation
+        means the driver thread itself can't keep up).
         """
         ...
 
@@ -211,23 +233,33 @@ def vendor_channel_factory(app_id: str) -> SdkChannel:
 class _AliyunArtcChannel:
     """Production :class:`SdkChannel` over Aliyun ARTC SDK for Linux Python.
 
-    Subclasses the vendor's :class:`EngineEventHandlerInterface` to route
-    the relevant callbacks (out of ~70 total) back into the ``SdkChannel``
-    contract:
+    Threading model — the critical bit:
 
-    - ``OnJoinChannelResult`` → unblocks :meth:`join`.
+    Vendor's ``AliRTCEngineImpl`` is Python ↔ TCP-sidecar IPC. Inside
+    ``CreateAliRTCEngine`` it registers two long-lived asyncio tasks
+    (``__recvCoroutine`` + ``__heartbeatCoroutine``) on whatever loop is
+    current; both only progress while their loop is being driven. Vendor
+    SDK entry points (``JoinChannel``, ``Release``, …) then call
+    ``loop.run_until_complete(__writeData(...))`` against the SAME loop.
+
+    Therefore every vendor API call and every pump iteration must run on
+    the SAME thread against the SAME loop. We achieve that by owning a
+    :class:`_ArtcDriverThread` per channel instance and dispatching all
+    vendor calls through ``self._driver.call(...)``. See
+    :mod:`isales_engine.transport._rtc_driver` for the pump details.
+
+    Vendor callback handling:
+
+    - ``OnJoinChannelResult`` → unblocks :meth:`join` via an asyncio
+      ``Event`` on the main loop (callback fires on the driver thread,
+      so the ``Event`` set is marshaled with ``call_soon_threadsafe``).
     - ``OnSubscribeAudioFrame`` → :data:`InboundFrameCallback`.
     - ``OnPushAudioFrameBufferFull`` → :data:`BufferStateCallback`.
-    - ``OnLeaveChannelResult`` → logged, not surfaced (caller already moved on).
-    - ``OnError`` → logged.
-
-    The vendor's ``JoinChannel`` is fire-and-forget; this adaptor blocks
-    in :meth:`join` until ``OnJoinChannelResult`` fires, via a
-    ``threading.Event``. :class:`AliyunRtcSession` calls ``join`` inside
-    ``asyncio.to_thread`` so the asyncio event loop stays unblocked.
+    - ``OnLeaveChannelResult`` / ``OnError`` / ``OnWarning`` → logged.
 
     Lifecycle: one instance per call. Reuse after :meth:`leave` is not
-    supported (the vendor's engine instance is released).
+    supported (the vendor's engine instance is released, and the driver
+    thread is joined).
     """
 
     def __init__(
@@ -244,9 +276,18 @@ class _AliyunArtcChannel:
         self._handler: Any = None
         self._inbound_cb: InboundFrameCallback | None = None
         self._buffer_cb: BufferStateCallback | None = None
-        # OnJoinChannelResult signaling.
-        self._join_event = threading.Event()
+        # Driver thread is spawned lazily in join() and torn down in
+        # leave(); see design Decision 5 — __init__ may run before token
+        # mint succeeds and we don't want a thread for a session that
+        # never joins.
+        self._driver: _ArtcDriverThread | None = None
+        # OnJoinChannelResult is set on the driver thread; marshaled to
+        # the main loop via call_soon_threadsafe so join() can await it.
+        self._join_event: asyncio.Event | None = None
         self._join_result: int | None = None
+        # Cached so the vendor-callback closure can post back to the
+        # session's loop (callbacks fire on the driver thread).
+        self._main_loop: asyncio.AbstractEventLoop | None = None
 
     # ----- SdkChannel surface --------------------------------------------
 
@@ -256,7 +297,7 @@ class _AliyunArtcChannel:
     def on_buffer_state(self, callback: BufferStateCallback) -> None:
         self._buffer_cb = callback
 
-    def join(
+    async def join(
         self,
         channel: str,
         token: str,
@@ -268,8 +309,85 @@ class _AliyunArtcChannel:
         if self._engine is not None:
             raise RuntimeError("channel already joined")
 
+        self._main_loop = asyncio.get_running_loop()
+        self._join_event = asyncio.Event()
+        self._join_result = None
         self._handler = self._build_handler()
 
+        # Spawn driver thread BEFORE first vendor call — both
+        # CreateAliRTCEngine and JoinChannel must run on its loop.
+        self._driver = _ArtcDriverThread(name=f"artc-driver-{uid}")
+        self._driver.start(main_loop=self._main_loop)
+
+        try:
+            await self._driver.call(self._do_create_engine)
+            await self._driver.call(
+                self._do_configure_audio,
+                send_sample_rate=send_sample_rate,
+                send_channels=send_channels,
+            )
+            await self._driver.call(
+                self._do_join_channel,
+                channel=channel,
+                token=token,
+                uid=uid,
+            )
+            # Vendor's JoinChannel is fire-and-forget at the IPC layer;
+            # OnJoinChannelResult fires on a later driver-thread pump
+            # iteration. 30s timeout matches the previous behavior.
+            try:
+                await asyncio.wait_for(self._join_event.wait(), timeout=30.0)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    "OnJoinChannelResult timed out after 30s",
+                ) from exc
+            if self._join_result != 0:
+                raise RuntimeError(
+                    f"OnJoinChannelResult reported failure: result={self._join_result}",
+                )
+        except BaseException:
+            # join failed mid-flight — tear down the driver so we don't
+            # leak a thread for a session that never went live. The
+            # engine itself may or may not exist; best-effort release.
+            await self._teardown_driver()
+            raise
+
+    async def leave(self) -> None:
+        if self._engine is None and self._driver is None:
+            return
+        if self._engine is not None and self._driver is not None:
+            try:
+                await self._driver.call(self._do_leave_engine)
+            except BaseException:  # noqa: BLE001
+                # Even if the vendor cleanup misbehaves, we still need to
+                # stop the driver thread — don't let a leaky release pin
+                # the thread forever.
+                logger.exception("error during AliyunArtcChannel.leave vendor cleanup")
+        await self._teardown_driver()
+
+    async def push_audio(self, pcm: bytes, *, timestamp_ms: int) -> int:
+        if self._engine is None or self._driver is None:
+            raise RuntimeError("push_audio() called before join()")
+        try:
+            return await self._driver.call(
+                self._do_push_audio,
+                pcm=pcm,
+                timestamp_ms=timestamp_ms,
+            )
+        except DriverQueueFull as exc:
+            # Translate driver-level saturation into the public RTC
+            # backpressure error so callers handle it uniformly with the
+            # Windows / macOS sessions.
+            raise RtcPushBackpressure(
+                "artc driver command queue full",
+            ) from exc
+
+    # ----- driver-thread closures (vendor SDK calls) --------------------
+
+    def _do_create_engine(self) -> None:
+        """Runs on the driver thread. Vendor's CreateAliRTCEngine
+        internally does loop.run_until_complete(InitializeEngine) which
+        registers the long-lived recvCoroutine on the driver loop."""
         core_service_path = os.environ.get(
             "ISALES_RTC_CORE_SERVICE",
             os.path.join(_resolve_sdk_path(), "Release", "lib", "AliRtcCoreService"),
@@ -291,16 +409,14 @@ class _AliyunArtcChannel:
             extra,
         )
 
+    def _do_configure_audio(
+        self,
+        *,
+        send_sample_rate: int,
+        send_channels: int,
+    ) -> None:
+        """Runs on the driver thread."""
         defs = self._defs
-        join_cfg = defs.JoinChannelConfig()
-        join_cfg.channelProfile = defs.ChannelProfile.ChannelProfileInteractiveLive
-        join_cfg.subscribeAudioFormat = defs.AudioFormat.AudioFormatPcmBeforMixing
-        join_cfg.subscribeVideoFormat = defs.VideoFormat.VideoFormatH264
-        join_cfg.isAudioOnly = True
-        join_cfg.publishAvsyncMode = defs.PublishAvsyncMode.PublishAvsyncWithPts
-        join_cfg.subscribeMode = defs.SubscribeMode.SubscribeAutomatically
-        join_cfg.publishMode = defs.PublishMode.PublishAutomatically
-
         self._engine.PublishLocalAudioStream(True)
         self._engine.SetExternalAudioSource(
             True,
@@ -311,20 +427,32 @@ class _AliyunArtcChannel:
             defs.AliEngineClientRole.AliEngineClientRoleInteractive,
         )
 
+    def _do_join_channel(
+        self,
+        *,
+        channel: str,
+        token: str,
+        uid: str,
+    ) -> None:
+        """Runs on the driver thread. Vendor's JoinChannel internally
+        does loop.run_until_complete(__writeData(...)); the driver thread
+        owns the loop so this is safe."""
+        defs = self._defs
+        join_cfg = defs.JoinChannelConfig()
+        join_cfg.channelProfile = defs.ChannelProfile.ChannelProfileInteractiveLive
+        join_cfg.subscribeAudioFormat = defs.AudioFormat.AudioFormatPcmBeforMixing
+        join_cfg.subscribeVideoFormat = defs.VideoFormat.VideoFormatH264
+        join_cfg.isAudioOnly = True
+        join_cfg.publishAvsyncMode = defs.PublishAvsyncMode.PublishAvsyncWithPts
+        join_cfg.subscribeMode = defs.SubscribeMode.SubscribeAutomatically
+        join_cfg.publishMode = defs.PublishMode.PublishAutomatically
+
         ret = self._engine.JoinChannel(token, channel, uid, uid, join_cfg)
         if ret != 0:
             raise RuntimeError(f"JoinChannel returned non-zero status: {ret}")
 
-        # Wait for OnJoinChannelResult — vendor JoinChannel is asynchronous;
-        # 30s is generous (typical join is sub-second).
-        if not self._join_event.wait(timeout=30.0):
-            raise RuntimeError("OnJoinChannelResult timed out after 30s")
-        if self._join_result != 0:
-            raise RuntimeError(
-                f"OnJoinChannelResult reported failure: result={self._join_result}",
-            )
-
-    def leave(self) -> None:
+    def _do_leave_engine(self) -> None:
+        """Runs on the driver thread."""
         if self._engine is None:
             return
         try:
@@ -334,29 +462,41 @@ class _AliyunArtcChannel:
             # completes; we don't wait for OnLeaveChannelResult since the
             # caller is already moving on. Release is best-effort.
             self._engine.Release()
-        except Exception:  # noqa: BLE001 — vendor exceptions are unspecified
-            logger.exception("error during AliyunArtcChannel.leave")
         finally:
             self._engine = None
-            self._handler = None
-            self._join_event.clear()
-            self._join_result = None
 
-    def push_audio(self, pcm: bytes, *, timestamp_ms: int) -> int:
-        if self._engine is None:
-            raise RuntimeError("push_audio() called before join()")
+    def _do_push_audio(self, *, pcm: bytes, timestamp_ms: int) -> int:
+        """Runs on the driver thread."""
         return int(
             self._engine.PushExternalAudioFrameRawData(pcm, len(pcm), timestamp_ms),
         )
+
+    async def _teardown_driver(self) -> None:
+        """Stop the driver thread and join it; idempotent.
+
+        Runs ``stop`` (which blocks until ``thread.join``) inside
+        ``asyncio.to_thread`` so we don't pin the main loop for up to 5s.
+        """
+        driver = self._driver
+        self._driver = None
+        self._handler = None
+        self._engine = None
+        self._join_event = None
+        self._join_result = None
+        self._main_loop = None
+        if driver is None:
+            return
+        await asyncio.to_thread(driver.stop)
 
     # ----- event handler subclass ----------------------------------------
 
     def _build_handler(self) -> Any:
         """Subclass the vendor's EngineEventHandlerInterface in-place.
 
-        We need ``self`` from the enclosing :class:`_AliyunArtcChannel`
-        instance to fire callbacks, so we build the subclass inside this
-        method and capture ``outer = self`` in the closure.
+        Vendor invokes these callbacks on the driver thread (inside the
+        pump's ``run_until_complete``). Anything that touches asyncio
+        state on the main loop MUST be marshaled with
+        ``call_soon_threadsafe``.
         """
         outer = self
         Base = self._artc.EngineEventHandlerInterface  # noqa: N806 (vendor name)
@@ -369,7 +509,13 @@ class _AliyunArtcChannel:
                 userId: str,
             ) -> None:
                 outer._join_result = result
-                outer._join_event.set()
+                # _join_event is an asyncio.Event on the MAIN loop;
+                # cannot call .set() directly from this driver thread.
+                main_loop = outer._main_loop
+                event = outer._join_event
+                if main_loop is None or event is None:
+                    return
+                main_loop.call_soon_threadsafe(event.set)
 
             def OnLeaveChannelResult(self, result: int) -> None:
                 logger.info("ARTC OnLeaveChannelResult result=%s", result)
@@ -381,9 +527,8 @@ class _AliyunArtcChannel:
                 if pcm is None or pcm.pcmBuf_ is None:
                     return
                 # Vendor's AudioPcmFrame doesn't carry a wall-clock
-                # timestamp; surface frame_ms_ * sequence number is the
-                # caller's concern. We pass 0 for timestamp_ms — the engine
-                # session uses its own monotonic clock for jitter buffer.
+                # timestamp; the engine session uses its own monotonic
+                # clock for jitter buffer.
                 outer._inbound_cb(
                     uid,
                     bytes(pcm.pcmBuf_),
@@ -396,9 +541,15 @@ class _AliyunArtcChannel:
                     outer._buffer_cb(isFull)
 
             def OnError(self, error_code: Any) -> None:
-                logger.warning("ARTC OnError code=%s", getattr(error_code, "value", error_code))
+                logger.warning(
+                    "ARTC OnError code=%s",
+                    getattr(error_code, "value", error_code),
+                )
 
             def OnWarning(self, warning_code: Any) -> None:
-                logger.debug("ARTC OnWarning code=%s", getattr(warning_code, "value", warning_code))
+                logger.debug(
+                    "ARTC OnWarning code=%s",
+                    getattr(warning_code, "value", warning_code),
+                )
 
         return Handler()
