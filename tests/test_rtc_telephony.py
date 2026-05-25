@@ -228,10 +228,11 @@ async def test_dial_sends_dial_command_to_edge() -> None:
         assert dial.rtc_channel == "42"
         assert dial.rtc_uid_engine == "engine-42"
         assert dial.rtc_uid_edge == "edge-42"
-        # Token isn't predictable (random nonce) but must be a non-empty
-        # 64-char SHA-256 hex string.
-        assert len(dial.rtc_token) == 64
-        assert int(dial.rtc_token, 16) >= 0
+        # Token isn't predictable (random salt) but must be ARTC v3.0 binary
+        # format: VERSION_0 "000" prefix + base64(zlib(...)). See
+        # isales_engine/transport/rtc_token.py § "Token format".
+        assert dial.rtc_token.startswith("000")
+        assert len(dial.rtc_token) > 50
 
 
 @pytest.mark.asyncio
