@@ -1,4 +1,13 @@
-"""Aliyun ARTC RTC token signing (cloud-side only).
+"""Aliyun RTC token signing (cloud-side only).
+
+NOTE on naming: "ARTC" in Aliyun docs is the SDK family name
+(ApsaraVideo Real-time Communication SDK) used under two product lines:
+(1) Aliyun RTC PaaS — two-way audio/video with channels, publish/subscribe;
+(2) ApsaraVideo Live — one-to-many low-latency live streaming.
+iSales targets (1) — Aliyun RTC PaaS. The PaaS-vs-Live distinction shows
+up in token format: v3.0 binary (this module) vs the deprecated
+``sha256(appid+appkey+ch+uid+nonce+ts)`` Live algorithm, which the RTC
+roomserver rejects with HTTP 401.
 
 Spec: arch-cloud-edge-split / design.md Decision 1 (Aliyun RTC PaaS) +
 Decision 5 (control plane); device-hardware § Requirement: 云端 engine 的
@@ -10,7 +19,7 @@ Algorithm: authoritative Python 3 reference is
 help.aliyun.com/zh/document_detail/2689025.html — the only correct doc).
 The simpler ``sha256(appid+appkey+ch+uid+nonce+ts)`` algorithm published
 elsewhere (e.g. the old ``aliyunvideo/AliRtcAppServer`` repo) is for the
-deprecated 直播 (Live) product and is rejected by ARTC RTC roomserver
+deprecated 直播 (Live) product and is rejected by Aliyun RTC roomserver
 with HTTP 401 "auth invalid" (实测踩坑过 2026-05-24)。
 
 Token format::
@@ -70,7 +79,7 @@ from dataclasses import dataclass, field
 
 _VERSION_0 = "000"
 
-# Privilege bits (Service.add_*_publish_privilege). v1.0 ARTC RTC iSales
+# Privilege bits (Service.add_*_publish_privilege). v1.0 Aliyun RTC iSales
 # 用 audio-only push/pull，留 None (= ENABLE_PRIVILEGE 默认 = allow all)
 # 跟 sample example0 ("full privileges as default") 行为一致。
 _ENABLE_PRIVILEGE = 1
