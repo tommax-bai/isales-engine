@@ -42,12 +42,13 @@ class Settings(BaseSettings):
         default="", alias="ISALES_ENGINE_EDGE_DEVICE_ID"
     )
     engine_rtc_app_id: str = Field(default="", alias="ISALES_RTC_APP_ID")
-    # ARTC RTC AppKey — NOT a model provider credential, NOT under
+    # DingRTC AppKey — NOT a model provider credential, NOT under
     # provider_credential SSOT. Stays in env (engine-only, never crosses
     # cloud-edge). See impl-provider-credential-db-ssot design § Non-Goals.
     engine_rtc_app_key: str = Field(default="", alias="ISALES_RTC_APP_KEY")
-    # vendor → real ARTC SDK via LD_LIBRARY_PATH/PYTHONPATH;
-    # in_memory → InMemorySdkChannel test double (local dev / smoke).
+    # vendor → real DingRTC SDK (loads dingrtc_pywrap extension, requires
+    # vendor SDK on $ISALES_DINGRTC_LINUX_SDK_PATH and LD_LIBRARY_PATH);
+    # in_memory → InMemoryDingRtcChannel test double (local dev / smoke).
     engine_rtc_sdk_kind: str = Field(
         default="vendor", alias="ISALES_ENGINE_RTC_SDK_KIND"
     )

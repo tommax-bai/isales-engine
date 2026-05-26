@@ -49,7 +49,6 @@ from isales_engine.settings import Settings, load_settings
 from isales_engine.transport.dingrtc import (
     DingRtcSession,
     InMemoryDingRtcChannel,
-    SdkLoadError,  # noqa: F401  — re-exported for backward-compat with old aliyun_rtc import path
 )
 from isales_engine.transport.grpc_server import CloudEdgeGrpcServer
 from isales_engine.transport.hardware_alert_handler import log_hardware_alert
