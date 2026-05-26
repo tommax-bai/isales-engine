@@ -399,6 +399,11 @@ class _PybindDingRtcChannel:
         self._join_future: asyncio.Future[tuple[int, str, str, int]] | None = None
         self._on_join_result_cb: JoinResultCallback | None = None
         self._on_error_cb: ErrorCallback | None = None
+        # Captured from setup_and_join(); reused per-frame so push_audio
+        # never sends ``samplesPerSec=0`` to the SDK (vendor will SIGFPE
+        # on integer-divide by zero inside the audio pipeline).
+        self._send_sample_rate: int = 0
+        self._send_channels: int = 0
 
     async def setup_and_join(
         self,
@@ -414,6 +419,8 @@ class _PybindDingRtcChannel:
     ) -> None:
         self._loop = asyncio.get_running_loop()
         self._join_future = self._loop.create_future()
+        self._send_sample_rate = int(send_sample_rate)
+        self._send_channels = int(send_channels)
 
         # Build SDK objects.
         b = self._binding
@@ -493,11 +500,18 @@ class _PybindDingRtcChannel:
         engine = self._engine
         if engine is None:
             raise RtcNotJoined("push_audio before setup_and_join")
+        # SDK consumes ``RtcEngineAudioFrame.samplesPerSec`` per frame;
+        # passing 0 triggers an integer divide-by-zero inside the audio
+        # pipeline (observed: SIGFPE on Linux 3.9.0 SDK during the
+        # listen loop of ecs_pcm_loopback_listen.py). Always send the
+        # rate captured from ``set_external_audio_source`` at join time.
+        if self._send_sample_rate <= 0 or self._send_channels <= 0:
+            raise RtcNotJoined("push_audio before setup_and_join (rate/channels unset)")
         try:
             engine.push_external_audio(
                 pcm,
-                sample_rate=0,  # 0 = use whatever was configured via SetExternalAudioSource
-                channels=1,
+                sample_rate=self._send_sample_rate,
+                channels=self._send_channels,
                 bytes_per_sample=2,
                 timestamp=timestamp_ms,
             )

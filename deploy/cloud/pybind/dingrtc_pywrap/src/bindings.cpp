@@ -158,6 +158,13 @@ public:
         if (channels <= 0 || bytes_per_sample <= 0) {
             throw DingRtcError(-3, "invalid channels/bytes_per_sample");
         }
+        // Vendor SDK divides internally by samplesPerSec; passing 0
+        // produces SIGFPE inside the audio pipeline (observed on Linux
+        // 3.9.0). Reject up-front with a clear error so a caller bug
+        // surfaces as an exception, not a crashed process.
+        if (sample_rate <= 0) {
+            throw DingRtcError(-3, "invalid sample_rate (must be > 0)");
+        }
         const int num_samples = total_bytes / (bytes_per_sample * channels);
 
         ding::rtc::RtcEngineAudioFrame frame{};
