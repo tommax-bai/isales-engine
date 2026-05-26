@@ -5,7 +5,11 @@
 #include <memory>
 #include <string>
 
-#include "engine_types.h"  // ding::rtc::RtcEngineAudioFrameObserver / RtcEngineAudioFrame
+// RtcEngineAudioFrameObserver is declared in engine_interface.h (not
+// engine_types.h, which only has structs / enums / error codes).
+// engine_interface.h transitively includes engine_types.h, so RtcEngineAudioFrame
+// is reachable too.
+#include "engine_interface.h"
 
 namespace idingrtc {
 

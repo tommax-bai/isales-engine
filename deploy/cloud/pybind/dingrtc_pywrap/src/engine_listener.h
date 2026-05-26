@@ -5,7 +5,9 @@
 #include <mutex>
 #include <string>
 
-#include "engine_types.h"  // ding::rtc::RtcEngineEventListener / RtcEngineStats
+// RtcEngineEventListener is declared in engine_interface.h (engine_types.h
+// only has structs / enums / connection-status types).
+#include "engine_interface.h"
 
 namespace idingrtc {
 
