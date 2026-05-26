@@ -37,13 +37,15 @@ public:
     void clear_callbacks();
 
     // Overrides — called from SDK threads (GIL NOT held by default).
+    // NB: vendor spelling is OnConnectionStatusChanged (with trailing 'd').
+    // OnBye takes the RtcEngineOnByeType enum, not a raw int.
     void OnJoinChannelResult(int result, const char *channel, const char *userId,
                               int elapsed) override;
     void OnLeaveChannelResult(int result, ding::rtc::RtcEngineStats stats) override;
-    void OnBye(int code) override;
+    void OnBye(ding::rtc::RtcEngineOnByeType code) override;
     void OnOccurError(int error, const char *message) override;
-    void OnConnectionStatusChange(ding::rtc::RtcEngineConnectionStatus status,
-                                   ding::rtc::RtcEngineConnectionStatusChangeReason reason)
+    void OnConnectionStatusChanged(ding::rtc::RtcEngineConnectionStatus status,
+                                    ding::rtc::RtcEngineConnectionStatusChangeReason reason)
         override;
 
 private:

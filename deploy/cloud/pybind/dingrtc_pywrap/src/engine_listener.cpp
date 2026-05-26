@@ -84,14 +84,14 @@ void EngineListener::OnLeaveChannelResult(int result, ding::rtc::RtcEngineStats)
     invoke_locked(cb, py::make_tuple(result));
 }
 
-void EngineListener::OnBye(int code) {
+void EngineListener::OnBye(ding::rtc::RtcEngineOnByeType code) {
     py::gil_scoped_acquire gil;
     py::object cb;
     {
         std::lock_guard<std::mutex> lk(mu_);
         cb = on_bye_;
     }
-    invoke_locked(cb, py::make_tuple(code));
+    invoke_locked(cb, py::make_tuple(static_cast<int>(code)));
 }
 
 void EngineListener::OnOccurError(int error, const char *message) {
@@ -104,7 +104,7 @@ void EngineListener::OnOccurError(int error, const char *message) {
     invoke_locked(cb, py::make_tuple(error, message ? message : ""));
 }
 
-void EngineListener::OnConnectionStatusChange(
+void EngineListener::OnConnectionStatusChanged(
     ding::rtc::RtcEngineConnectionStatus status,
     ding::rtc::RtcEngineConnectionStatusChangeReason reason) {
     py::gil_scoped_acquire gil;

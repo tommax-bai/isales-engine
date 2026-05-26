@@ -30,14 +30,17 @@ public:
                   std::string expected_remote_uid);
     ~AudioObserver() override = default;
 
-    // RtcEngineAudioFrameObserver overrides — frame is owned by SDK; copy
-    // before return.
-    void OnCapturedAudioFrame(ding::rtc::RtcEngineAudioFrame *frame) override;
-    void OnProcessCapturedAudioFrame(ding::rtc::RtcEngineAudioFrame *frame) override;
-    void OnPublishAudioFrame(ding::rtc::RtcEngineAudioFrame *frame) override;
-    void OnPlaybackAudioFrame(ding::rtc::RtcEngineAudioFrame *frame) override;
+    // RtcEngineAudioFrameObserver overrides — vendor passes by REFERENCE
+    // (not pointer); copy bytes before return. OnPlaybackAudioFrame /
+    // OnCapturedAudioFrame / OnProcessCapturedAudioFrame / OnPublishAudioFrame
+    // are pure virtual (must override even when unused). OnRemoteUserAudioFrame
+    // has a default empty body.
+    void OnCapturedAudioFrame(ding::rtc::RtcEngineAudioFrame &frame) override;
+    void OnProcessCapturedAudioFrame(ding::rtc::RtcEngineAudioFrame &frame) override;
+    void OnPublishAudioFrame(ding::rtc::RtcEngineAudioFrame &frame) override;
+    void OnPlaybackAudioFrame(ding::rtc::RtcEngineAudioFrame &frame) override;
     void OnRemoteUserAudioFrame(const char *uid,
-                                 ding::rtc::RtcEngineAudioFrame *frame) override;
+                                 ding::rtc::RtcEngineAudioFrame &frame) override;
 
     std::shared_ptr<FrameRingBuffer> buffer() const { return buffer_; }
 
