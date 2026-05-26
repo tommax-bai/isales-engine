@@ -46,7 +46,11 @@ from isales_engine.run_loop import (
 from isales_engine.runtime_config import load_runtime_config
 from isales_engine.session_manager import SessionManager
 from isales_engine.settings import Settings, load_settings
-from isales_engine.transport.aliyun_rtc import AliyunRtcSession, InMemorySdkChannel
+from isales_engine.transport.dingrtc import (
+    DingRtcSession,
+    InMemoryDingRtcChannel,
+    SdkLoadError,  # noqa: F401  — re-exported for backward-compat with old aliyun_rtc import path
+)
 from isales_engine.transport.grpc_server import CloudEdgeGrpcServer
 from isales_engine.transport.hardware_alert_handler import log_hardware_alert
 from isales_engine.transport.heartbeat_handler import make_heartbeat_handler
@@ -88,13 +92,16 @@ def _build_telephony(
         )
         sdk_kind = settings.engine_rtc_sdk_kind
         if sdk_kind == "vendor":
-            def rtc_factory() -> AliyunRtcSession:
-                return AliyunRtcSession.production(
+            def rtc_factory() -> DingRtcSession:
+                return DingRtcSession.production(
                     app_id=settings.engine_rtc_app_id,
                 )
         elif sdk_kind == "in_memory":
-            def rtc_factory() -> AliyunRtcSession:
-                return AliyunRtcSession(channel=InMemorySdkChannel())
+            def rtc_factory() -> DingRtcSession:
+                return DingRtcSession(
+                    channel=InMemoryDingRtcChannel(),
+                    app_id=settings.engine_rtc_app_id,
+                )
         else:
             raise RuntimeError(
                 f"unknown engine_rtc_sdk_kind: {sdk_kind!r}",
