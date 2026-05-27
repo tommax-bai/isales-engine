@@ -103,7 +103,23 @@ class VolcengineTTSProvider(TTSProvider):
         }
         # Payload shape per Volcengine 流式 TTS public docs. Output PCM
         # 8 kHz mono 16-bit LE matches the modem-controller PCM channel.
+        #
+        # OpenSpeech TTS 强制要求 body.app.{appid,token,cluster} + body.user.uid
+        # 即便 HTTP header `App-Key: <appid>` 与 `Authorization: Bearer; <token>`
+        # 已经携带相同信息。第一次跑遇到 400 `Missing required: app.appid` 是
+        # 这一段缺失;App-Key header 值与 app.appid 是同一字符串 (volcengine
+        # 控制台同一个 appid 字段)。cluster 默认 `volcano_tts` 覆盖通用 TTS
+        # voice;如果业务用了 `volcano_icl` (in-context-learning) 或其他 cluster,
+        # 应改走 provider_credential 取 `tts_cluster` field。
         payload = {
+            "app": {
+                "appid": self._app_key,
+                "token": self._app_token,
+                "cluster": "volcano_tts",
+            },
+            "user": {
+                "uid": "isales-engine",
+            },
             "audio": {
                 "voice_type": voice_id,
                 "encoding": "pcm",
