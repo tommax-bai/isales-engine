@@ -12,3 +12,14 @@ venv/
 .env
 .coverage
 htmlcov/
+
+# Vendor RTC SDK binaries / headers — proprietary, never commit. The
+# canonical OS-level location on ECS is `/opt/isales/vendor/DingRTC_Linux_SDK_*/`
+# (managed by `deploy/cloud/scripts/install-dingrtc-sdk.sh`, outside
+# any repo); these globs are forward-compat for in-tree placements
+# (e.g. dev mac unpacking the SDK zip into the repo by mistake) and
+# the `engine-rtc-dingrtc-migration § 9.7` 三端一致检查。
+vendor/DingRTC_*_SDK_*/
+deploy/cloud/vendor/dingrtc-linux/
+deploy/cloud/pybind/dingrtc_pywrap/build/
+deploy/cloud/pybind/dingrtc_pywrap/*.so
