@@ -161,6 +161,21 @@ class _CallState:
 
     async def _inbound_loop(self) -> None:
         import time as _time  # noqa: PLC0415
+        # DingRTC C++ SDK mixed-playback OnPlaybackAudioFrame defaults to
+        # 48 kHz output regardless of how peers join. ASR Provider (and
+        # 8 kHz GSM modem path) need 16 kHz / 8 kHz; resample inline here
+        # rather than burdening every consumer. ``audioop.ratecv`` is the
+        # stdlib stateful resampler (carries fractional sample state across
+        # chunks so a 20 ms 48 kHz chunk → exactly a 20 ms 16 kHz chunk).
+        # Python 3.14+ removes audioop; until then this is the lightweight
+        # path. ASR ``stream_recognize(audio_chunks)`` is the only consumer
+        # in v1.0, so 16 kHz target matches the V3 SAUC required rate.
+        try:
+            import audioop  # noqa: PLC0415
+        except ImportError:  # pragma: no cover  - Py 3.13+ replacement TBD
+            audioop = None
+        target_rate = 16000
+        ratecv_state: Any = None
         recv_count = 0
         last_log_t = _time.monotonic()
         last_log_count = 0
@@ -210,7 +225,18 @@ class _CallState:
                     last_log_t = now
                     last_log_count = recv_count
                     max_rms_window = 0
-                await self.inbound_q.put(pcm)
+                # Resample 48 kHz → 16 kHz if needed (mixed playback default).
+                out_pcm = pcm
+                src_rate = int(frame.sample_rate or 0)
+                if (
+                    src_rate > 0 and src_rate != target_rate
+                    and audioop is not None and pcm
+                ):
+                    out_pcm, ratecv_state = audioop.ratecv(
+                        pcm, 2, frame.channels or 1,
+                        src_rate, target_rate, ratecv_state,
+                    )
+                await self.inbound_q.put(out_pcm)
         except RtcNotJoined:
             # close_iterators() may race ahead of this task being
             # scheduled: leave() invalidates the session before the pump
