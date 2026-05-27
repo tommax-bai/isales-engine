@@ -28,6 +28,41 @@ FOLLOW_UP_APPEND_TEMPLATE = """
 
 SHORT_REPLY_APPEND = "\n\n【打断保护】请用一句话回应。"
 
+# Output-schema suffix appended to the SYSTEM prompt of role/judge/polish.
+# Necessary because the PG-stored system prompts may use legacy phrasing
+# like "直接返回 POSITIVE/NEGATIVE" or "不要输出任何额外的解释,标识等等",
+# which conflict with the parser's expected JSON schema. The suffix is
+# explicitly framed as an OVERRIDE so the model treats it as authoritative
+# over any earlier 输出规则 instruction in the same system message.
+# (dashscope OpenAI-compat JSON mode also requires the substring 'json' to
+# appear somewhere in messages; this suffix satisfies that as a side-effect.)
+ROLE_OUTPUT_SCHEMA_SUFFIX = (
+    "\n\n【输出规则·最高优先级】\n"
+    "无论上述任何输出规则如何描述,你的最终输出必须且只能是一个 JSON 对象,\n"
+    "schema 如下,字段名一字不差,缺一不可:\n"
+    '{"reply": "<面向客户的回复文本>",'
+    ' "goal_achieved": <true|false>,'
+    ' "goal_type": "<目标类型字符串,无则空串>",'
+    ' "extracted": {<结构化字段对象,无则空对象>}}\n'
+    "不要输出 markdown 代码块围栏,不要输出任何解释/标识/前后缀文本。"
+)
+JUDGE_OUTPUT_SCHEMA_SUFFIX = (
+    "\n\n【输出规则·最高优先级】\n"
+    "无论上述任何输出规则如何描述,你的最终输出必须且只能是一个 JSON 对象,\n"
+    "schema 如下,字段名一字不差,缺一不可:\n"
+    '{"passed": <true|false>, "reason": "<简要原因>"}\n'
+    "判断为接受/POSITIVE 时 passed=true; 判断为拒绝/NEGATIVE 时 passed=false。\n"
+    "不要输出 markdown 代码块围栏,不要输出任何解释/标识/前后缀文本。"
+)
+POLISH_OUTPUT_SCHEMA_SUFFIX = (
+    "\n\n【输出规则·最高优先级】\n"
+    "无论上述任何输出规则如何描述,你的最终输出必须且只能是一个 JSON 对象,\n"
+    "schema 如下,字段名一字不差,缺一不可:\n"
+    '{"reply": "<润色后的最终回复文本>",'
+    ' "selected_candidate_index": <从 0 开始的整数,标识被选中的候选索引>}\n'
+    "不要输出 markdown 代码块围栏,不要输出任何解释/标识/前后缀文本。"
+)
+
 
 @dataclass
 class RoleSpec:
@@ -92,19 +127,17 @@ def build_role_messages(
         system += FOLLOW_UP_APPEND_TEMPLATE.format(n=config.follow_up_count)
     if config.short_reply_active:
         system += SHORT_REPLY_APPEND
+    system += ROLE_OUTPUT_SCHEMA_SUFFIX
 
     user = _build_user_message(session, config)
     return [Message(role="system", content=system), Message(role="user", content=user)]
 
 
 def build_judge_messages(judge: JudgeSpec, candidate_reply: str) -> list[Message]:
-    system = "[judge] " + judge.system_prompt
-    # dashscope 兼容模式要求 messages 出现 "json" 字样 + 强制 JSON output 给 parser 用；
-    # parse_judge_output 期望 {"passed": bool, "reason": str}.
+    system = "[judge] " + judge.system_prompt + JUDGE_OUTPUT_SCHEMA_SUFFIX
     user = (
         f"请审查以下候选回复：\n{candidate_reply}\n\n"
-        '请以 JSON 格式回复,例如 {"passed": true, "reason": "..."}。'
-        "仅输出 JSON,不要其他说明。"
+        "按上述系统提示的 JSON schema 输出。"
     )
     return [Message(role="system", content=system), Message(role="user", content=user)]
 
@@ -112,25 +145,22 @@ def build_judge_messages(judge: JudgeSpec, candidate_reply: str) -> list[Message
 def build_polish_messages(
     polish: PolishSpec, candidates: list[str]
 ) -> list[Message]:
-    system = "[polish] " + polish.system_prompt
+    system = "[polish] " + polish.system_prompt + POLISH_OUTPUT_SCHEMA_SUFFIX
     body_lines = [f"candidate[{i}]: {reply}" for i, reply in enumerate(candidates)]
-    # parse_polish_output 期望 {"reply": str, "selected_candidate_index": int}.
     user = (
         "请润色并选优：\n"
         + "\n".join(body_lines)
-        + '\n\n请以 JSON 格式回复,例如 {"reply": "润色后文本", "selected_candidate_index": 0}。'
-        "仅输出 JSON,不要其他说明。"
+        + "\n\n按上述系统提示的 JSON schema 输出。"
     )
     return [Message(role="system", content=system), Message(role="user", content=user)]
 
 
 def build_greeting_messages(role: RoleSpec, config: PipelineConfig) -> list[Message]:
-    system = "[role] " + role.system_prompt
+    system = "[role] " + role.system_prompt + ROLE_OUTPUT_SCHEMA_SUFFIX
     user = (
         f"【线索信息】name={config.lead.name or '—'}, phone={config.lead.phone}\n"
         "【任务】请生成开场白。\n"
-        "请以 JSON 格式回复,例如 {\"reply\": \"开场白文本\"}。"
-        " 仅输出 JSON,不要其他说明。"
+        "按上述系统提示的 JSON schema 输出。"
     )
     return [Message(role="system", content=system), Message(role="user", content=user)]
 
@@ -141,13 +171,11 @@ def _build_user_message(session: CallSession, config: PipelineConfig) -> str:
         parts.append("【上次通话纪要】\n" + config.last_call_summary)
     parts.append(_render_lead_info(config.lead))
     parts.append(_render_dialog(session))
-    # dashscope 兼容模式要求 messages 出现 "json" 字样;parse_role_output 期望
-    # {"reply": str, "goal_achieved": bool, "goal_type": str, "extracted": dict}.
-    parts.append(
-        "【输出格式】请以 JSON 格式回复,例如 "
-        '{"reply": "AI 回复文本", "goal_achieved": false, "goal_type": "", "extracted": {}}。'
-        "仅输出 JSON,不要其他说明。"
-    )
+    # Schema requirement lives in ROLE_OUTPUT_SCHEMA_SUFFIX on the system prompt,
+    # not here — system has higher precedence and the PG-stored role prompt
+    # otherwise dominates. Keeping the literal substring "JSON" here for the
+    # dashscope OpenAI-compat 'messages must contain json' guard.
+    parts.append("按系统提示的 JSON schema 输出。")
     return "\n\n".join(parts)
 
 
