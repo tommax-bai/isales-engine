@@ -116,7 +116,9 @@ def build_greeting_messages(role: RoleSpec, config: PipelineConfig) -> list[Mess
     system = "[role] " + role.system_prompt
     user = (
         f"【线索信息】name={config.lead.name or '—'}, phone={config.lead.phone}\n"
-        "【任务】请生成开场白。"
+        "【任务】请生成开场白。\n"
+        "请以 JSON 格式回复,例如 {\"reply\": \"开场白文本\"}。"
+        " 仅输出 JSON,不要其他说明。"
     )
     return [Message(role="system", content=system), Message(role="user", content=user)]
 
