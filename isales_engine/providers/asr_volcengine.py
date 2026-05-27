@@ -355,9 +355,6 @@ class VolcengineASRProvider(ASRProvider):
             push_done = asyncio.Event()
 
             async def _push_audio() -> None:
-                pushed_chunks = 0
-                pushed_bytes = 0
-                last_log_t = time.monotonic()
                 try:
                     async for chunk in audio_chunks:
                         if not chunk:
@@ -370,21 +367,7 @@ class VolcengineASRProvider(ASRProvider):
                             payload=chunk,
                         )
                         await ws.send(audio_frame)
-                        pushed_chunks += 1
-                        pushed_bytes += len(chunk)
-                        # Diagnostic: log every ~1 s of pushed audio.
-                        now = time.monotonic()
-                        if now - last_log_t >= 1.0:
-                            logger.info(
-                                "volcengine_asr_audio_push chunks=%s bytes=%s",
-                                pushed_chunks, pushed_bytes,
-                            )
-                            last_log_t = now
                     # End-of-stream: empty audio frame with last-packet flag.
-                    logger.info(
-                        "volcengine_asr_audio_push_eos total_chunks=%s total_bytes=%s",
-                        pushed_chunks, pushed_bytes,
-                    )
                     eos_frame = _encode_frame(
                         msg_type=MSG_AUDIO_ONLY_REQUEST,
                         flags=FLAGS_NO_SEQ_LAST_PACKET,
@@ -403,15 +386,7 @@ class VolcengineASRProvider(ASRProvider):
             push_task = asyncio.create_task(_push_audio(), name="asr_push")
 
             try:
-                recv_count = 0
                 async for raw in ws:
-                    recv_count += 1
-                    if recv_count <= 3 or recv_count % 20 == 0:
-                        logger.info(
-                            "volcengine_asr_recv_frame seq=%s len=%s type=%s",
-                            recv_count, len(raw),
-                            "str" if isinstance(raw, str) else "bytes",
-                        )
                     if isinstance(raw, str):
                         # Text frames are unexpected on this protocol but log
                         # them for diagnostics rather than crashing.
@@ -458,13 +433,6 @@ class VolcengineASRProvider(ASRProvider):
                             exc, len(payload),
                         )
                         continue
-
-                    if recv_count <= 5 or recv_count % 10 == 0:
-                        logger.info(
-                            "volcengine_asr_recv_json seq=%s data_keys=%s preview=%s",
-                            recv_count, list(data.keys()) if isinstance(data, dict) else type(data).__name__,
-                            json.dumps(data, ensure_ascii=False)[:300],
-                        )
 
                     for asr_result in _parse_v3_response(data, ts0=ts0):
                         yield asr_result
