@@ -507,14 +507,37 @@ class _PybindDingRtcChannel:
         # rate captured from ``set_external_audio_source`` at join time.
         if self._send_sample_rate <= 0 or self._send_channels <= 0:
             raise RtcNotJoined("push_audio before setup_and_join (rate/channels unset)")
+
+        # DingRTC SDK push_external_audio expects PCM frames sized to the
+        # SDK's internal 10ms grid: ``samples_per_10ms = sample_rate / 100``.
+        # Empirically (calls 13-15, mac --dev-no-modem smoke), a single
+        # TTS-V3-SSE chunk can be 8-12 KB (~250-400 ms at 16 kHz) — passing
+        # that whole blob to push_external_audio raises
+        # ``DingRtcError: PushExternalAudioFrame failed`` and aborts the
+        # _do_greeting turn. Slice into 10 ms frames here and push one by
+        # one; SDK does its own internal queueing across frames.
+        frame_size = (self._send_sample_rate // 100) * self._send_channels * 2  # 10 ms × 2 bytes/sample
+        if not pcm:
+            return 0
+        ts = timestamp_ms
+        # 10 ms per pushed frame keeps timestamp accounting cheap; callers
+        # pass an overall start timestamp and the SDK runs the playback clock.
+        ts_step_ms = 10
         try:
-            engine.push_external_audio(
-                pcm,
-                sample_rate=self._send_sample_rate,
-                channels=self._send_channels,
-                bytes_per_sample=2,
-                timestamp=timestamp_ms,
-            )
+            for off in range(0, len(pcm), frame_size):
+                frame = pcm[off:off + frame_size]
+                # Pad the last (potentially short) frame to a full SDK
+                # frame so the codec sees a clean 10 ms shape.
+                if len(frame) < frame_size:
+                    frame = frame + b"\x00" * (frame_size - len(frame))
+                engine.push_external_audio(
+                    frame,
+                    sample_rate=self._send_sample_rate,
+                    channels=self._send_channels,
+                    bytes_per_sample=2,
+                    timestamp=ts,
+                )
+                ts += ts_step_ms
         except self._binding.DingRtcError as exc:
             code = exc.args[0] if exc.args else -1
             # DingRTC SDK uses specific error codes for buffer full;
