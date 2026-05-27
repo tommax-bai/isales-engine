@@ -160,6 +160,11 @@ class _CallState:
         )
 
     async def _inbound_loop(self) -> None:
+        import time as _time  # noqa: PLC0415
+        recv_count = 0
+        last_log_t = _time.monotonic()
+        last_log_count = 0
+        max_rms_window = 0
         try:
             async for frame in self.rtc_session.audio_frames():
                 # DingRTC C++ SDK's `OnPlaybackAudioFrame` is **mixed** playback
@@ -174,7 +179,38 @@ class _CallState:
                 # in depth against future multi-user channel changes).
                 if frame.sender_uid and frame.sender_uid != self.edge_uid:
                     continue
-                await self.inbound_q.put(frame.pcm)
+                recv_count += 1
+                # Compute peak RMS for the chunk to surface whether the
+                # inbound stream is silence or real speech.
+                pcm = frame.pcm
+                if pcm and len(pcm) >= 2:
+                    # Sample every 8th int16 to keep CPU cost negligible.
+                    sample_count = len(pcm) // 2
+                    stride = max(1, sample_count // 32)
+                    total = 0
+                    samples_seen = 0
+                    for i in range(0, len(pcm), stride * 2):
+                        if i + 2 > len(pcm):
+                            break
+                        s = int.from_bytes(pcm[i:i + 2], "little", signed=True)
+                        total += s * s
+                        samples_seen += 1
+                    if samples_seen:
+                        rms = int((total // samples_seen) ** 0.5)
+                        if rms > max_rms_window:
+                            max_rms_window = rms
+                now = _time.monotonic()
+                if now - last_log_t >= 1.0:
+                    logger.info(
+                        "rtc_inbound recv=%s delta=%s max_rms_1s=%s "
+                        "sample_rate=%s bytes=%s",
+                        recv_count, recv_count - last_log_count,
+                        max_rms_window, frame.sample_rate, len(pcm),
+                    )
+                    last_log_t = now
+                    last_log_count = recv_count
+                    max_rms_window = 0
+                await self.inbound_q.put(pcm)
         except RtcNotJoined:
             # close_iterators() may race ahead of this task being
             # scheduled: leave() invalidates the session before the pump
