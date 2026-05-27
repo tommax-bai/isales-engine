@@ -355,6 +355,9 @@ class VolcengineASRProvider(ASRProvider):
             push_done = asyncio.Event()
 
             async def _push_audio() -> None:
+                pushed_chunks = 0
+                pushed_bytes = 0
+                last_log_t = time.monotonic()
                 try:
                     async for chunk in audio_chunks:
                         if not chunk:
@@ -367,7 +370,21 @@ class VolcengineASRProvider(ASRProvider):
                             payload=chunk,
                         )
                         await ws.send(audio_frame)
+                        pushed_chunks += 1
+                        pushed_bytes += len(chunk)
+                        # Diagnostic: log every ~1 s of pushed audio.
+                        now = time.monotonic()
+                        if now - last_log_t >= 1.0:
+                            logger.info(
+                                "volcengine_asr_audio_push chunks=%s bytes=%s",
+                                pushed_chunks, pushed_bytes,
+                            )
+                            last_log_t = now
                     # End-of-stream: empty audio frame with last-packet flag.
+                    logger.info(
+                        "volcengine_asr_audio_push_eos total_chunks=%s total_bytes=%s",
+                        pushed_chunks, pushed_bytes,
+                    )
                     eos_frame = _encode_frame(
                         msg_type=MSG_AUDIO_ONLY_REQUEST,
                         flags=FLAGS_NO_SEQ_LAST_PACKET,
