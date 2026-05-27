@@ -101,6 +101,7 @@ async def run_session(
             ),
         )
 
+    listen_ctx: _ListenContext | None = None
     try:
         connected = await _dial_and_wait_connected(
             session, telephony, phone, timeout_s=connect_timeout_s
@@ -115,7 +116,17 @@ async def run_session(
         sm.transition_to(CallStatus.GREETING, reason="connected")
         _publish_status(publisher, session, "connected")
 
+        # Start ASR + partial_monitor BEFORE greeting so the user can barge
+        # in mid-greeting. Previously these pumps lived inside _main_turn_loop,
+        # which left the greeting structurally uninterruptible.
+        listen_ctx = _start_listen_pumps(session, config, telephony, providers)
+
         await _do_greeting(session, config, providers, telephony)
+        # If barge-in fired mid-greeting, partial_monitor flipped
+        # ``interruption_signaled``; clear it so the main turn loop's first
+        # iteration starts with a clean slate and just picks up the user's
+        # ASR final from the queue.
+        session.interruption_signaled = False
         sm.transition_to(CallStatus.LISTENING, reason="greeting_done")
         _publish_status(publisher, session, "greeting_done")
 
@@ -127,6 +138,7 @@ async def run_session(
             providers=providers,
             publisher=publisher,
             pipeline_timeout_ms=pipeline_timeout_ms,
+            listen_ctx=listen_ctx,
         )
 
     except _ManualHangupRequested:
@@ -149,6 +161,8 @@ async def run_session(
             "hangup", reason=session.hangup_cause, initiated_by="ai"
         )
     finally:
+        if listen_ctx is not None:
+            await _stop_listen_pumps(session, listen_ctx)
         # Token-budget warning (impl-engine-providers PR #7). Default 50k
         # if not configured; runtime sets ``_token_budget_per_call`` on the
         # session at construction time.
@@ -222,17 +236,34 @@ async def _do_greeting(
     await _play_tts(session, telephony, providers.tts, text, voice_id=config.voice_id)
 
 
-async def _main_turn_loop(
+@dataclass
+class _ListenContext:
+    """Shared ASR / event / partial-monitor state owned by ``run_session``.
+
+    Created by :func:`_start_listen_pumps` BEFORE the greeting so user voice
+    during the greeting reaches ``_partial_monitor`` (which cancels the
+    in-flight greeting ``_play_tts`` on a triggered verdict). Disposed of by
+    :func:`_stop_listen_pumps` in ``run_session``'s ``finally``.
+    """
+
+    asr_finals_q: asyncio.Queue[ASRResult]
+    asr_partials_q: asyncio.Queue[ASRResult]
+    hangup_event: asyncio.Event
+    asr_finished: asyncio.Event
+    pump_asr: asyncio.Task[None]
+    pump_ev: asyncio.Task[None]
+    pump_partial_monitor: asyncio.Task[None]
+
+
+def _start_listen_pumps(
     session: CallSession,
-    sm: StateMachine,
-    *,
     config: RuntimeConfig,
     telephony: TelephonyClient,
     providers: Providers,
-    publisher: EventPublisher | None,
-    pipeline_timeout_ms: int,
-) -> None:
-    asr_iter = providers.asr.stream_recognize(telephony.audio_in(session.call_record_id))
+) -> _ListenContext:
+    asr_iter = providers.asr.stream_recognize(
+        telephony.audio_in(session.call_record_id)
+    )
     events_iter = telephony.events(session.call_record_id)
 
     asr_finals_q: asyncio.Queue[ASRResult] = asyncio.Queue()
@@ -280,6 +311,49 @@ async def _main_turn_loop(
     session.tasks["asr_pump"] = pump_asr
     session.tasks["ev_pump"] = pump_ev
     session.tasks["partial_monitor"] = pump_partial_monitor
+
+    return _ListenContext(
+        asr_finals_q=asr_finals_q,
+        asr_partials_q=asr_partials_q,
+        hangup_event=hangup_event,
+        asr_finished=asr_finished,
+        pump_asr=pump_asr,
+        pump_ev=pump_ev,
+        pump_partial_monitor=pump_partial_monitor,
+    )
+
+
+async def _stop_listen_pumps(
+    session: CallSession, ctx: _ListenContext
+) -> None:
+    for t in (ctx.pump_asr, ctx.pump_ev, ctx.pump_partial_monitor):
+        t.cancel()
+    await asyncio.gather(
+        ctx.pump_asr, ctx.pump_ev, ctx.pump_partial_monitor, return_exceptions=True
+    )
+    session.tasks.pop("asr_pump", None)
+    session.tasks.pop("ev_pump", None)
+    session.tasks.pop("partial_monitor", None)
+
+
+async def _main_turn_loop(
+    session: CallSession,
+    sm: StateMachine,
+    *,
+    config: RuntimeConfig,
+    telephony: TelephonyClient,
+    providers: Providers,
+    publisher: EventPublisher | None,
+    pipeline_timeout_ms: int,
+    listen_ctx: _ListenContext,
+) -> None:
+    asr_finals_q = listen_ctx.asr_finals_q
+    asr_partials_q = listen_ctx.asr_partials_q
+    hangup_event = listen_ctx.hangup_event
+    asr_finished = listen_ctx.asr_finished
+    pump_asr = listen_ctx.pump_asr
+    pump_ev = listen_ctx.pump_ev
+    pump_partial_monitor = listen_ctx.pump_partial_monitor
 
     no_progress_started = time.monotonic()
     last_progress_ms = _to_ms(no_progress_started)
@@ -533,15 +607,9 @@ async def _main_turn_loop(
 
             sm.transition_to(CallStatus.LISTENING, reason="tts_done")
     finally:
-        for t in (pump_asr, pump_ev, pump_partial_monitor):
-            t.cancel()
-        await asyncio.gather(
-            pump_asr, pump_ev, pump_partial_monitor, return_exceptions=True
-        )
-        session.tasks.pop("asr_pump", None)
-        session.tasks.pop("ev_pump", None)
-        session.tasks.pop("partial_monitor", None)
-        _ = asr_finished
+        # Pump lifecycle now belongs to run_session — these locals just keep
+        # type checkers happy that they were "used" in this scope.
+        _ = (pump_asr, pump_ev, pump_partial_monitor, asr_finished)
 
 
 
