@@ -95,10 +95,16 @@ class VolcengineTTSProvider(TTSProvider):
         self, text: str, voice_id: str
     ) -> AsyncIterator[bytes]:
         url = f"{self._endpoint}/tts"
+        # SeedTTS 2.0 / BigTTS (voice_type 后缀 `*_uranus_bigtts` / `saturn_*_tob`)
+        # 用 `Resource-Id: volc.megatts.default`,不是老 OpenSpeech 普通 TTS 的
+        # `Resource-Id: tts`. 控制台开通的是 TTS-SeedTTS2.0 服务,服务端按
+        # resource id 路由 grant lookup, mismatch → 403 "[resource_id=] requested
+        # resource not granted". 若未来切换到普通 TTS / DubbingTTS, 把这一行换
+        # 回 `tts` 或抽到 provider_credential `tts_resource_id` field.
         headers = {
             "Authorization": f"Bearer; {self._app_token}",
             "Content-Type": "application/json",
-            "Resource-Id": "tts",
+            "Resource-Id": "volc.megatts.default",
             "App-Key": self._app_key,
         }
         # Payload shape per Volcengine 流式 TTS public docs. Output PCM
