@@ -145,14 +145,34 @@ def build_asr(
         )
     s = _require(store, name)
     if name == "volcengine":
+        # 豆包 V3 SAUC ASR 两套鉴权 (vendor 文档 § 鉴权), 跟 TTS V3 同一模型:
+        #   1. 新版控制台: X-Api-Key 单 UUID (provider_credential.volcengine.api_key)
+        #   2. 旧版控制台: X-Api-App-Key + X-Api-Access-Key (复用 volcengine.app_key
+        #      / app_token 的现存值, 注意 ASR 用 X-Api-App-Key header 名,TTS 用
+        #      X-Api-App-Id, vendor 文档命名不一致但本质同一字段)
+        # resource_id 决定 ASR 模型版本 (volc.bigasr.sauc.duration 1.0 /
+        # volc.seedasr.sauc.duration 2.0 / .concurrent 并发版).
+        from isales_engine.providers.asr_volcengine import (  # noqa: PLC0415
+            DEFAULT_ASR_RESOURCE_ID,
+            VolcengineASRProvider,
+        )
+
+        api_key = s.get("volcengine", "api_key")
+        resource_id = (
+            s.get("volcengine", "asr_resource_id") or DEFAULT_ASR_RESOURCE_ID
+        )
+        if api_key:
+            return VolcengineASRProvider(
+                api_key=api_key,
+                resource_id=resource_id,
+            )
+        # legacy fallback
         app_key = _require_field(s, "volcengine", "app_key")
         app_token = _require_field(s, "volcengine", "app_token")
-        from isales_engine.providers.asr_volcengine import VolcengineASRProvider
-
         return VolcengineASRProvider(
-            endpoint=s.get("volcengine", "asr_endpoint") or _DEFAULT_ENDPOINT["volcengine_asr"],
             app_key=app_key,
-            app_token=app_token,
+            access_key=app_token,
+            resource_id=resource_id,
         )
     raise NotImplementedError(name)  # pragma: no cover
 
