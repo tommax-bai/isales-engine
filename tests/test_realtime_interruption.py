@@ -75,8 +75,16 @@ async def test_partial_monitor_triggers_cancel_on_long_non_whitelist_partial() -
     speaking_task = asyncio.create_task(fake_speaking())
     session.current_speaking_task = speaking_task
 
-    # Push partials: one early (below threshold) then one late (above threshold).
+    # Push partials: one early (anchors the wall-clock start) then one
+    # late (above the 400ms duration threshold). The monitor uses
+    # time.monotonic() rather than partial.timestamp_ms (V3 SAUC's
+    # audio-domain end_time stays constant across confirmation partials),
+    # so the synthetic delay needs to be wall-clock real, not just an
+    # asserted field on the ASRResult.
     await asr_partials_q.put(ASRResult(text="您看", is_final=False, timestamp_ms=100))
+    # Sleep slightly more than min_duration_ms so the second partial's
+    # wall-clock anchor delta clears the threshold.
+    await asyncio.sleep(0.45)
     await asr_partials_q.put(
         ASRResult(text="您看这个内容不太对", is_final=False, timestamp_ms=600)
     )

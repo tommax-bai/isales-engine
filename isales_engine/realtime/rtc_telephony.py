@@ -128,6 +128,11 @@ class _CallState:
         self.device_id = device_id
         self.events_q: asyncio.Queue[TelephonyEvent | object] = asyncio.Queue()
         self.inbound_q: asyncio.Queue[bytes | object] = asyncio.Queue()
+        # Forked stream of the SAME inbound PCM frames, so a VAD monitor can
+        # run in parallel with ASR without competing for items in inbound_q.
+        # ``audio_in()`` consumes ``inbound_q``; ``audio_in_vad()`` consumes
+        # ``vad_q``. Both close on ``_SENTINEL``.
+        self.vad_q: asyncio.Queue[bytes | object] = asyncio.Queue()
         self.inbound_pump: asyncio.Task[None] | None = None
         self._outbound_ts: int = 0
         self._outbound_frame_ms = outbound_frame_ms
@@ -201,6 +206,10 @@ class _CallState:
                         src_rate, target_rate, ratecv_state,
                     )
                 await self.inbound_q.put(pcm)
+                # Fork the same PCM to the VAD lane. Non-blocking put_nowait
+                # would risk dropping frames; await is safe because the VAD
+                # monitor drains as fast as ASR.
+                await self.vad_q.put(pcm)
         except RtcNotJoined:
             # close_iterators() may race ahead of this task being
             # scheduled: leave() invalidates the session before the pump
@@ -208,8 +217,9 @@ class _CallState:
             # sentinel still goes out in `finally`.
             pass
         finally:
-            # Terminator for audio_in() consumers.
+            # Terminator for audio_in() / audio_in_vad() consumers.
             await self.inbound_q.put(_SENTINEL)
+            await self.vad_q.put(_SENTINEL)
 
     # ----- dispatcher-driven event handlers ------------------------------
 
@@ -415,6 +425,25 @@ class RtcTelephonyClient(TelephonyClient):
         async def _iter() -> AsyncIterator[bytes]:
             while True:
                 item = await state.inbound_q.get()
+                if item is _SENTINEL:
+                    return
+                assert isinstance(item, bytes)
+                yield item
+
+        return _iter()
+
+    def audio_in_vad(self, call_id: int) -> AsyncIterator[bytes]:
+        """Fork of the inbound PCM stream for a VAD monitor.
+
+        Same frames as ``audio_in()`` but on a parallel queue so VAD-based
+        barge-in detection can run alongside ASR without ASR-vendor partial
+        latency. Closes on the same ``_SENTINEL`` as ``audio_in``.
+        """
+        state = self._require_state(call_id)
+
+        async def _iter() -> AsyncIterator[bytes]:
+            while True:
+                item = await state.vad_q.get()
                 if item is _SENTINEL:
                     return
                 assert isinstance(item, bytes)

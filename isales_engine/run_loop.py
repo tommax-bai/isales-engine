@@ -238,11 +238,11 @@ async def _do_greeting(
 
 @dataclass
 class _ListenContext:
-    """Shared ASR / event / partial-monitor state owned by ``run_session``.
+    """Shared ASR / event / partial-monitor / VAD state owned by ``run_session``.
 
     Created by :func:`_start_listen_pumps` BEFORE the greeting so user voice
-    during the greeting reaches ``_partial_monitor`` (which cancels the
-    in-flight greeting ``_play_tts`` on a triggered verdict). Disposed of by
+    during the greeting reaches ``_partial_monitor`` and ``_vad_monitor``
+    (both can cancel the in-flight greeting ``_play_tts``). Disposed of by
     :func:`_stop_listen_pumps` in ``run_session``'s ``finally``.
     """
 
@@ -253,6 +253,7 @@ class _ListenContext:
     pump_asr: asyncio.Task[None]
     pump_ev: asyncio.Task[None]
     pump_partial_monitor: asyncio.Task[None]
+    pump_vad_monitor: asyncio.Task[None]
 
 
 def _start_listen_pumps(
@@ -276,6 +277,11 @@ def _start_listen_pumps(
             async for r in asr_iter:
                 if not r.text:
                     continue
+                # TEMP DIAG: classification before the queue split.
+                logger.warning(
+                    "asr_pump text=%r is_final=%s ts=%s",
+                    r.text[:40], r.is_final, r.timestamp_ms,
+                )
                 if r.is_final:
                     await asr_finals_q.put(r)
                     # A final closes the current utterance — clear the
@@ -308,9 +314,18 @@ def _start_listen_pumps(
         ),
         name="partial_monitor",
     )
+    pump_vad_monitor = asyncio.create_task(
+        _vad_monitor(
+            session,
+            audio_in_vad=telephony.audio_in_vad(session.call_record_id),
+            interruption_cfg=config.interruption,
+        ),
+        name="vad_monitor",
+    )
     session.tasks["asr_pump"] = pump_asr
     session.tasks["ev_pump"] = pump_ev
     session.tasks["partial_monitor"] = pump_partial_monitor
+    session.tasks["vad_monitor"] = pump_vad_monitor
 
     return _ListenContext(
         asr_finals_q=asr_finals_q,
@@ -320,20 +335,28 @@ def _start_listen_pumps(
         pump_asr=pump_asr,
         pump_ev=pump_ev,
         pump_partial_monitor=pump_partial_monitor,
+        pump_vad_monitor=pump_vad_monitor,
     )
 
 
 async def _stop_listen_pumps(
     session: CallSession, ctx: _ListenContext
 ) -> None:
-    for t in (ctx.pump_asr, ctx.pump_ev, ctx.pump_partial_monitor):
+    for t in (
+        ctx.pump_asr, ctx.pump_ev, ctx.pump_partial_monitor, ctx.pump_vad_monitor
+    ):
         t.cancel()
     await asyncio.gather(
-        ctx.pump_asr, ctx.pump_ev, ctx.pump_partial_monitor, return_exceptions=True
+        ctx.pump_asr,
+        ctx.pump_ev,
+        ctx.pump_partial_monitor,
+        ctx.pump_vad_monitor,
+        return_exceptions=True,
     )
     session.tasks.pop("asr_pump", None)
     session.tasks.pop("ev_pump", None)
     session.tasks.pop("partial_monitor", None)
+    session.tasks.pop("vad_monitor", None)
 
 
 async def _main_turn_loop(
@@ -761,14 +784,32 @@ async def _partial_monitor(
         text = partial.text.strip()
         if not text:
             continue
+
+        # Use wall-clock for the duration condition rather than the ASR's
+        # ``partial.timestamp_ms``. The V3 SAUC ASR sets ``timestamp_ms`` to
+        # the utterance ``end_time`` (audio-domain), which stays constant
+        # across repeated confirmation partials of the same word — so
+        # ``elapsed = now - anchor`` was permanently 0 and the duration
+        # condition never fired (root cause of the "AI plays full sentence
+        # even when user speaks throughout" symptom).
+        now_ms = int(time.monotonic() * 1000)
         if session.current_user_speech_started_ms is None:
-            session.current_user_speech_started_ms = partial.timestamp_ms
+            session.current_user_speech_started_ms = now_ms
 
         verdict = evaluate_partial(
             text=text,
             speech_started_ts_ms=session.current_user_speech_started_ms,
-            now_ts_ms=partial.timestamp_ms,
+            now_ts_ms=now_ms,
             config=interruption_cfg,
+        )
+        # TEMP DIAG: surfaces each evaluation so a follow-up smoke can confirm
+        # the verdict path. Remove once verified.
+        logger.warning(
+            "partial_monitor_eval text=%r elapsed_ms=%s verdict=%s reason=%s",
+            text[:40],
+            now_ms - session.current_user_speech_started_ms,
+            verdict.verdict,
+            verdict.reason,
         )
         if verdict.verdict != "triggered":
             continue
@@ -785,6 +826,97 @@ async def _partial_monitor(
         speaking_task = session.current_speaking_task
         if speaking_task is not None and not speaking_task.done():
             speaking_task.cancel()
+
+
+async def _vad_monitor(
+    session: CallSession,
+    *,
+    audio_in_vad: AsyncIterator[bytes],
+    interruption_cfg: InterruptionConfig,
+) -> None:
+    """RMS-based barge-in detector independent of the ASR partial pipeline.
+
+    The partial-monitor path waits for the ASR vendor to emit a transcribed
+    partial (V3 SAUC: ~500–800 ms vendor latency) before the duration
+    condition can even start counting; that pushes the user-perceived
+    cancel latency to ~1.5–2 s. This monitor reads raw PCM directly from
+    ``telephony.audio_in_vad()`` and triggers cancel as soon as the rolling
+    voice-active span exceeds ``interruption_cfg.min_duration_ms``,
+    typically ~250–400 ms after the user actually starts speaking.
+
+    Coordination with ``_partial_monitor``:
+
+    * Both paths gate on ``session.current_speaking_task is not None`` and
+      ``not session.interruption_signaled``. Once either fires it sets the
+      flag and the other path becomes a no-op for this utterance.
+    * The ``interruption`` event emitted here carries ``source="vad"`` so
+      transcripts can distinguish the two paths.
+    """
+
+    try:
+        import audioop  # noqa: PLC0415
+    except ImportError:  # pragma: no cover  - Py 3.13+ replacement TBD
+        audioop = None  # type: ignore[assignment]
+
+    # 16 kHz int16 mono: a 20 ms frame is 640 bytes. Engine inbound stream is
+    # resampled to 16 kHz upstream of audio_in_vad. We tolerate any frame
+    # size (push_external_audio is 10 ms = 320 bytes; OnPlaybackAudioFrame
+    # is 20–60 ms depending on the SDK build) and infer the duration from
+    # the byte count.
+    bytes_per_ms = 16_000 * 2 // 1000  # = 32
+    # RMS threshold tuned empirically against DingRTC's mixed-playback
+    # background-noise floor (~30–80 with no peer speech). Voice utterances
+    # typically register ≥ 500–2000. 200 is a safe "above-noise" cutoff
+    # that catches normal speech while ignoring DingRTC's mixer hum.
+    voice_rms_threshold = 200
+    voice_active_ms = 0
+    try:
+        async for pcm in audio_in_vad:
+            if not pcm:
+                continue
+            frame_ms = max(len(pcm) // bytes_per_ms, 1)
+            if audioop is not None:
+                try:
+                    rms = audioop.rms(pcm, 2)
+                except audioop.error:
+                    rms = 0
+            else:
+                rms = 0
+
+            if rms >= voice_rms_threshold:
+                voice_active_ms += frame_ms
+            else:
+                voice_active_ms = 0
+                continue
+
+            if session.current_speaking_task is None or session.interruption_signaled:
+                # Not in SPEAKING / FILLER, or another path already fired —
+                # keep accumulating voice_active_ms so the surfaced count
+                # in the event reflects the user's actual span, but skip
+                # the cancel side-effect.
+                continue
+
+            if voice_active_ms < interruption_cfg.min_duration_ms:
+                continue
+
+            # Lock in the interruption: signal first, then cancel.
+            session.interruption_signaled = True
+            session.append_event(
+                "interruption",
+                interrupted_event_id=session.current_turn_id,
+                source="vad",
+                voice_active_ms=voice_active_ms,
+                rms=rms,
+            )
+            speaking_task = session.current_speaking_task
+            if speaking_task is not None and not speaking_task.done():
+                speaking_task.cancel()
+            # Reset so a new utterance after the interrupted reply starts
+            # fresh. ``interruption_signaled`` is cleared by the main loop
+            # after it processes the interruption.
+            voice_active_ms = 0
+    except asyncio.CancelledError:
+        return
 
 
 async def _attempt_hangup(telephony: TelephonyClient, call_id: int) -> None:

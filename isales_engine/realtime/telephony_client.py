@@ -50,6 +50,21 @@ class TelephonyClient(ABC):
     def audio_in(self, call_id: int) -> AsyncIterator[bytes]:
         """Caller→engine audio frames (drives ASR)."""
 
+    def audio_in_vad(self, call_id: int) -> AsyncIterator[bytes]:
+        """Parallel fork of ``audio_in`` for a low-latency VAD barge-in path.
+
+        Default implementation yields nothing — implementations that want
+        VAD-based interruption SHOULD override and return a queue/fork that
+        mirrors ``audio_in()`` so an ASR-independent monitor can react to
+        sustained voice without the vendor partial-result latency.
+        """
+
+        async def _empty() -> AsyncIterator[bytes]:
+            return
+            yield  # pragma: no cover
+
+        return _empty()
+
     @abstractmethod
     async def audio_out(self, call_id: int, chunks: AsyncIterator[bytes]) -> None:
         """Engine→caller audio (consume the iterator end-to-end before returning)."""
