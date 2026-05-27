@@ -403,7 +403,15 @@ class VolcengineASRProvider(ASRProvider):
             push_task = asyncio.create_task(_push_audio(), name="asr_push")
 
             try:
+                recv_count = 0
                 async for raw in ws:
+                    recv_count += 1
+                    if recv_count <= 3 or recv_count % 20 == 0:
+                        logger.info(
+                            "volcengine_asr_recv_frame seq=%s len=%s type=%s",
+                            recv_count, len(raw),
+                            "str" if isinstance(raw, str) else "bytes",
+                        )
                     if isinstance(raw, str):
                         # Text frames are unexpected on this protocol but log
                         # them for diagnostics rather than crashing.
@@ -450,6 +458,13 @@ class VolcengineASRProvider(ASRProvider):
                             exc, len(payload),
                         )
                         continue
+
+                    if recv_count <= 5 or recv_count % 10 == 0:
+                        logger.info(
+                            "volcengine_asr_recv_json seq=%s data_keys=%s preview=%s",
+                            recv_count, list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                            json.dumps(data, ensure_ascii=False)[:300],
+                        )
 
                     for asr_result in _parse_v3_response(data, ts0=ts0):
                         yield asr_result
