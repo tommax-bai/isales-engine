@@ -99,7 +99,13 @@ def build_role_messages(
 
 def build_judge_messages(judge: JudgeSpec, candidate_reply: str) -> list[Message]:
     system = "[judge] " + judge.system_prompt
-    user = f"请审查以下候选回复：\n{candidate_reply}"
+    # dashscope 兼容模式要求 messages 出现 "json" 字样 + 强制 JSON output 给 parser 用；
+    # parse_judge_output 期望 {"passed": bool, "reason": str}.
+    user = (
+        f"请审查以下候选回复：\n{candidate_reply}\n\n"
+        '请以 JSON 格式回复,例如 {"passed": true, "reason": "..."}。'
+        "仅输出 JSON,不要其他说明。"
+    )
     return [Message(role="system", content=system), Message(role="user", content=user)]
 
 
@@ -108,7 +114,13 @@ def build_polish_messages(
 ) -> list[Message]:
     system = "[polish] " + polish.system_prompt
     body_lines = [f"candidate[{i}]: {reply}" for i, reply in enumerate(candidates)]
-    user = "请润色并选优：\n" + "\n".join(body_lines)
+    # parse_polish_output 期望 {"reply": str, "selected_candidate_index": int}.
+    user = (
+        "请润色并选优：\n"
+        + "\n".join(body_lines)
+        + '\n\n请以 JSON 格式回复,例如 {"reply": "润色后文本", "selected_candidate_index": 0}。'
+        "仅输出 JSON,不要其他说明。"
+    )
     return [Message(role="system", content=system), Message(role="user", content=user)]
 
 
@@ -129,6 +141,13 @@ def _build_user_message(session: CallSession, config: PipelineConfig) -> str:
         parts.append("【上次通话纪要】\n" + config.last_call_summary)
     parts.append(_render_lead_info(config.lead))
     parts.append(_render_dialog(session))
+    # dashscope 兼容模式要求 messages 出现 "json" 字样;parse_role_output 期望
+    # {"reply": str, "goal_achieved": bool, "goal_type": str, "extracted": dict}.
+    parts.append(
+        "【输出格式】请以 JSON 格式回复,例如 "
+        '{"reply": "AI 回复文本", "goal_achieved": false, "goal_type": "", "extracted": {}}。'
+        "仅输出 JSON,不要其他说明。"
+    )
     return "\n\n".join(parts)
 
 
