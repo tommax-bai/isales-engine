@@ -120,9 +120,21 @@ class VolcengineASRProvider(ASRProvider):
             "Resource-Id": "asr",
         }
 
-        async with websockets_module.connect(
-            self._endpoint, additional_headers=headers
-        ) as ws:
+        logger.info(
+            "volcengine_asr_connecting endpoint=%s headers=%s",
+            self._endpoint, list(headers.keys()),
+        )
+        try:
+            ws_ctx = websockets_module.connect(
+                self._endpoint, additional_headers=headers
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("volcengine_asr_connect_failed: %s", exc)
+            raise
+
+        async with ws_ctx as ws:
+            logger.info("volcengine_asr_connected logid=%s",
+                        getattr(ws.response_headers, "get", lambda *_: None)("x-tt-logid", "?"))
             # Send config frame (JSON). Field names follow Volcengine 实时
             # 语音识别 docs — verify against the vendor account before
             # production.
