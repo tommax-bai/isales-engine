@@ -169,13 +169,28 @@ def build_tts(
         )
     s = _require(store, name)
     if name == "volcengine":
-        app_key = _require_field(s, "volcengine", "app_key")
-        app_token = _require_field(s, "volcengine", "app_token")
+        # 豆包 V3 SSE TTS 支持两套鉴权 (vendor 文档 § 2.1):
+        #   1. 新版控制台 (推荐): X-Api-Key 单 UUID
+        #      → provider_credential.volcengine.api_key
+        #   2. 旧版控制台 (fallback): X-Api-App-Id + X-Api-Access-Key
+        #      → provider_credential.volcengine.{app_key, app_token}
+        # 新版优先, 没配再降到旧版三件套. resource_id 决定模型版本 (seed-tts-2.0
+        # / seed-tts-1.0 / seed-icl-2.0 etc.), 不传走默认 seed-tts-2.0.
         from isales_engine.providers.tts_volcengine import VolcengineTTSProvider
 
+        api_key = s.get("volcengine", "api_key")
+        resource_id = s.get("volcengine", "tts_resource_id") or "seed-tts-2.0"
+        if api_key:
+            return VolcengineTTSProvider(
+                api_key=api_key,
+                resource_id=resource_id,
+            )
+        # legacy 3-tuple fallback
+        app_key = _require_field(s, "volcengine", "app_key")
+        app_token = _require_field(s, "volcengine", "app_token")
         return VolcengineTTSProvider(
-            endpoint=s.get("volcengine", "tts_endpoint") or _DEFAULT_ENDPOINT["volcengine_tts"],
-            app_key=app_key,
-            app_token=app_token,
+            app_id=app_key,
+            access_key=app_token,
+            resource_id=resource_id,
         )
     raise NotImplementedError(name)  # pragma: no cover
