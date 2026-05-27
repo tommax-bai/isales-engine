@@ -38,6 +38,49 @@ Expected output on success:
     [3/4] join(channel=...)...
         OnJoinChannelResult: rc=0
     [4/4] PASS — joined channel for 5s, then left cleanly.
+
+Expected callback order (real-AppId path, observed on ECS 2026-05-26):
+
+    1. SDK init logs:  `[API] JoinChannel (appid=..., channel=..., userid=..., gslb=https://gslb.dingrtc.com, nick=...)`
+    2. SDK file log under `<work_dir>/Ali_RTC_Log_Biz/Python-*.log` shows
+       `OnJoinChannelResult, result:0, channel:<ch>, elapsed:128, streams_size:2`
+    3. GSLB ACL ack:   sidecar HTTP log shows `gslb.dingrtc.com ... statusCode:200`
+    4. Async future on the wrapper resolves with `OnJoinChannelResult.code == 0`.
+    5. (optional) `OnRemoteUserOnLineNotify(uid, elapsed)` fires when another
+       peer joins the same channel; not required for single-peer smoke.
+    6. On `leave()`, `OnLeaveChannelResult(stats)` fires before the SDK
+       releases its resources.
+
+§ 4.2 / § 4.4 evidence (2026-05-26, isales-engine@f1c5ca6 on ECS):
+
+  * Vendor demo-appid path:  channel `dingrtc-demo-1779785349`, AppId
+    `a4zfr1hn`, token from `https://onertc-demo-app-server.dingtalk.com/login`
+    (server-issued; HTTP GET with `?passwd=hello1234&env=onertcOnline&...`,
+    no client-side AppKey involved — see macOS smoke
+    `isales-telephony/scripts/macos_dingrtc_smoke.py::fetch_demo_token`
+    for the canonical fetch helper).  `OnJoinChannelResult(code=0)` +
+    GSLB statusCode:200.
+  * Real-AppId path:  channel `rtc-smoke-1779785584`, AppId `o6dpsan9`,
+    token self-signed via `isales_engine.transport.rtc_token.RtcTokenIssuer`
+    (post-`_pack_options(None)` byte-perfect fix).
+    `OnJoinChannelResult(code=0, elapsed=128 ms, streams_size:2)` + GSLB
+    statusCode:200 + 10-s clean run with 1001 inbound frames
+    (1.92 MB, ~99 Hz × 1920 B/frame = 16 kHz mono 60 ms shape) per
+    `ecs_pcm_loopback_listen.py --channel rtc-smoke-1779785584
+    --duration 10`.  Dual-peer (mac dev + ECS, channel
+    `dual-peer-1779788945`) verified at § 8.8: both peers receive
+    > 1900 inbound frames on the same channel.
+
+NOTE — stale env-based demo path:  The `ISALES_DINGRTC_DEMO_APPKEY`
+flow below predates the § 4.2 ground-truth that the vendor's demo
+flow goes through a server-issued token from `onertc-demo-app-server`
+(no client-side demo AppKey actually exists; that assumption came
+from § 1.5 of the migration plan and was retired when § 4.2 hit
+green).  This script's demo path will be reworked to mirror the
+macOS smoke's `fetch_demo_token` helper in a follow-on commit; until
+then, the `--real` path (which uses `RtcTokenIssuer.sign`) is the
+recommended way to drive this script and is what produced the
+evidence above.
 """
 
 from __future__ import annotations
