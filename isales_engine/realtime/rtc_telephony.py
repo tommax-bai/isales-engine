@@ -162,9 +162,17 @@ class _CallState:
     async def _inbound_loop(self) -> None:
         try:
             async for frame in self.rtc_session.audio_frames():
-                if frame.sender_uid != self.edge_uid:
-                    # A 3rd uid joined our channel? Defence in depth —
-                    # spec says only edge + engine ever share a channel.
+                # DingRTC C++ SDK's `OnPlaybackAudioFrame` is **mixed** playback
+                # (no per-uid). Binding sets sender_uid = "" for mixed frames.
+                # `OnRemoteUserAudioFrame` (per-uid) is not exposed by the
+                # Linux 3.9.0 SDK (`expected_remote_uid_` filter exists in
+                # audio_observer.cpp but is never triggered on the playback
+                # path). In v1.0 a channel has exactly 2 peers (engine +
+                # edge), so a mixed frame ≡ edge's audio. Accept empty
+                # sender_uid as "from the only other peer = edge"; only
+                # skip frames bearing an unexpected non-empty uid (defence
+                # in depth against future multi-user channel changes).
+                if frame.sender_uid and frame.sender_uid != self.edge_uid:
                     continue
                 await self.inbound_q.put(frame.pcm)
         except RtcNotJoined:
