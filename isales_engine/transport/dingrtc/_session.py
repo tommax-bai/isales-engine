@@ -523,6 +523,7 @@ class _PybindDingRtcChannel:
         # 10 ms per pushed frame keeps timestamp accounting cheap; callers
         # pass an overall start timestamp and the SDK runs the playback clock.
         ts_step_ms = 10
+        frames_pushed = 0
         try:
             for off in range(0, len(pcm), frame_size):
                 frame = pcm[off:off + frame_size]
@@ -538,8 +539,16 @@ class _PybindDingRtcChannel:
                     timestamp=ts,
                 )
                 ts += ts_step_ms
+                frames_pushed += 1
         except self._binding.DingRtcError as exc:
             code = exc.args[0] if exc.args else -1
+            logger.warning(
+                "dingrtc_push_audio_failed rc=%s msg=%s frame_size=%s "
+                "send_rate=%s send_ch=%s total_len=%s frames_pushed=%s",
+                code, str(exc), frame_size,
+                self._send_sample_rate, self._send_channels,
+                len(pcm), frames_pushed,
+            )
             # DingRTC SDK uses specific error codes for buffer full;
             # without an authoritative list of "buffer full" rcs in
             # engine_conf.h, treat anything matching a transient pattern
