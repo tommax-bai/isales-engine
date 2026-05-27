@@ -281,6 +281,15 @@ async def _call_roles_parallel(
         duration_ms = int((time.monotonic() - start) * 1000)
         parsed = parse_role_output(resp.content)
         if parsed.parse_failed:
+            # TEMP DIAG (remove once turn-2 default_reply root cause closed):
+            # surface what the LLM actually returned so we can tell whether
+            # dashscope sent non-JSON, a different schema, or empty reply.
+            logger.warning(
+                "role_parse_failed role_config_id=%s len=%d preview=%r",
+                role.role_config_id,
+                len(resp.content),
+                resp.content[:250],
+            )
             return _Candidate(
                 role=role,
                 raw_output=resp.content,
@@ -344,6 +353,15 @@ async def _run_judges_parallel(
                 "duration_ms": int((time.monotonic() - start) * 1000),
             }
         passed, reason = parse_judge_output(resp.content)
+        if reason == "judge_parse_failed" or (not passed):
+            # TEMP DIAG (remove once turn-2 default_reply root cause closed).
+            logger.warning(
+                "judge_result role_config_id=%s passed=%s reason=%s preview=%r",
+                judge.role_config_id,
+                passed,
+                reason,
+                resp.content[:200],
+            )
         return {
             "candidate_index": candidate_index,
             "role_config_id": judge.role_config_id,
@@ -392,6 +410,12 @@ async def _call_polish(
 
     reply, idx = parse_polish_output(resp.content)
     if reply is None or idx is None:
+        # TEMP DIAG (remove once turn-2 default_reply root cause closed).
+        logger.warning(
+            "polish_parse_failed len=%d preview=%r",
+            len(resp.content),
+            resp.content[:250],
+        )
         return None, None, resp.content, "polish_parse_failed"
     return reply, idx, resp.content, None
 
