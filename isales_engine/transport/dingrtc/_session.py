@@ -524,6 +524,13 @@ class _PybindDingRtcChannel:
         # pass an overall start timestamp and the SDK runs the playback clock.
         ts_step_ms = 10
         frames_pushed = 0
+        # SDK internal jitter buffer fills up around ~200-250ms of
+        # un-played PCM (calls 14-17: rc=fail at frame 23/38, i.e. 230ms
+        # in). Pace the push at roughly real-time so SDK has time to drain
+        # frames into the network. Sleep ~8ms per 10ms frame (slightly faster
+        # than real-time to avoid underruns) for a sustained pace that
+        # doesn't overflow the buffer.
+        sleep_per_frame_s = 0.008
         try:
             for off in range(0, len(pcm), frame_size):
                 frame = pcm[off:off + frame_size]
@@ -540,6 +547,8 @@ class _PybindDingRtcChannel:
                 )
                 ts += ts_step_ms
                 frames_pushed += 1
+                if off + frame_size < len(pcm):
+                    await asyncio.sleep(sleep_per_frame_s)
         except self._binding.DingRtcError as exc:
             code = exc.args[0] if exc.args else -1
             logger.warning(
