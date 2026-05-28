@@ -85,6 +85,11 @@ async def test_partial_monitor_triggers_cancel_on_long_non_whitelist_partial() -
     # Sleep slightly more than min_duration_ms so the second partial's
     # wall-clock anchor delta clears the threshold.
     await asyncio.sleep(0.45)
+    # Pretend the VAD monitor has registered above-baseline voice energy
+    # for the same span — without this, partial_monitor's VAD-corroboration
+    # check skips the trigger (defensive guard against DingRTC mixed-playback
+    # self-loopback being mis-transcribed as user speech).
+    session.vad_voice_active_ms = 450
     await asr_partials_q.put(
         ASRResult(text="您看这个内容不太对", is_final=False, timestamp_ms=600)
     )

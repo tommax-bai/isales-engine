@@ -116,19 +116,26 @@ async def run_session(
         sm.transition_to(CallStatus.GREETING, reason="connected")
         _publish_status(publisher, session, "connected")
 
-        # Start ASR + partial_monitor BEFORE greeting so the user can barge
-        # in mid-greeting. Previously these pumps lived inside _main_turn_loop,
-        # which left the greeting structurally uninterruptible.
-        listen_ctx = _start_listen_pumps(session, config, telephony, providers)
+        # NOTE on greeting interruptibility: an earlier draft of this commit
+        # moved _start_listen_pumps to BEFORE _do_greeting so users could
+        # barge in mid-greeting. That ran into a DingRTC Linux 3.9.0 SDK
+        # limitation — POSITION_PLAYBACK mixed frames include this peer's
+        # own external-audio source, so the engine's TTS uplink loops back
+        # as inbound. ASR then transcribes the loopback as gibberish text
+        # (e.g. "胃可以打造" from the greeting "我是智联招聘"), which
+        # partial_monitor / VAD then mis-treat as the user speaking and
+        # cancel the greeting on itself. POSITION_REMOTE_USER would solve
+        # this but the SDK doesn't fire its per-uid callback on this
+        # version (audited 2026-05-28 by switching position and observing
+        # zero inbound frames). Until a real AEC subtracts our own TTS
+        # reference signal from the inbound mix, greeting playback stays
+        # uninterruptible — pumps start only after greeting completes.
 
         await _do_greeting(session, config, providers, telephony)
-        # If barge-in fired mid-greeting, partial_monitor flipped
-        # ``interruption_signaled``; clear it so the main turn loop's first
-        # iteration starts with a clean slate and just picks up the user's
-        # ASR final from the queue.
-        session.interruption_signaled = False
         sm.transition_to(CallStatus.LISTENING, reason="greeting_done")
         _publish_status(publisher, session, "greeting_done")
+
+        listen_ctx = _start_listen_pumps(session, config, telephony, providers)
 
         await _main_turn_loop(
             session,
@@ -277,11 +284,6 @@ def _start_listen_pumps(
             async for r in asr_iter:
                 if not r.text:
                     continue
-                # TEMP DIAG: classification before the queue split.
-                logger.warning(
-                    "asr_pump text=%r is_final=%s ts=%s",
-                    r.text[:40], r.is_final, r.timestamp_ms,
-                )
                 if r.is_final:
                     await asr_finals_q.put(r)
                     # A final closes the current utterance — clear the
@@ -802,16 +804,27 @@ async def _partial_monitor(
             now_ts_ms=now_ms,
             config=interruption_cfg,
         )
-        # TEMP DIAG: surfaces each evaluation so a follow-up smoke can confirm
-        # the verdict path. Remove once verified.
-        logger.warning(
-            "partial_monitor_eval text=%r elapsed_ms=%s verdict=%s reason=%s",
-            text[:40],
-            now_ms - session.current_user_speech_started_ms,
-            verdict.verdict,
-            verdict.reason,
-        )
         if verdict.verdict != "triggered":
+            continue
+
+        # Corroborate via VAD before cancelling — see comment below. — DingRTC's mixed playback
+        # frames include the engine's own TTS uplink (Linux 3.9.0 SDK self-
+        # loopback, see _session.py POSITION_PLAYBACK note). ASR happily
+        # transcribes that loopback as plausible Chinese (audited 2026-05-28
+        # "胃可以打造" mis-transcription of the greeting's "我是智联招聘"),
+        # so a duration-pass partial alone isn't enough to prove the user
+        # actually spoke. The VAD monitor's RMS threshold is tuned above
+        # the TTS self-loopback baseline, so a non-zero
+        # ``vad_voice_active_ms`` means voice energy ABOVE the loopback,
+        # i.e. genuine user speech overlaid on the AI playback.
+        if session.vad_voice_active_ms < interruption_cfg.min_duration_ms:
+            logger.warning(
+                "partial_monitor_skip_no_vad_corroboration text=%r "
+                "elapsed_ms=%s vad_active_ms=%s",
+                text[:40],
+                now_ms - session.current_user_speech_started_ms,
+                session.vad_voice_active_ms,
+            )
             continue
 
         # Lock in the interruption: signal first, then cancel. If cancellation
@@ -868,8 +881,26 @@ async def _vad_monitor(
     # background-noise floor (~30–80 with no peer speech). Voice utterances
     # typically register ≥ 500–2000. 200 is a safe "above-noise" cutoff
     # that catches normal speech while ignoring DingRTC's mixer hum.
-    voice_rms_threshold = 200
+    # RMS threshold chosen to ride ABOVE the DingRTC mixed-playback self-
+    # loopback baseline. On Linux 3.9.0 the SDK's POSITION_PLAYBACK frames
+    # include this peer's own external-audio source; engine TTS playback
+    # therefore registers RMS ~600-800 even when the remote peer is silent
+    # (vad_diag 2026-05-28). Real user speech overlaid on top totals
+    # ~1100-2600; setting the threshold to 1200 keeps the self-loopback
+    # baseline ignored while still firing on a normal-volume user.
+    # POSITION_REMOTE_USER would solve this cleanly but the SDK's per-uid
+    # callback is dormant on this version (see _session.py).
+    voice_rms_threshold = 1200
+    # Hangover window: Chinese / Mandarin speech has natural ~50-100 ms
+    # micro-pauses between syllables / words / breath. If we reset on
+    # every silent frame, voice_active_ms never accumulates past the
+    # threshold during natural speech. Allow up to 300 ms of contiguous
+    # silence inside a voice burst before resetting the active counter —
+    # well under the duration_ms threshold so an actually-silent gap of
+    # 400+ ms still resets cleanly.
+    silence_hangover_ms = 300
     voice_active_ms = 0
+    silence_run_ms = 0
     try:
         async for pcm in audio_in_vad:
             if not pcm:
@@ -885,9 +916,21 @@ async def _vad_monitor(
 
             if rms >= voice_rms_threshold:
                 voice_active_ms += frame_ms
+                silence_run_ms = 0
             else:
-                voice_active_ms = 0
+                # Tolerate short silence within an active burst — only
+                # reset the burst counter once contiguous silence exceeds
+                # the hangover window.
+                if voice_active_ms > 0:
+                    silence_run_ms += frame_ms
+                    if silence_run_ms >= silence_hangover_ms:
+                        voice_active_ms = 0
+                        silence_run_ms = 0
+                # Mirror onto the session so partial_monitor can corroborate.
+                session.vad_voice_active_ms = voice_active_ms
                 continue
+            # Mirror onto the session so partial_monitor can corroborate.
+            session.vad_voice_active_ms = voice_active_ms
 
             if session.current_speaking_task is None or session.interruption_signaled:
                 # Not in SPEAKING / FILLER, or another path already fired —
@@ -915,6 +958,7 @@ async def _vad_monitor(
             # fresh. ``interruption_signaled`` is cleared by the main loop
             # after it processes the interruption.
             voice_active_ms = 0
+            session.vad_voice_active_ms = 0
     except asyncio.CancelledError:
         return
 

@@ -437,6 +437,15 @@ class _PybindDingRtcChannel:
             engine.create("")
             engine.set_event_listener(listener)
             engine.register_audio_observer(observer)
+            # POSITION_PLAYBACK (8) = mixer output, including our own
+            # external-audio source (TTS uplink loops back as RMS ~600-800
+            # baseline). POSITION_REMOTE_USER (16) is the cleaner choice
+            # semantically but DingRTC Linux 3.9.0 doesn't fire its
+            # ``OnRemoteUserAudioFrame`` callback (audited 2026-05-28: 14 s
+            # test call with REMOTE_USER position produced zero inbound
+            # frames). Stay on PLAYBACK and compensate for self-loopback
+            # by raising the VAD RMS threshold above the TTS-loopback
+            # baseline (see ``_vad_monitor`` in run_loop.py).
             engine.enable_audio_frame_observer(True, b.POSITION_PLAYBACK)
             engine.set_external_audio_source(True, send_sample_rate, send_channels)
             engine.publish_local_audio_stream(True)
