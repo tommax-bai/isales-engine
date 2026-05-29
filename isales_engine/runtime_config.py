@@ -242,9 +242,15 @@ async def load_runtime_config(
 
     _ = pipeline_default_timeout_ms  # carried in CallSession.run() args
 
-    # Pre-generated filler-only path; no fixed greeting in DB yet (campaign
-    # has no greeting columns at v0.1.2).
-    fixed_greeting: str | None = None
+    # Temporary fixed-greeting hack (2026-05-29 experiment). To be replaced
+    # by Campaign.greeting column — see future openspec change
+    # `campaign-fixed-greeting`. Dict-keyed so per-campaign content is
+    # explicit; campaigns not in the dict fall back to LLM-generated
+    # greeting (None → generate_greeting goes through build_greeting_messages).
+    _FIXED_GREETINGS: dict[int, str] = {
+        1: "您好，我是智联招聘的小雨，请问您现在方便接电话吗？",
+    }
+    fixed_greeting: str | None = _FIXED_GREETINGS.get(campaign.id)
 
     strategy_value = (
         campaign.continuous_interruption_strategy

@@ -133,10 +133,26 @@ def build_role_messages(
     return [Message(role="system", content=system), Message(role="user", content=user)]
 
 
-def build_judge_messages(judge: JudgeSpec, candidate_reply: str) -> list[Message]:
+def build_judge_messages(
+    judge: JudgeSpec,
+    candidate_reply: str,
+    session: CallSession,
+) -> list[Message]:
+    """Build judge LLM messages with dialog history context.
+
+    Experiment (2026-05-29, parked prompt-template-vars in stash): inject the
+    conversation history into the user message so judge can evaluate the
+    candidate against the actual dialog state, not in isolation. Mirrors voxen
+    referee's chat-history-as-user-message pattern. PG-stored judge prompt
+    (system) is **not** touched in this experiment — we want to isolate the
+    effect of "judge now has dialog context" from "judge prompt rewritten".
+    """
     system = "[judge] " + judge.system_prompt + JUDGE_OUTPUT_SCHEMA_SUFFIX
     user = (
-        f"请审查以下候选回复：\n{candidate_reply}\n\n"
+        "### 对话历史\n"
+        f"{_render_dialog_history_for_judge(session)}\n\n"
+        "### 销售 AI 准备发给客户的候选回复\n"
+        f"{candidate_reply}\n\n"
         "按上述系统提示的 JSON schema 输出。"
     )
     return [Message(role="system", content=system), Message(role="user", content=user)]
@@ -190,4 +206,21 @@ def _render_dialog(session: CallSession) -> str:
         prefix = "用户" if turn.role == "user" else "AI"
         lines.append(f"{prefix}: {turn.text}")
     lines.append("AI:")
+    return "\n".join(lines)
+
+
+def _render_dialog_history_for_judge(session: CallSession) -> str:
+    """Render dialog history for the judge's user-message context block.
+
+    Differs from ``_render_dialog`` in two ways: (1) no ``【对话】`` 标题（judge
+    sees its own ``### 对话历史`` section header), (2) no trailing ``AI:`` prompt
+    line — judge is not the one about to speak. Empty history (first turn /
+    greeting) returns an explicit placeholder so judge knows context is empty.
+    """
+    if not session.dialog_history:
+        return "（尚无对话历史，这是首轮回复）"
+    lines: list[str] = []
+    for turn in session.dialog_history:
+        prefix = "用户" if turn.role == "user" else "AI"
+        lines.append(f"{prefix}：{turn.text}")
     return "\n".join(lines)

@@ -169,7 +169,7 @@ async def _run_layers(
     # ---- Layer 2: judges (skipped during wrap-up) ----
     if not is_wrap_up and config.judges:
         await _run_judges_parallel(
-            surviving, config.judges, llm, timeout_s=timeout_s
+            surviving, config.judges, llm, session=session, timeout_s=timeout_s
         )
         trace["judge_results"] = [
             judge for c in surviving for judge in c.judge_results
@@ -322,14 +322,20 @@ async def _run_judges_parallel(
     judges: list[JudgeSpec],
     llm: LLMProvider,
     *,
+    session: CallSession,
     timeout_s: float,
 ) -> None:
-    """Mutates each candidate in-place: fills ``judge_results`` + ``judge_passed``."""
+    """Mutates each candidate in-place: fills ``judge_results`` + ``judge_passed``.
+
+    ``session`` is threaded through so ``build_judge_messages`` can pull
+    dialog history into the judge's user message (2026-05-29 experiment —
+    judge-history injection, mirrors voxen referee pattern).
+    """
 
     async def _call_judge(
         candidate_index: int, judge: JudgeSpec, reply: str
     ) -> dict[str, Any]:
-        messages = build_judge_messages(judge, reply)
+        messages = build_judge_messages(judge, reply, session)
         start = time.monotonic()
         try:
             async with asyncio.timeout(timeout_s):
