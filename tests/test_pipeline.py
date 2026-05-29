@@ -17,11 +17,13 @@ from isales_engine.pipeline.json_parser import (
 )
 from isales_engine.pipeline.orchestrator import PipelineOutcome, run_pipeline
 from isales_engine.pipeline.prompt_builder import (
+    JUDGE_OUTPUT_SCHEMA_SUFFIX,
     JudgeSpec,
     LeadInfo,
     PipelineConfig,
     PolishSpec,
     RoleSpec,
+    build_judge_messages,
 )
 from isales_engine.providers.llm_mock import KeywordDrivenMockLLM
 
@@ -420,5 +422,109 @@ async def test_greeting_llm_failure_returns_default() -> None:
     config = _make_config()
     text = await generate_greeting(session, config, _Boom())
     assert text == "您好。"
+
+
+# ---- build_judge_messages (engine-judge-dialog-context change) ------------
+#
+# Spec: role-prompt § Requirement: Judge 拿到对话上下文.
+# Covers: N 轮历史拼接 / 空历史显式占位 / SUFFIX 不在 user message 重复 /
+# 用户·AI 中文前缀 + 全角冒号 / 无尾部 AI: 提示行.
+
+
+def _make_judge_spec() -> JudgeSpec:
+    return JudgeSpec(
+        role_config_id=3,
+        prompt_version_id=3,
+        system_prompt="你是一个专业的对话应答分析专家...",  # PG-stored 原文形态
+    )
+
+
+class TestBuildJudgeMessages:
+    def test_n_turn_history_rendered_in_user_message(self) -> None:
+        session = _make_session()
+        session.append_event("greeting", text="您好，我是智联招聘的小雨。")
+        session.append_event("user_speech", text="哎你好。")
+        judge = _make_judge_spec()
+
+        messages = build_judge_messages(judge, "请问您方便聊两句吗？", session)
+
+        assert len(messages) == 2
+        user_content = messages[1].content
+        # 历史段两行 + section 顺序 + 候选回复段
+        assert "### 对话历史" in user_content
+        assert "AI：您好，我是智联招聘的小雨。" in user_content
+        assert "用户：哎你好。" in user_content
+        assert "### 销售 AI 准备发给客户的候选回复" in user_content
+        assert "请问您方便聊两句吗？" in user_content
+        # JSON guard 兜底字面 (dashscope OpenAI-compat JSON mode 需要)
+        assert user_content.endswith("按上述系统提示的 JSON schema 输出。")
+
+    def test_empty_history_uses_explicit_placeholder(self) -> None:
+        session = _make_session()
+        # session.dialog_history 初始为空 — greeting 之前的纯空状态
+        assert session.dialog_history == []
+        judge = _make_judge_spec()
+
+        messages = build_judge_messages(judge, "candidate text", session)
+
+        user_content = messages[1].content
+        assert "### 对话历史" in user_content
+        assert "（尚无对话历史，这是首轮回复）" in user_content
+        # 不留空段
+        assert "### 对话历史\n\n###" not in user_content
+        assert "candidate text" in user_content
+
+    def test_schema_suffix_on_system_not_repeated_in_user(self) -> None:
+        session = _make_session()
+        session.append_event("greeting", text="您好。")
+        judge = _make_judge_spec()
+
+        messages = build_judge_messages(judge, "candidate", session)
+
+        system_content = messages[0].content
+        user_content = messages[1].content
+        # system 含 [judge] 前缀 + PG 原文 + SUFFIX
+        assert system_content.startswith("[judge] ")
+        assert judge.system_prompt in system_content
+        assert JUDGE_OUTPUT_SCHEMA_SUFFIX in system_content
+        # user message 不重复 SUFFIX 字面
+        assert JUDGE_OUTPUT_SCHEMA_SUFFIX not in user_content
+
+    def test_user_ai_prefixes_use_chinese_fullwidth_colon(self) -> None:
+        session = _make_session()
+        session.append_event("greeting", text="开场白")
+        session.append_event("user_speech", text="客户发言")
+        judge = _make_judge_spec()
+
+        messages = build_judge_messages(judge, "candidate", session)
+        user_content = messages[1].content
+
+        # 中文角色标签 + 全角冒号
+        assert "AI：开场白" in user_content
+        assert "用户：客户发言" in user_content
+        # 不应出现英文标签 / 半角冒号
+        assert "user:" not in user_content
+        assert "assistant:" not in user_content
+        assert "AI: 开场白" not in user_content  # 半角冒号 + 空格
+
+    def test_no_trailing_ai_prompt_line(self) -> None:
+        """Judge is not the speaker — must not get a trailing `AI:` cue line
+        (that's role's behavior in _render_dialog)."""
+        session = _make_session()
+        session.append_event("greeting", text="开场白")
+        session.append_event("user_speech", text="客户发言")
+        judge = _make_judge_spec()
+
+        messages = build_judge_messages(judge, "candidate text", session)
+        user_content = messages[1].content
+
+        # 历史段最后一条 dialog turn 是 "用户：客户发言"; 之后直接是空行 +
+        # 候选回复段, 不应出现独占一行的 "AI：" / "AI:"
+        history_block = user_content.split("### 销售 AI 准备")[0]
+        # 不应有以独占行结尾的 "AI：" 或 "AI:"
+        assert not history_block.rstrip().endswith("AI：")
+        assert not history_block.rstrip().endswith("AI:")
+        # 最后非空行应是"用户：客户发言"
+        assert history_block.rstrip().splitlines()[-1] == "用户：客户发言"
 
 
