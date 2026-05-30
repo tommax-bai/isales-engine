@@ -30,6 +30,7 @@ import random
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
+import httpx
 from isales_common.enums import GenerationStatus
 from isales_common.providers.tts import TTSProvider
 
@@ -179,21 +180,64 @@ class FillerManager:
             )
 
     async def _stream_audio(self, phrase: FillerPhraseSpec) -> int:
-        """Generate audio chunks via TTS and forward them to the telephony out path.
+        """Forward filler audio to the telephony out path.
 
-        Real production stage 6 will skip TTS and stream the pre-rendered
-        audio file from OSS; for stage 4 we run the mock TTS which emits PCM
-        deterministically based on the phrase text.
+        When the phrase has a pre-rendered ``audio_url`` (production stage 6),
+        we stream that file directly and skip TTS entirely — this removes the
+        synthesis latency from the filler path. Otherwise we fall back to the
+        TTS provider (e.g. the stage-4 mock TTS which emits PCM
+        deterministically based on the phrase text).
         """
-
-        async def chunks() -> AsyncIterator[bytes]:
-            async for chunk in self._tts.synthesize_stream(phrase.text, self._voice_id):
-                yield chunk
 
         # Approximate duration: each char in TextLengthMockTTS is ~20ms.
         approx_duration_ms = max(50, len(phrase.text) * 20)
+
+        # Prefer pre-rendered audio when we have an http(s) URL we can fetch.
+        # Other schemes (e.g. ``oss://``) or any fetch failure fall back to
+        # live TTS so the filler still plays.
+        prerendered: bytes | None = None
+        if phrase.audio_url and phrase.audio_url.startswith(("http://", "https://")):
+            prerendered = await self._fetch_audio(phrase.audio_url)
+
+        if prerendered is not None:
+            audio = prerendered
+
+            async def chunks() -> AsyncIterator[bytes]:
+                yield audio
+        else:
+            async def chunks() -> AsyncIterator[bytes]:
+                async for chunk in self._tts.synthesize_stream(
+                    phrase.text, self._voice_id
+                ):
+                    yield chunk
+
         await self._telephony.audio_out(self._session.call_record_id, chunks())
         return approx_duration_ms
+
+    async def _fetch_audio(self, audio_url: str) -> bytes | None:
+        """Best-effort fetch of pre-rendered filler audio.
+
+        Returns the audio bytes, or ``None`` on any failure so the caller can
+        fall back to live TTS instead of dropping the filler entirely.
+        """
+
+        try:
+            async with httpx.AsyncClient() as client, client.stream(
+                "GET", audio_url
+            ) as response:
+                response.raise_for_status()
+                buffer = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if chunk:
+                        buffer.extend(chunk)
+                return bytes(buffer)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "filler_audio_fetch_failed call_record_id=%s url=%s",
+                self._session.call_record_id,
+                audio_url,
+            )
+            return None
 
     # ---- helpers ---------------------------------------------------------
 

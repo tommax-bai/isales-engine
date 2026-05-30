@@ -66,6 +66,26 @@ class VolcengineTTSProvider(TTSProvider):
         self._app_key = app_key
         self._app_token = app_token
         self._timeout_s = timeout_s
+        # Reuse a single AsyncClient across requests so the connection pool
+        # (TCP + TLS) is kept warm — avoids per-call handshake latency.
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self._timeout_s)
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the shared AsyncClient (call on provider shutdown)."""
+
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
+
+    async def close(self) -> None:
+        """Alias for :meth:`aclose` — lifecycle close on provider shutdown."""
+
+        await self.aclose()
 
     async def synthesize_stream(
         self,
@@ -121,7 +141,8 @@ class VolcengineTTSProvider(TTSProvider):
         start = time.monotonic()
         first_byte_logged = False
 
-        async with httpx.AsyncClient(timeout=self._timeout_s) as client, client.stream(
+        client = self._get_client()
+        async with client.stream(
             "POST", url, headers=headers, json=payload
         ) as response:
             if response.status_code >= 400:

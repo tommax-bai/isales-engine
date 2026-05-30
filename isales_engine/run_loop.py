@@ -363,6 +363,21 @@ async def _main_turn_loop(
                 )
             last_progress_ms = _to_ms(time.monotonic())
 
+            is_wrap_up = session.state is CallStatus.WRAPPING_UP
+
+            # Start the filler before evaluate_transfer so its audio overlaps
+            # the transfer-decision LLM latency (call-latency fix).
+            filler: FillerManager | None = None
+            if not is_wrap_up:
+                filler = FillerManager(
+                    session,
+                    config.fillers,
+                    telephony=telephony,
+                    tts=providers.tts,
+                    voice_id=config.voice_id,
+                )
+                await filler.start()
+
             decision = await evaluate_transfer(
                 user_text=user_text,
                 turn_count=len(session.dialog_history),
@@ -371,6 +386,8 @@ async def _main_turn_loop(
                 llm=providers.llm,
             )
             if decision.triggered:
+                if filler is not None:
+                    await filler.stop()
                 sm.transition_to(
                     CallStatus.TRANSFERRING, reason=decision.trigger_type or "transfer"
                 )
@@ -396,13 +413,13 @@ async def _main_turn_loop(
                 )
                 return
 
-            is_wrap_up = session.state is CallStatus.WRAPPING_UP
-
             # Continuous-interruption protection (ai-pipeline spec delta).
             protection = _decide_protection(session, config)
             if protection == "listen_only":
                 # Skip PROCESSING this turn. Play a short cue + return to
                 # LISTENING; counter resets so we give the user a clean slate.
+                if filler is not None:
+                    await filler.stop()
                 sm.transition_to(CallStatus.SPEAKING, reason="listen_only_cue")
                 await _play_tts(
                     session, telephony, providers.tts,
@@ -422,17 +439,6 @@ async def _main_turn_loop(
             sm.transition_to(CallStatus.PROCESSING, reason="speech_end")
             _publish_status(publisher, session, "speech_end")
 
-            filler: FillerManager | None = None
-            if not is_wrap_up:
-                filler = FillerManager(
-                    session,
-                    config.fillers,
-                    telephony=telephony,
-                    tts=providers.tts,
-                    voice_id=config.voice_id,
-                )
-                await filler.start()
-
             result = await run_pipeline(
                 session,
                 user_text,
@@ -441,8 +447,11 @@ async def _main_turn_loop(
                 is_wrap_up=is_wrap_up,
                 pipeline_timeout_ms=pipeline_timeout_ms,
             )
+            # Pipeline is done — cancel the filler immediately instead of
+            # waiting for its audio to finish, so the reply TTS starts sooner
+            # (call-latency fix).
             if filler is not None:
-                await filler.wait_finished()
+                await filler.stop()
 
             # Token budget bookkeeping (PR #7 wires accumulation; PR #6 just
             # ensures the trace records persist token fields).
