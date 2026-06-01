@@ -355,10 +355,36 @@ class VolcengineASRProvider(ASRProvider):
             push_done = asyncio.Event()
 
             async def _push_audio() -> None:
+                # DIAG-REMOVE-AFTER-MIC-DEBUG: push chunks/bytes per 1s + dump first 5s
+                import time as _t  # noqa: PLC0415
+                _last = _t.monotonic()
+                _chunks = 0
+                _bytes = 0
+                # DIAG-REMOVE: dump first ~5s (100 chunks × 320B = 16kHz mono = 5s)
+                # to verify what's actually going to vendor
+                _dump_path = "/tmp/asr_push_dump.pcm"
+                _dump_fh: Any = None
+                _dump_max_bytes = 5 * 16000 * 2  # 5s @ 16k mono int16
+                _dump_written = 0
+                try:
+                    _dump_fh = open(_dump_path, "wb")
+                except Exception:  # noqa: BLE001
+                    pass
                 try:
                     async for chunk in audio_chunks:
                         if not chunk:
                             continue
+                        # DIAG-REMOVE: dump
+                        if _dump_fh and _dump_written < _dump_max_bytes:
+                            _dump_fh.write(chunk)
+                            _dump_written += len(chunk)
+                            if _dump_written >= _dump_max_bytes:
+                                _dump_fh.close()
+                                _dump_fh = None
+                                logger.info(
+                                    "volcengine_asr_push_dump_complete path=%s bytes=%s",
+                                    _dump_path, _dump_written,
+                                )
                         audio_frame = _encode_frame(
                             msg_type=MSG_AUDIO_ONLY_REQUEST,
                             flags=FLAGS_NO_SEQ,
@@ -367,6 +393,20 @@ class VolcengineASRProvider(ASRProvider):
                             payload=chunk,
                         )
                         await ws.send(audio_frame)
+                        # DIAG-REMOVE-AFTER-MIC-DEBUG ------------------------
+                        _chunks += 1
+                        _bytes += len(chunk)
+                        _now = _t.monotonic()
+                        if _now - _last >= 1.0:
+                            logger.info(
+                                "volcengine_asr_push_1s chunks=%s bytes=%s "
+                                "first_chunk_len=%s",
+                                _chunks, _bytes, len(chunk),
+                            )
+                            _last = _now
+                            _chunks = 0
+                            _bytes = 0
+                        # DIAG-REMOVE-AFTER-MIC-DEBUG end --------------------
                     # End-of-stream: empty audio frame with last-packet flag.
                     eos_frame = _encode_frame(
                         msg_type=MSG_AUDIO_ONLY_REQUEST,
@@ -385,6 +425,12 @@ class VolcengineASRProvider(ASRProvider):
 
             push_task = asyncio.create_task(_push_audio(), name="asr_push")
 
+            # DIAG-REMOVE-AFTER-MIC-DEBUG: recv frame count + msg_type histogram
+            import time as _t  # noqa: PLC0415
+            _last_recv_log = _t.monotonic()
+            _recv_count = 0
+            _msg_type_seen: dict[int, int] = {}
+            _first_payload_preview: str | None = None
             try:
                 async for raw in ws:
                     if isinstance(raw, str):
@@ -403,6 +449,44 @@ class VolcengineASRProvider(ASRProvider):
 
                     msg_type = decoded["msg_type"]
                     payload = decoded["payload"]
+                    # DIAG-REMOVE-AFTER-MIC-DEBUG begin ----------------------
+                    _recv_count += 1
+                    _msg_type_seen[msg_type] = _msg_type_seen.get(msg_type, 0) + 1
+                    if _first_payload_preview is None and payload:
+                        try:
+                            _first_payload_preview = payload[:200].decode(
+                                "utf-8", errors="replace",
+                            )
+                            logger.info(
+                                "volcengine_asr_first_recv msg_type=0x%x "
+                                "payload_len=%s preview=%r",
+                                msg_type, len(payload), _first_payload_preview,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # Log every frame with non-empty text (filter handshake
+                    # ack where text=""). Caller can grep `NONEMPTY_TEXT` to
+                    # see if vendor ever emits a real partial.
+                    if payload:
+                        try:
+                            _txt = payload[:500].decode("utf-8", errors="replace")
+                            if '"text":"' in _txt and '"text":""' not in _txt:
+                                logger.info(
+                                    "volcengine_asr_NONEMPTY_TEXT msg_type=0x%x "
+                                    "preview=%r",
+                                    msg_type, _txt,
+                                )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    _now = _t.monotonic()
+                    if _now - _last_recv_log >= 1.0:
+                        logger.info(
+                            "volcengine_asr_recv_1s total=%s msg_types=%s",
+                            _recv_count,
+                            {f"0x{k:x}": v for k, v in _msg_type_seen.items()},
+                        )
+                        _last_recv_log = _now
+                    # DIAG-REMOVE-AFTER-MIC-DEBUG end ------------------------
 
                     if msg_type == MSG_ERROR_RESPONSE:
                         err_code = decoded.get("error_code")

@@ -165,6 +165,7 @@ class _CallState:
         )
 
     async def _inbound_loop(self) -> None:
+        import time as _time  # noqa: PLC0415  # DIAG-REMOVE-AFTER-MIC-DEBUG
         # DingRTC C++ SDK mixed-playback OnPlaybackAudioFrame defaults to
         # 48 kHz output regardless of how peers join. ASR Provider (and
         # 8 kHz GSM modem path) need 16 kHz / 8 kHz; resample inline here
@@ -180,6 +181,14 @@ class _CallState:
             audioop = None
         target_rate = 16000
         ratecv_state: Any = None
+        # DIAG-REMOVE-AFTER-MIC-DEBUG begin ----------------------------------
+        recv_count = 0
+        last_log_t = _time.monotonic()
+        last_log_count = 0
+        max_rms_window = 0
+        first_sender_uid: str | None = None
+        skipped_sender_count = 0
+        # DIAG-REMOVE-AFTER-MIC-DEBUG end ------------------------------------
         try:
             async for frame in self.rtc_session.audio_frames():
                 # DingRTC C++ SDK's `OnPlaybackAudioFrame` is **mixed** playback
@@ -193,23 +202,92 @@ class _CallState:
                 # skip frames bearing an unexpected non-empty uid (defence
                 # in depth against future multi-user channel changes).
                 if frame.sender_uid and frame.sender_uid != self.edge_uid:
+                    skipped_sender_count += 1  # DIAG-REMOVE-AFTER-MIC-DEBUG
                     continue
+                # DIAG-REMOVE-AFTER-MIC-DEBUG begin ---------------------------
+                if first_sender_uid is None:
+                    first_sender_uid = frame.sender_uid or "<empty>"
+                recv_count += 1
+                _p = frame.pcm
+                if _p and len(_p) >= 2:
+                    _sample_count = len(_p) // 2
+                    _stride = max(1, _sample_count // 32)
+                    _total = 0
+                    _seen = 0
+                    for _i in range(0, len(_p), _stride * 2):
+                        if _i + 2 > len(_p):
+                            break
+                        _s = int.from_bytes(_p[_i:_i + 2], "little", signed=True)
+                        _total += _s * _s
+                        _seen += 1
+                    if _seen:
+                        _rms = int((_total // _seen) ** 0.5)
+                        if _rms > max_rms_window:
+                            max_rms_window = _rms
+                # DIAG-REMOVE-AFTER-MIC-DEBUG end -----------------------------
                 pcm = frame.pcm
-                # Resample 48 kHz → 16 kHz if needed (mixed playback default).
+                # DingRTC mixed playback frame on Linux 3.9 SDK is 48 kHz
+                # **stereo** int16 10 ms (1920 B = 480 samples × 2 ch × 2 B).
+                # ASR / VAD downstream consume 16 kHz **mono** int16. Two-step
+                # normalize: (1) stereo → mono (L+R)/2 with audioop.tomono,
+                # (2) 48 kHz → 16 kHz with audioop.ratecv using channels=1
+                # (post-downmix). Without (1) ratecv preserves stereo and the
+                # downstream ASR provider sees 16 kHz stereo bytes interpreted
+                # as 16 kHz mono → effective 2× tempo → vendor V3 SAUC returns
+                # `audio_info.duration=0 text=""` empty results (2026-06-01
+                # diagnostic on mac dev-no-modem fake-WAV upstream).
                 src_rate = int(frame.sample_rate or 0)
+                src_channels = int(getattr(frame, "channels", 1) or 1)
+                if src_channels > 1 and audioop is not None and pcm:
+                    pcm = audioop.tomono(pcm, 2, 0.5, 0.5)
+                # DIAG-REMOVE-AFTER-MIC-DEBUG: post-downmix RMS — verify
+                # stereo→mono didn't cancel L+R (phase-inverted channels).
+                _post_downmix_rms = 0
+                if audioop is not None and pcm:
+                    try:
+                        _post_downmix_rms = audioop.rms(pcm, 2)
+                    except Exception:  # noqa: BLE001
+                        pass
                 if (
                     src_rate > 0 and src_rate != target_rate
                     and audioop is not None and pcm
                 ):
                     pcm, ratecv_state = audioop.ratecv(
-                        pcm, 2, frame.channels or 1,
+                        pcm, 2, 1,
                         src_rate, target_rate, ratecv_state,
                     )
+                # DIAG-REMOVE-AFTER-MIC-DEBUG: post-resample RMS (final PCM going to ASR)
+                _final_rms = 0
+                if audioop is not None and pcm:
+                    try:
+                        _final_rms = audioop.rms(pcm, 2)
+                    except Exception:  # noqa: BLE001
+                        pass
                 await self.inbound_q.put(pcm)
                 # Fork the same PCM to the VAD lane. Non-blocking put_nowait
                 # would risk dropping frames; await is safe because the VAD
                 # monitor drains as fast as ASR.
                 await self.vad_q.put(pcm)
+                # DIAG-REMOVE-AFTER-MIC-DEBUG begin ---------------------------
+                _now = _time.monotonic()
+                if _now - last_log_t >= 1.0:
+                    logger.info(
+                        "rtc_inbound_1s sid=%s recv=%s delta=%s raw_max_rms=%s "
+                        "post_downmix_rms=%s final_rms=%s "
+                        "sample_rate=%s channels=%s bytes=%s first_sender_uid=%s "
+                        "skipped_sender=%s edge_uid=%s after_resample_bytes=%s",
+                        self.sid, recv_count, recv_count - last_log_count,
+                        max_rms_window, _post_downmix_rms, _final_rms,
+                        frame.sample_rate,
+                        getattr(frame, "channels", "?"),
+                        len(_p),
+                        first_sender_uid, skipped_sender_count, self.edge_uid,
+                        len(pcm),
+                    )
+                    last_log_t = _now
+                    last_log_count = recv_count
+                    max_rms_window = 0
+                # DIAG-REMOVE-AFTER-MIC-DEBUG end -----------------------------
         except RtcNotJoined:
             # close_iterators() may race ahead of this task being
             # scheduled: leave() invalidates the session before the pump
