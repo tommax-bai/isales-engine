@@ -277,6 +277,12 @@ class VolcengineASRProvider(ASRProvider):
                 async for result in self._stream_one_connection(
                     websockets, audio_chunks, ts0=ts0,
                 ):
+                    if result.is_final:
+                        logger.info(
+                            "volcengine_asr_stream_recognize_yielding_FINAL "
+                            "text=%r",
+                            result.text,
+                        )
                     yield result
                 return
             except ConnectionClosed as exc:
@@ -353,6 +359,16 @@ class VolcengineASRProvider(ASRProvider):
 
             # Step 2: concurrently push audio frames + recv server frames.
             push_done = asyncio.Event()
+            # Q-fix: partial-promote on silence-EOS. Shared state between
+            # _push_audio (writer) and the recv loop (reader) so EOS can
+            # immediately surface the latest partial as a final, without
+            # waiting for vendor's own finalize (observed 7+ s delay on
+            # 2026-06-01 mac dev-no-modem). After promote, vendor's eventual
+            # final is suppressed (avoid double-yield).
+            _latest_partial_text: list[str | None] = [None]
+            _latest_partial_update_at: list[float] = [0.0]  # monotonic ts
+            _promote_yielded: list[bool] = [False]
+            _pending_promote: list[ASRResult] = []  # max 1 entry, drained by recv loop
 
             async def _push_audio() -> None:
                 # DIAG-REMOVE-AFTER-MIC-DEBUG: push chunks/bytes per 1s + dump first 5s
@@ -370,6 +386,35 @@ class VolcengineASRProvider(ASRProvider):
                     _dump_fh = open(_dump_path, "wb")
                 except Exception:  # noqa: BLE001
                     pass
+
+                # Client-side silence-driven EOS (PERMANENT, not DIAG).
+                # Vendor V3 SAUC does not emit ``definite=true`` until either
+                # (a) it sees absolute silence in its own server-side VAD or
+                # (b) the client sends ``FLAGS_NO_SEQ_LAST_PACKET`` EOS.
+                # The (a) path is unreliable under low-energy comfort noise
+                # (dev-no-modem mixed-playback self-loopback measured 50-350
+                # final_rms after the WAV ends; noisy real-mic environments
+                # also stay above absolute silence). So drive (b) actively:
+                # after ``SILENCE_DURATION_S`` of chunks with RMS below
+                # ``SILENCE_RMS_THRESHOLD``, send EOS to force finalize.
+                # Vendor then emits the final + closes the connection; the
+                # outer ``stream_recognize`` ``while True`` reconnects when
+                # new audio arrives. Threshold + duration tuned against
+                # 2026-06-01 mac dev-no-modem dump data (rtc_inbound_1s log).
+                try:
+                    import audioop  # noqa: PLC0415
+                except ImportError:  # pragma: no cover  - Py 3.13+ removal
+                    audioop = None  # type: ignore[assignment]
+                # Hysteresis: low threshold to enter silence, high to exit.
+                # Single-chunk RMS jitter is high (observed 125 → 335 → 1152
+                # → 2881 in 1 s on dev-no-modem self-loopback), so reset
+                # ONLY on clear speech (> _SPEECH_RMS_RESET); chunks in the
+                # 500-1500 band keep whatever silence state we're already in.
+                _SILENCE_RMS_THRESHOLD = 500
+                _SPEECH_RMS_RESET = 1500
+                _SILENCE_DURATION_S = 1.5
+                _silence_started_at: float | None = None
+
                 try:
                     async for chunk in audio_chunks:
                         if not chunk:
@@ -385,6 +430,102 @@ class VolcengineASRProvider(ASRProvider):
                                     "volcengine_asr_push_dump_complete path=%s bytes=%s",
                                     _dump_path, _dump_written,
                                 )
+
+                        _now = _t.monotonic()
+                        # Silence-driven EOS check (before send) — if this
+                        # chunk is silence and we've accumulated enough, fire
+                        # EOS and return without sending this chunk; vendor
+                        # finalizes on the EOS marker.
+                        _chunk_rms = 0
+                        if audioop is not None:
+                            try:
+                                _chunk_rms = audioop.rms(chunk, 2)
+                            except Exception:  # noqa: BLE001
+                                _chunk_rms = 0
+                        if _chunk_rms < _SILENCE_RMS_THRESHOLD:
+                            if _silence_started_at is None:
+                                _silence_started_at = _now
+                            elif (_now - _silence_started_at) >= _SILENCE_DURATION_S:
+                                logger.info(
+                                    "volcengine_asr_silence_eos: "
+                                    "silence_duration_s=%.2f chunk_rms=%s "
+                                    "low_thr=%s high_reset=%s — sending EOS",
+                                    _now - _silence_started_at,
+                                    _chunk_rms, _SILENCE_RMS_THRESHOLD,
+                                    _SPEECH_RMS_RESET,
+                                )
+                                # Q-fix: send EOS, wait for vendor partial
+                                # to catch up (vendor server-side processing
+                                # lags push-side silence detection by ~500ms
+                                # observed on 2026-06-01), then promote
+                                # latest partial as final. Recv loop yields
+                                # promoted via _pending_promote on ws.close.
+                                _silence_eos = _encode_frame(
+                                    msg_type=MSG_AUDIO_ONLY_REQUEST,
+                                    flags=FLAGS_NO_SEQ_LAST_PACKET,
+                                    serialization=SERIALIZATION_RAW,
+                                    compression=COMPRESSION_NONE,
+                                    payload=b"",
+                                )
+                                try:
+                                    await ws.send(_silence_eos)
+                                except Exception as _exc:  # noqa: BLE001
+                                    logger.warning(
+                                        "volcengine_asr_silence_eos_send_failed: %s",
+                                        _exc,
+                                    )
+                                # Wait for partial to STABILIZE (vendor stops
+                                # changing partial text — typically means
+                                # utterance complete). Stable = 0.3 s no
+                                # text change. MAX 2 s. If no partial ever
+                                # arrives, skip promote.
+                                _STABLE_S = 0.3
+                                _MAX_WAIT_S = 2.0
+                                _wait_start = _t.monotonic()
+                                while (_t.monotonic() - _wait_start) < _MAX_WAIT_S:
+                                    if _latest_partial_text[0]:
+                                        _since_update = (
+                                            _t.monotonic()
+                                            - _latest_partial_update_at[0]
+                                        )
+                                        if _since_update >= _STABLE_S:
+                                            break
+                                    await asyncio.sleep(0.05)
+                                _pt = _latest_partial_text[0]
+                                _waited_s = _t.monotonic() - _wait_start
+                                if _pt:
+                                    _promoted = ASRResult(
+                                        text=_pt,
+                                        is_final=True,
+                                        timestamp_ms=int(
+                                            (_t.monotonic() - ts0) * 1000,
+                                        ),
+                                    )
+                                    _pending_promote.append(_promoted)
+                                    _promote_yielded[0] = True
+                                    logger.info(
+                                        "volcengine_asr_promote_partial_to_final "
+                                        "text=%r catchup_waited_s=%.2f",
+                                        _pt, _waited_s,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "volcengine_asr_silence_eos_no_partial "
+                                        "catchup_waited_s=%.2f — vendor never "
+                                        "emitted partial",
+                                        _waited_s,
+                                    )
+                                # Close ws → recv loop wakes up → drain
+                                # _pending_promote → outer reconnect.
+                                try:
+                                    await ws.close()
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                return
+                        elif _chunk_rms > _SPEECH_RMS_RESET:
+                            _silence_started_at = None  # clear speech resets
+                        # else: 500 <= rms <= 1500, in-between — maintain state
+
                         audio_frame = _encode_frame(
                             msg_type=MSG_AUDIO_ONLY_REQUEST,
                             flags=FLAGS_NO_SEQ,
@@ -396,12 +537,12 @@ class VolcengineASRProvider(ASRProvider):
                         # DIAG-REMOVE-AFTER-MIC-DEBUG ------------------------
                         _chunks += 1
                         _bytes += len(chunk)
-                        _now = _t.monotonic()
                         if _now - _last >= 1.0:
                             logger.info(
                                 "volcengine_asr_push_1s chunks=%s bytes=%s "
-                                "first_chunk_len=%s",
-                                _chunks, _bytes, len(chunk),
+                                "first_chunk_len=%s chunk_rms=%s silence_acc_s=%.2f",
+                                _chunks, _bytes, len(chunk), _chunk_rms,
+                                (_now - _silence_started_at) if _silence_started_at else 0.0,
                             )
                             _last = _now
                             _chunks = 0
@@ -432,7 +573,34 @@ class VolcengineASRProvider(ASRProvider):
             _msg_type_seen: dict[int, int] = {}
             _first_payload_preview: str | None = None
             try:
-                async for raw in ws:
+                # Q-fix: replaced `async for raw in ws` with a 100 ms polling
+                # loop so we can check `_pending_promote` even when vendor
+                # does not respond to ws.close() immediately. Original
+                # `async for` blocks on next ws frame; vendor sometimes
+                # keeps the connection open after EOS for 7+ s draining
+                # buffered audio, during which a queued promoted-final
+                # would be stuck waiting for ConnectionClosed that never
+                # arrives. Now: wake every 100 ms, drain any pending
+                # promote, then re-enter recv.
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        if _pending_promote:
+                            while _pending_promote:
+                                _yp = _pending_promote.pop(0)
+                                logger.info(
+                                    "volcengine_asr_yield_promoted_in_poll "
+                                    "text=%r is_final=%s",
+                                    _yp.text, _yp.is_final,
+                                )
+                                yield _yp
+                            # ws.close() was called by _push_audio; recv
+                            # connection is dead — break out of poll loop
+                            # so outer reconnects on the natural next
+                            # utterance.
+                            break
+                        continue
                     if isinstance(raw, str):
                         # Text frames are unexpected on this protocol but log
                         # them for diagnostics rather than crashing.
@@ -519,7 +687,45 @@ class VolcengineASRProvider(ASRProvider):
                         continue
 
                     for asr_result in _parse_v3_response(data, ts0=ts0):
+                        # Q-fix: track latest partial text. Update timestamp
+                        # ONLY when text actually changes — vendor pushes the
+                        # same partial every ~20 ms even when content is
+                        # unchanged, so a timestamp-on-every-frame model
+                        # would never see "stable" (silence-EOS catchup loop
+                        # relies on `(now - update_at) >= STABLE_S` to detect
+                        # utterance completion).
+                        if not asr_result.is_final and asr_result.text:
+                            import time as _t2  # noqa: PLC0415
+                            if asr_result.text != _latest_partial_text[0]:
+                                _latest_partial_text[0] = asr_result.text
+                                _latest_partial_update_at[0] = _t2.monotonic()
+                        # Suppress vendor's eventual real final after we've
+                        # already promoted the partial — avoid double-final
+                        # yield to engine state machine (would trigger 2nd
+                        # LLM turn on the same utterance content).
+                        if _promote_yielded[0] and asr_result.is_final:
+                            continue
                         yield asr_result
+            except ConnectionClosed as _cc_exc:
+                # Drain any promoted final queued by _push_audio before
+                # letting outer stream_recognize reconnect. ws.close() was
+                # called by _push_audio after silence-EOS to skip vendor's
+                # 7+ s real-finalize delay.
+                logger.info(
+                    "volcengine_asr_recv_connectionclosed pending_promote_len=%s "
+                    "exc=%r",
+                    len(_pending_promote), _cc_exc,
+                )
+                while _pending_promote:
+                    _p_yield = _pending_promote.pop(0)
+                    logger.info(
+                        "volcengine_asr_yield_promoted_in_except "
+                        "text=%r is_final=%s",
+                        _p_yield.text, _p_yield.is_final,
+                    )
+                    yield _p_yield
+                logger.info("volcengine_asr_recv_reraising_connectionclosed")
+                raise
             finally:
                 push_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
