@@ -477,10 +477,18 @@ class VolcengineASRProvider(ASRProvider):
                                 # Wait for partial to STABILIZE (vendor stops
                                 # changing partial text — typically means
                                 # utterance complete). Stable = 0.3 s no
-                                # text change. MAX 2 s. If no partial ever
-                                # arrives, skip promote.
+                                # text change. MAX 5 s — vendor server-side
+                                # processing latency is unstable across days
+                                # (observed 1 s on 2026-06-01 smoke #20 vs
+                                # 4 s on 2026-06-02 smoke #21 same setup);
+                                # need headroom so post-EOS catchup doesn't
+                                # under-shoot. campaign silence_threshold_ms
+                                # must be ≥ silence_acc (1.5) + MAX_WAIT (5)
+                                # + LLM RTT (~3-5) = ~10 s minimum for full
+                                # chain. If no partial ever arrives, skip
+                                # promote.
                                 _STABLE_S = 0.3
-                                _MAX_WAIT_S = 2.0
+                                _MAX_WAIT_S = 5.0
                                 _wait_start = _t.monotonic()
                                 while (_t.monotonic() - _wait_start) < _MAX_WAIT_S:
                                     if _latest_partial_text[0]:
