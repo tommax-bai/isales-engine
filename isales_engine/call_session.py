@@ -41,7 +41,12 @@ TRANSCRIPT_EVENT_TYPES: frozenset[str] = frozenset(
         "hangup",
         # Engine-internal events introduced by impl-engine spec deltas.
         "state_changed",
+        # state_error: historical, written by transition_to pre-soften-guard.
+        # state_warning: current, written when a transition falls outside
+        # LEGAL_TRANSITIONS (advisory, non-blocking). See call-state-machine
+        # § "非法 transition 改 advisory 警告".
         "state_error",
+        "state_warning",
     }
 )
 
