@@ -942,7 +942,24 @@ async def _vad_monitor(
             if voice_active_ms < interruption_cfg.min_duration_ms:
                 continue
 
-            # Lock in the interruption: signal first, then cancel.
+            # PROTOTYPE 2026-06-03: VAD-source cancel DISABLED.
+            # VAD energy 信号容易被 ambient noise (椅子/风扇/呼吸/键盘)
+            # 误触发 — 2026-06-03 真 mic smoke #128 实证 rms=1705
+            # voice_active_ms=200 (接近 mac mic baseline) 误打断 AI
+            # 长回应. 改用 ASR partial text length gate (≥2 字)
+            # 作为唯一 barge-in 信号 (在 evaluate_partial 里),
+            # 噪音过不了 vendor model 不会识别成中文文字这道闸.
+            # VAD 仍 mirror voice_active_ms 给 partial_monitor 做 corroboration
+            # (550902d 加的防自环误触机制保留). 验证通过后 promote 到
+            # InterruptionConfig + openspec change interruption-detection-text-length-gate.
+            logger.info(
+                "vad_monitor_cancel_disabled_prototype "
+                "voice_active_ms=%s rms=%s "
+                "(barge-in 改靠 partial text length, 见 evaluate_partial)",
+                voice_active_ms, rms,
+            )
+            continue
+            # 下面原 cancel 路径暂时不走 (PROTOTYPE)
             session.interruption_signaled = True
             session.append_event(
                 "interruption",

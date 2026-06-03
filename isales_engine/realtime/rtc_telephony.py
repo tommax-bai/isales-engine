@@ -188,6 +188,20 @@ class _CallState:
         max_rms_window = 0
         first_sender_uid: str | None = None
         skipped_sender_count = 0
+        # DIAG-REMOVE-AFTER-ECHO-TEST: raw stereo 48k dump (前 15s)
+        # 用于 verify SDK 是否把 own publish (engine TTS) mix 进
+        # OnPlaybackAudioFrame self-loopback path. 测试方法: user 不说话,
+        # 跑 smoke 让 greeting + silence_activation 兜底 TTS 自然播放,
+        # 之后 afplay 听 dump — 若含 AI TTS 内容 = SDK 真的 self-loopback;
+        # 若纯静音 = 真因在别处 (VAD 阈值 / 真说话 race).
+        _raw_dump_path = "/tmp/inbound_raw_48k_stereo.pcm"
+        _raw_dump_fh: Any = None
+        _raw_dump_max_bytes = 15 * 48000 * 2 * 2  # 15s @ 48k stereo int16
+        _raw_dump_written = 0
+        try:
+            _raw_dump_fh = open(_raw_dump_path, "wb")
+        except Exception:  # noqa: BLE001
+            pass
         # DIAG-REMOVE-AFTER-MIC-DEBUG end ------------------------------------
         try:
             async for frame in self.rtc_session.audio_frames():
@@ -204,6 +218,18 @@ class _CallState:
                 if frame.sender_uid and frame.sender_uid != self.edge_uid:
                     skipped_sender_count += 1  # DIAG-REMOVE-AFTER-MIC-DEBUG
                     continue
+                # DIAG-REMOVE-AFTER-ECHO-TEST: dump raw stereo 48k frame.pcm
+                if _raw_dump_fh and _raw_dump_written < _raw_dump_max_bytes:
+                    _raw_dump_fh.write(frame.pcm)
+                    _raw_dump_written += len(frame.pcm)
+                    if _raw_dump_written >= _raw_dump_max_bytes:
+                        _raw_dump_fh.close()
+                        _raw_dump_fh = None
+                        logger.info(
+                            "inbound_raw_dump_complete path=%s bytes=%s "
+                            "(15s @ 48k stereo int16)",
+                            _raw_dump_path, _raw_dump_written,
+                        )
                 # DIAG-REMOVE-AFTER-MIC-DEBUG begin ---------------------------
                 if first_sender_uid is None:
                     first_sender_uid = frame.sender_uid or "<empty>"

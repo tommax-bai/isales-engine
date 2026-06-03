@@ -198,3 +198,59 @@ def test_settings_no_longer_carries_provider_secrets(monkeypatch) -> None:  # ty
     assert s.live_provider_tests is False
     assert s.credentials_required is True  # 新加字段，默认 True
     assert s.volcengine_tts_voice_id_default == "BV001_streaming"
+
+
+# ---- chat_stream error mapping (pipeline-stream-and-referee) ---------------
+#
+# chat_stream reuses map_http_error / map_transport_error, so the same vendor
+# failures surface as the same ProviderError subclasses as chat(). One case
+# per family here; the streaming-specific paths live in
+# tests/test_provider_chat_stream.py.
+
+from isales_engine.providers.llm_openai_compatible import (  # noqa: E402
+    OpenAICompatibleLLMProvider,
+)
+
+
+def _stream_provider(handler) -> OpenAICompatibleLLMProvider:  # type: ignore[no-untyped-def]
+    return OpenAICompatibleLLMProvider(
+        provider="openai",
+        api_key="sk-test",
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o-mini",
+        transport=httpx.MockTransport(handler),
+    )
+
+
+async def _drain(provider: OpenAICompatibleLLMProvider) -> None:
+    from isales_common.providers._models import Message
+
+    async for _ in provider.chat_stream([Message(role="user", content="hi")]):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_500_maps_to_server_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"code": "OVERLOADED"})
+
+    with pytest.raises(ProviderServerError):
+        await _drain(_stream_provider(handler))
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_4xx_maps_to_invalid_request() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"code": "BAD"})
+
+    with pytest.raises(ProviderInvalidRequest):
+        await _drain(_stream_provider(handler))
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_transport_timeout_maps() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow")
+
+    with pytest.raises(ProviderTimeout):
+        await _drain(_stream_provider(handler))

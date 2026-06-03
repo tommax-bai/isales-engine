@@ -13,8 +13,10 @@ without running real LLMs.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from isales_common.providers._models import LLMResponse, Message
@@ -56,8 +58,17 @@ class KeywordDrivenMockLLM(LLMProvider):
       ``goal_type="do_not_call"``, ``goal_achieved=true``.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        first_token_ms: float = 0.0,
+        per_token_ms: float = 0.0,
+    ) -> None:
         self.calls: list[tuple[list[Message], bool]] = []
+        # Simulated streaming cadence (seconds converted from ms). 0 = no sleep
+        # (default — unit tests stay fast); set non-zero to exercise latency.
+        self._first_token_s = first_token_ms / 1000.0
+        self._per_token_s = per_token_ms / 1000.0
 
     async def chat(
         self,
@@ -77,6 +88,35 @@ class KeywordDrivenMockLLM(LLMProvider):
             finish_reason="stop",
             latency_ms=0,
         )
+
+    async def chat_stream(
+        self,
+        messages: list[Message],
+        *,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream the decided content one character at a time.
+
+        Honours ``first_token_ms`` (delay before the first chunk) and
+        ``per_token_ms`` (delay between subsequent chunks) so tests can
+        simulate realistic streaming latency.
+        """
+        self.calls.append((list(messages), False))
+        decision = self._decide(messages, json_mode=False)
+        first = True
+        for ch in decision.content:
+            if first:
+                if self._first_token_s:
+                    await asyncio.sleep(self._first_token_s)
+                first = False
+            elif self._per_token_s:
+                await asyncio.sleep(self._per_token_s)
+            yield ch
+        self.last_call_tokens_in = decision.tokens_in
+        self.last_call_tokens_out = decision.tokens_out
+        self.last_call_finish_reason = "stop"
 
     # ------------------------------------------------------------------
     def _decide(self, messages: list[Message], *, json_mode: bool) -> _Decision:
