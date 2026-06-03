@@ -80,6 +80,12 @@ class CallSession:
     # DialCommand.device_id reaches the edge.
     device_id: int = 0
 
+    # post-call extractor (pipeline-stream-and-referee): the extractor slot ids
+    # stashed by run_session so finalize_session can LPUSH the isales:extract
+    # task. 0 → no extractor configured → no extract LPUSH.
+    extractor_role_config_id: int = 0
+    extractor_prompt_version_id: int = 0
+
     # Mutable state.
     state: CallStatus = CallStatus.INIT
     previous_state: CallStatus | None = None

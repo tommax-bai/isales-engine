@@ -15,15 +15,18 @@ counter, and unregisters from ``SessionManager``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime
 from typing import Any
 
 from isales_common.enums import CallStatus, HangupCause
 from isales_common.models import CallRecord
+from isales_common.redis_keys import EXTRACT_QUEUE
 from isales_common.schemas.messages import CallEnded
 from isales_common.schemas.messages.dial import DialRequest
 from redis.asyncio import Redis
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from isales_engine.call_session import CallSession
@@ -92,6 +95,14 @@ async def finalize_session(
             session.call_record_id,
         )
 
+    # Post-call extractor (pipeline-stream-and-referee): hand the transcript to
+    # the worker's offline extractor. Only when an extractor slot is configured
+    # and there is real dialog to extract from.
+    if session.extractor_role_config_id and session.dialog_history:
+        await _lpush_extract(
+            redis, sessionmaker, session, max_retries=3
+        )
+
     await _lpush_call_ended(
         redis,
         queue=settings.engine_call_ended_queue,
@@ -156,6 +167,66 @@ async def _lpush_call_ended(
                 await asyncio.sleep(backoff)
                 backoff *= 2
     return False
+
+
+async def _lpush_extract(
+    redis: Redis[Any],
+    sessionmaker: async_sessionmaker[AsyncSession],
+    session: CallSession,
+    *,
+    max_retries: int = 3,
+) -> bool:
+    """LPUSH the post-call extract task + mark call_record.extract_status.
+
+    Spec: service-communication § "isales:extract 队列消息 schema". The
+    extract_status='pending' UPDATE is best-effort; a failed UPDATE does not
+    block the LPUSH (the worker still writes 'done'/'failed' on completion).
+    """
+    payload = json.dumps(
+        {
+            "call_record_id": session.call_record_id,
+            "transcript_snapshot": [
+                {"role": t.role, "text": t.text, "ts_ms": t.ts_ms}
+                for t in session.dialog_history
+            ],
+            "extractor_role_config_id": session.extractor_role_config_id,
+            "extractor_prompt_version_id": session.extractor_prompt_version_id,
+        },
+        ensure_ascii=False,
+    )
+
+    pushed = False
+    backoff = 0.2
+    for attempt in range(1, max_retries + 1):
+        try:
+            await redis.lpush(EXTRACT_QUEUE, payload)
+            pushed = True
+            break
+        except Exception:  # noqa: BLE001 — Redis transient failures are retried
+            logger.exception(
+                "extract_lpush_failed attempt=%s call_record_id=%s",
+                attempt,
+                session.call_record_id,
+            )
+            if attempt < max_retries:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+
+    if pushed:
+        try:
+            async with sessionmaker() as db:
+                await db.execute(
+                    update(CallRecord)
+                    .where(CallRecord.id == session.call_record_id)
+                    .values(extract_status="pending")
+                )
+                await db.commit()
+        except Exception:  # noqa: BLE001 — don't block finalize on this UPDATE
+            logger.exception(
+                "extract_status_pending_update_failed call_record_id=%s",
+                session.call_record_id,
+            )
+    return pushed
 
 
 async def _decr_concurrency(

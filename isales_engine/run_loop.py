@@ -91,6 +91,12 @@ async def run_session(
     # separate parameter plumbed through every helper.
     session._token_budget_per_call = token_budget_per_call
 
+    # Stash extractor slot ids so finalize_session can LPUSH the post-call
+    # extract task without re-loading the runtime config (pipeline-stream-and-
+    # referee § post-call extractor).
+    session.extractor_role_config_id = config.pipeline.extractor.role_config_id
+    session.extractor_prompt_version_id = config.pipeline.extractor.prompt_version_id
+
     sm = StateMachine(session)
     session.call_started_at_monotonic = time.monotonic()
     started_wall = now_utc()
