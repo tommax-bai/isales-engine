@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
 
 import pytest
 from isales_common.providers._models import LLMResponse, Message
@@ -15,8 +16,9 @@ from tests.test_run_loop import _make_config, _make_session
 
 
 class _CountingLLM(LLMProvider):
-    """Echoes tokens_in/out from a fixed response so the orchestrator
-    accumulates them into ``session.total_tokens_in/out``."""
+    """Reports tokens_in/out so run_loop accumulates them into
+    ``session.total_tokens_in/out``. The main streaming path is the one the
+    engine bills against (referee tokens are not accumulated)."""
 
     def __init__(self, *, tokens_in: int, tokens_out: int) -> None:
         self.tokens_in = tokens_in
@@ -31,16 +33,11 @@ class _CountingLLM(LLMProvider):
         top_p: float = 1.0,
         max_tokens: int | None = None,
     ) -> LLMResponse:
-        system = next((m.content for m in messages if m.role == "system"), "")
-        if "[judge]" in system:
-            content = '{"passed": true, "reason": "ok"}'
-        elif "[polish]" in system:
-            content = '{"reply": "ok", "selected_candidate_index": 0}'
+        user = next((m.content for m in messages if m.role == "user"), "")
+        if "JSON schema 输出决策" in user:
+            content = '{"decision": "continue", "goal_type": null, "confidence": 0.9}'
         else:
-            content = (
-                '{"reply": "ok", "goal_achieved": false, '
-                '"goal_type": "", "extracted": {}}'
-            )
+            content = "您好。"
         return LLMResponse(
             content=content,
             tokens_in=self.tokens_in,
@@ -48,6 +45,20 @@ class _CountingLLM(LLMProvider):
             finish_reason="stop",
             latency_ms=10,
         )
+
+    async def chat_stream(  # type: ignore[override]
+        self,
+        messages: list[Message],
+        *,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        for ch in "好的。":
+            yield ch
+        self.last_call_tokens_in = self.tokens_in
+        self.last_call_tokens_out = self.tokens_out
+        self.last_call_finish_reason = "stop"
 
 
 async def test_total_tokens_accumulate_across_pipeline() -> None:

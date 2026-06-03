@@ -93,82 +93,73 @@ def _msgs(system: str, user: str) -> list[Message]:
     ]
 
 
-async def test_role_default_returns_parsable_json_in_json_mode() -> None:
+# Referee user-message primer (mirrors isales_engine.referee._USER_PRIMER).
+_REF_PRIMER = "请根据以上输入，按指定 JSON schema 输出决策。"
+
+
+async def test_main_chat_stream_emits_plain_text() -> None:
     llm = KeywordDrivenMockLLM()
-    resp = await llm.chat(_msgs("[role]", "你好"), json_mode=True)
+    out = [tok async for tok in llm.chat_stream(_msgs("你是销售助手。", "你好"))]
+    text = "".join(out)
+    assert text  # non-empty
+    # plain text, NOT JSON
+    assert not text.lstrip().startswith("{")
+    assert llm.last_call_finish_reason == "stop"
+
+
+async def test_main_short_reply_strategy() -> None:
+    llm = KeywordDrivenMockLLM()
+    out = [
+        tok
+        async for tok in llm.chat_stream(_msgs("你是销售助手。请用一句话回应", "用户内容"))
+    ]
+    assert "".join(out) == "明白了。"
+
+
+async def test_main_wrap_up_segment_says_goodbye() -> None:
+    llm = KeywordDrivenMockLLM()
+    out = [
+        tok
+        async for tok in llm.chat_stream(_msgs("你是销售助手。目标已达成", "用户内容"))
+    ]
+    assert "再见" in "".join(out)
+
+
+async def test_referee_continue_default() -> None:
+    llm = KeywordDrivenMockLLM()
+    resp = await llm.chat(_msgs("用户最后一句话：随便聊聊", _REF_PRIMER), json_mode=True)
     parsed = json.loads(resp.content)
-    assert parsed["goal_achieved"] is False
-    assert parsed["goal_type"] == ""
+    assert parsed["decision"] == "continue"
+    assert parsed["goal_type"] is None
 
 
-async def test_role_default_emits_explanatory_chatter_outside_json_mode() -> None:
-    llm = KeywordDrivenMockLLM()
-    resp = await llm.chat(_msgs("[role]", "你好"), json_mode=False)
-    # Surrounding text drives the regex fallback in PR #6's json_parser.
-    assert "解释" in resp.content
-    assert "{" in resp.content and "}" in resp.content
-
-
-async def test_role_appointment_keyword_marks_goal_achieved() -> None:
+async def test_referee_appointment_goal_achieved() -> None:
     llm = KeywordDrivenMockLLM()
     resp = await llm.chat(
-        _msgs("[role]", "我已经为您预约成功"), json_mode=True
+        _msgs("用户最后一句话：我已经为您预约成功", _REF_PRIMER), json_mode=True
     )
     parsed = json.loads(resp.content)
-    assert parsed["goal_achieved"] is True
+    assert parsed["decision"] == "goal_achieved"
     assert parsed["goal_type"] == "appointment"
-    assert "appointment_time" in parsed["extracted"]
 
 
-async def test_role_short_reply_strategy() -> None:
+async def test_referee_transfer() -> None:
     llm = KeywordDrivenMockLLM()
-    resp = await llm.chat(
-        _msgs("[role] 请用一句话回应", "用户内容"), json_mode=True
-    )
-    parsed = json.loads(resp.content)
-    assert parsed["reply"] == "明白了。"
+    resp = await llm.chat(_msgs("用户最后一句话：我要转人工", _REF_PRIMER), json_mode=True)
+    assert json.loads(resp.content)["decision"] == "transfer"
 
 
-async def test_role_wrap_up_segment_does_not_re_trigger_goal_achieved() -> None:
+async def test_referee_customer_decline() -> None:
     llm = KeywordDrivenMockLLM()
-    resp = await llm.chat(
-        _msgs("[role] 目标已达成", "用户内容"), json_mode=True
-    )
-    parsed = json.loads(resp.content)
-    assert parsed["goal_achieved"] is False
+    resp = await llm.chat(_msgs("用户最后一句话：我不需要没兴趣", _REF_PRIMER), json_mode=True)
+    assert json.loads(resp.content)["decision"] == "customer_decline"
 
 
-async def test_role_do_not_call_marker() -> None:
+async def test_greeting_chat_returns_plain_text() -> None:
     llm = KeywordDrivenMockLLM()
-    resp = await llm.chat(_msgs("[role]", "内部信号 do_not_call"), json_mode=True)
-    parsed = json.loads(resp.content)
-    assert parsed["goal_type"] == "do_not_call"
-    assert parsed["goal_achieved"] is True
-
-
-async def test_judge_default_passes() -> None:
-    llm = KeywordDrivenMockLLM()
-    resp = await llm.chat(_msgs("[judge]", "好的，请稍等"), json_mode=True)
-    parsed = json.loads(resp.content)
-    assert parsed["passed"] is True
-
-
-async def test_judge_reject_marker() -> None:
-    llm = KeywordDrivenMockLLM()
-    resp = await llm.chat(
-        _msgs("[judge]", "**reject** content"), json_mode=True
-    )
-    parsed = json.loads(resp.content)
-    assert parsed["passed"] is False
-
-
-async def test_polish_picks_first_candidate_and_prepends() -> None:
-    llm = KeywordDrivenMockLLM()
-    user = "candidate[0]: 您好\ncandidate[1]: 您好啊"
-    resp = await llm.chat(_msgs("[polish]", user), json_mode=True)
-    parsed = json.loads(resp.content)
-    assert parsed["selected_candidate_index"] == 0
-    assert parsed["reply"] == "好的，您好"
+    resp = await llm.chat(_msgs("你是销售助手。", "请生成开场白"))
+    assert not resp.content.lstrip().startswith("{")
+    assert resp.content
 
 
 async def test_transfer_intent_keyword() -> None:

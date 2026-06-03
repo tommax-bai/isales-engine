@@ -166,14 +166,17 @@ async def test_dial_happy_path_creates_session_and_persists(
                 "ts_start": None,
                 "ts_end": None,
                 "user_input": "test",
-                "role_candidates": [],
-                "judge_results": [],
-                "polish_input": None,
-                "polish_output": "ok",
-                "polish_duration_ms": 100,
-                "polish_role_config_id": None,
-                "polish_prompt_version_id": None,
-                "final_selected_candidate_index": 0,
+                "main_reply_text": "好的，请稍等。",
+                "main_duration_ms": 120,
+                "main_tokens_in": 16,
+                "main_tokens_out": 8,
+                "main_fallback_used": False,
+                "referee_decision": "continue",
+                "referee_goal_type": None,
+                "referee_confidence": 0.9,
+                "referee_duration_ms": 80,
+                "first_audio_ms": 200,
+                "error": None,
             }
         )
 
@@ -209,7 +212,9 @@ async def test_dial_happy_path_creates_session_and_persists(
             )
         ).scalars().all()
         assert len(traces) == 1
-        assert traces[0].polish_output == "ok"
+        # Dual-LLM trace: main reply text recorded (was polish_output).
+        assert traces[0].main_reply_text
+        assert traces[0].first_audio_ms is not None
 
     # CallEnded LPUSHed.
     queue_len = await redis_client.llen(settings.engine_call_ended_queue)

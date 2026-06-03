@@ -21,15 +21,13 @@ from isales_common.models import (
     RoleConfig,
 )
 from isales_common.schemas.messages.dial import DialRequest
+from isales_common.schemas.pipeline import ExtractorSpec, MainSpec, RefereeSpec
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from isales_engine.pipeline.prompt_builder import (
-    JudgeSpec,
     LeadInfo,
     PipelineConfig,
-    PolishSpec,
-    RoleSpec,
 )
 from isales_engine.realtime.filler_manager import FillerPhraseSpec, FillerSetSpec
 from isales_engine.realtime.interruption_detector import InterruptionConfig
@@ -51,6 +49,9 @@ class RuntimeConfig:
     voice_id: str
     fixed_greeting: str | None
     max_no_progress_seconds: int | None
+    # filler opt-in (pipeline-stream-and-referee). Default off — the streaming
+    # main link reaches first audio in ~500ms so filler usually just adds delay.
+    filler_enabled: bool = False
     # Continuous-interruption protection (ai-pipeline spec delta). Read by
     # run_loop._decide_protection. Stored at RuntimeConfig level (not on
     # InterruptionConfig) because the strategy is a campaign-level policy,
@@ -103,51 +104,62 @@ async def load_runtime_config(
             pv_id or 0,
         )
 
-    roles = [
-        RoleSpec(
+    def _first(kind: RoleKind) -> RoleConfig | None:
+        for rc in role_configs:
+            if rc.kind == kind.value:
+                return rc
+        return None
+
+    def _main_spec(rc: RoleConfig | None) -> MainSpec:
+        if rc is None:
+            # No main slot configured → empty prompt; main stream produces a
+            # default_reply, greeting falls back to "您好。".
+            return MainSpec(role_config_id=0, prompt_version_id=0, system_prompt="")
+        model, prompt, pv_id = _spec_for(rc)
+        return MainSpec(
             role_config_id=rc.id,
-            prompt_version_id=_spec_for(rc)[2],
-            system_prompt=_spec_for(rc)[1],
-            model=_spec_for(rc)[0],
+            prompt_version_id=pv_id,
+            system_prompt=prompt,
+            model=model,
             temperature=rc.temperature or 1.0,
             top_p=rc.top_p or 1.0,
         )
-        for rc in role_configs
-        if rc.kind == RoleKind.ROLE.value
-    ]
-    judges = [
-        JudgeSpec(
+
+    def _referee_spec(rc: RoleConfig | None) -> RefereeSpec:
+        if rc is None:
+            # No referee slot → empty prompt; run_referee fail-opens to continue.
+            return RefereeSpec(
+                role_config_id=0, prompt_version_id=0, system_prompt=""
+            )
+        model, prompt, pv_id = _spec_for(rc)
+        return RefereeSpec(
             role_config_id=rc.id,
-            prompt_version_id=_spec_for(rc)[2],
-            system_prompt=_spec_for(rc)[1],
-            model=_spec_for(rc)[0],
+            prompt_version_id=pv_id,
+            system_prompt=prompt,
+            model=model,
             temperature=rc.temperature or 1.0,
             top_p=rc.top_p or 1.0,
         )
-        for rc in role_configs
-        if rc.kind == RoleKind.JUDGE.value
-    ]
-    polish_rows = [rc for rc in role_configs if rc.kind == RoleKind.POLISH.value]
-    polish_rc = polish_rows[0] if polish_rows else None
-    polish = (
-        PolishSpec(
-            role_config_id=polish_rc.id,
-            prompt_version_id=_spec_for(polish_rc)[2],
-            system_prompt=_spec_for(polish_rc)[1],
-            model=_spec_for(polish_rc)[0],
-            temperature=polish_rc.temperature or 1.0,
-            top_p=polish_rc.top_p or 1.0,
+
+    def _extractor_spec(rc: RoleConfig | None) -> ExtractorSpec:
+        if rc is None:
+            return ExtractorSpec(
+                role_config_id=0, prompt_version_id=0, system_prompt=""
+            )
+        model, prompt, pv_id = _spec_for(rc)
+        return ExtractorSpec(
+            role_config_id=rc.id,
+            prompt_version_id=pv_id,
+            system_prompt=prompt,
+            model=model,
+            temperature=rc.temperature or 1.0,
+            top_p=rc.top_p or 1.0,
         )
-        if polish_rc is not None
-        else PolishSpec(
-            role_config_id=0, prompt_version_id=0, system_prompt="polish"
-        )
-    )
 
     pipeline = PipelineConfig(
-        roles=roles,
-        judges=judges,
-        polish=polish,
+        main=_main_spec(_first(RoleKind.MAIN)),
+        referee=_referee_spec(_first(RoleKind.REFEREE)),
+        extractor=_extractor_spec(_first(RoleKind.EXTRACTOR)),
         default_replies=[str(r) for r in (campaign.default_replies or [])],
         lead=LeadInfo(
             name=lead.name if lead else request.lead.name,
@@ -263,6 +275,7 @@ async def load_runtime_config(
         voice_id="default",
         fixed_greeting=fixed_greeting,
         max_no_progress_seconds=campaign.max_no_progress_seconds,
+        filler_enabled=campaign.filler_enabled,
         _max_continuous_interruptions=campaign.max_continuous_interruptions,
         _continuous_interruption_strategy=strategy_value,
     )

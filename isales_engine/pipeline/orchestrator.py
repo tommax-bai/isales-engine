@@ -1,24 +1,26 @@
-"""Three-layer parallel AI pipeline orchestrator.
+"""Dual-LLM streaming pipeline orchestrator.
 
-Spec: ai-pipeline § all Requirements; goal-achievement § 三层管线对结构化标记的处理;
-      role-prompt § JSON Mode 强制策略; impl-engine spec delta § per-turn
-      pipeline_trace.
+Spec: ai-pipeline § "单 main LLM streaming" / "referee 二级决策"; design.md
+决策 2 / 7 / 8.
 
-One ``run_pipeline()`` call drives one PROCESSING turn:
+One ``run_pipeline_stream()`` call drives one PROCESSING turn:
 
-1. Layer 1 — N parallel role LLM calls (gathered with return_exceptions).
-2. Drop candidates that failed JSON parsing or raised provider errors.
-3. Layer 2 — for each surviving candidate, call M judges in parallel.
-   Any judge marking ``passed=False`` drops that candidate.
-4. Layer 3 — polish LLM picks one of the passing candidates and rewrites the
-   reply. Polish failure (timeout / non-JSON) falls back to the first
-   passing candidate.
-5. If no candidates pass (parse-fail + judge-rejection are equivalent), pick
-   a random ``default_reply`` and emit a ``default_reply_used`` transcript
-   event.
+1. Spawn the referee LLM task (side-band enum decision) — unless this is a
+   WRAPPING_UP turn, where no state transition is needed.
+2. Stream the main LLM reply token-by-token through the sentence splitter; the
+   caller (run_loop) feeds each sentence to TTS the moment it is ready.
+3. If ``chat_stream`` fails *before any sentence is produced*, fall back once to
+   the non-streaming ``chat()`` and emit the whole reply. (This is the single,
+   removal-tracked streaming fallback — followup ``pipeline-remove-streaming-
+   fallback`` deletes it once the streaming path proves a 30-day SLA.) A failure
+   *after* sentences have already played cannot be un-played: we stop and record
+   the error.
+4. If the reply is still empty (stream + fallback both produced nothing), emit a
+   campaign ``default_reply`` so the call never goes silent.
 
-Goal markers (``goal_achieved`` / ``goal_type`` / ``extracted``) are inherited
-unchanged from the *selected* role candidate — never voted across candidates.
+The structured decision (goal_achieved / transfer / customer_decline) comes from
+the referee task the caller awaits after playback; the extracted CRM fields are
+produced offline by the worker. The main LLM itself emits **plain text only**.
 """
 
 from __future__ import annotations
@@ -27,461 +29,185 @@ import asyncio
 import logging
 import random
 import time
-from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from collections.abc import AsyncGenerator, AsyncIterator
+from dataclasses import dataclass
 
+from isales_common.providers._models import Message
 from isales_common.providers.llm import LLMProvider
 
 from isales_engine.call_session import CallSession
-from isales_engine.pipeline.json_parser import (
-    parse_judge_output,
-    parse_polish_output,
-    parse_role_output,
-)
-from isales_engine.pipeline.prompt_builder import (
-    JudgeSpec,
-    PipelineConfig,
-    PolishSpec,
-    RoleSpec,
-    build_judge_messages,
-    build_polish_messages,
-    build_role_messages,
-)
-from isales_engine.transcript_recorder import now_utc
+from isales_engine.pipeline.prompt_builder import PipelineConfig, build_main_messages
+from isales_engine.referee import recent_dialog_rounds, run_referee
+from isales_engine.streaming.sentence_splitter import split_sentences
+from isales_engine.streaming.types import RefereeResult
 
 logger = logging.getLogger(__name__)
 
-OutcomeSource = Literal[
-    "polished", "polish_fallback", "default_reply", "wrap_up_simplified"
-]
-
 
 @dataclass
-class PipelineOutcome:
-    reply: str
-    goal_achieved: bool
-    goal_type: str
-    extracted: dict[str, Any]
-    selected_candidate_index: int
-    source: OutcomeSource
+class MainStreamResult:
+    """Filled in as ``PipelineStream.sentences()`` is consumed."""
+
+    reply_text: str = ""
+    duration_ms: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    fallback_used: bool = False
+    used_default_reply: bool = False
     error: str | None = None
 
 
-@dataclass
-class _Candidate:
-    role: RoleSpec
-    raw_output: str
-    parsed_reply: str
-    parsed_goal_achieved: bool
-    parsed_goal_type: str
-    parsed_extracted: dict[str, Any]
-    duration_ms: int
-    tokens_in: int
-    tokens_out: int
-    error: str | None = None
-    parse_failed: bool = False
-    judge_results: list[dict[str, Any]] = field(default_factory=list)
-    judge_passed: bool = False
+class PipelineStream:
+    """Handle for one streaming PROCESSING turn.
+
+    ``referee_task`` is the side-band decision task (``None`` during wrap-up).
+    ``result`` is populated once ``sentences()`` has been fully consumed.
+    """
+
+    def __init__(
+        self,
+        session: CallSession,
+        user_input: str,
+        config: PipelineConfig,
+        main_llm: LLMProvider,
+        referee_llm: LLMProvider,
+        *,
+        is_wrap_up: bool,
+        pipeline_timeout_ms: int,
+    ) -> None:
+        self._session = session
+        self._user_input = user_input
+        self._config = config
+        self._main_llm = main_llm
+        self._referee_llm = referee_llm
+        self._is_wrap_up = is_wrap_up
+        self._timeout_s = pipeline_timeout_ms / 1000.0
+        self.referee_task: asyncio.Task[RefereeResult] | None = None
+        self.result = MainStreamResult()
+        self.turn_id = 0
+
+    def start(self) -> None:
+        """Spawn the referee task (concurrent with main streaming)."""
+        self._session.current_turn_id += 1
+        self.turn_id = self._session.current_turn_id
+        if not self._is_wrap_up:
+            recent = recent_dialog_rounds(self._session.dialog_history)
+            self.referee_task = asyncio.create_task(
+                run_referee(
+                    self._session,
+                    self._user_input,
+                    recent,
+                    self._config.referee,
+                    self._referee_llm,
+                ),
+                name=f"referee-turn-{self.turn_id}",
+            )
+
+    async def sentences(self) -> AsyncGenerator[str, None]:
+        """Yield TTS-ready sentences from the main LLM streaming reply."""
+        messages = build_main_messages(
+            self._session, self._config, is_wrap_up=self._is_wrap_up
+        )
+        start = time.monotonic()
+        yielded_any = False
+        try:
+            token_stream = self._main_llm.chat_stream(
+                messages,
+                temperature=self._config.main.temperature,
+                top_p=self._config.main.top_p,
+            )
+            async for sentence in split_sentences(token_stream):
+                yielded_any = True
+                self.result.reply_text += sentence
+                yield sentence
+        except Exception as exc:  # noqa: BLE001 — must not crash the turn
+            if yielded_any:
+                # Some audio already played; can't un-play. Record + stop.
+                logger.warning(
+                    "main_stream_failed_mid_turn turn=%s: %s", self.turn_id, exc
+                )
+                self.result.error = f"main_stream_mid: {exc}"
+            else:
+                logger.warning(
+                    "main_stream_failed_before_first_token turn=%s; chat() fallback",
+                    self.turn_id,
+                )
+                async for sentence in self._chat_fallback(messages):
+                    yielded_any = True
+                    self.result.reply_text += sentence
+                    yield sentence
+        finally:
+            self.result.duration_ms = int((time.monotonic() - start) * 1000)
+            self.result.tokens_in = self._main_llm.last_call_tokens_in or 0
+            self.result.tokens_out = self._main_llm.last_call_tokens_out or 0
+
+        if not self.result.reply_text.strip():
+            # Stream + fallback both silent → default reply, never go silent.
+            default = (
+                random.choice(self._config.default_replies)
+                if self._config.default_replies
+                else "好的，请稍等。"
+            )
+            self.result.reply_text = default
+            self.result.used_default_reply = True
+            if self.result.error is None:
+                self.result.error = "empty_reply_default_used"
+            self._session.append_event(
+                "default_reply_used", text=default, reason=self.result.error
+            )
+            yield default
+
+    async def _chat_fallback(self, messages: list[Message]) -> AsyncIterator[str]:
+        """One-shot non-streaming fallback (removal-tracked)."""
+        try:
+            async with asyncio.timeout(self._timeout_s):
+                resp = await self._main_llm.chat(
+                    messages,
+                    temperature=self._config.main.temperature,
+                    top_p=self._config.main.top_p,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("main_chat_fallback_failed turn=%s: %s", self.turn_id, exc)
+            self.result.error = f"main_fallback: {exc}"
+            return
+        self.result.fallback_used = True
+        text = (resp.content or "").strip()
+        if text:
+            # Re-split so long fallback replies still chunk for TTS.
+            async def _one() -> AsyncIterator[str]:
+                yield text
+
+            async for sentence in split_sentences(_one()):
+                yield sentence
 
 
-async def run_pipeline(
+def run_pipeline_stream(
     session: CallSession,
     user_input: str,
     config: PipelineConfig,
-    llm: LLMProvider,
+    main_llm: LLMProvider,
+    referee_llm: LLMProvider,
     *,
     is_wrap_up: bool = False,
     pipeline_timeout_ms: int = 8000,
-) -> PipelineOutcome:
-    """Run one full pipeline turn and append a pipeline_trace record."""
-
-    session.current_turn_id += 1
-    turn_id = session.current_turn_id
-    ts_start = now_utc()
-    trace_record: dict[str, Any] = {
-        "turn_id": turn_id,
-        "ts_start": ts_start,
-        "ts_end": None,
-        "user_input": user_input,
-        "role_candidates": [],
-        "judge_results": [],
-        "polish_input": None,
-        "polish_output": None,
-        "polish_duration_ms": None,
-        "polish_role_config_id": config.polish.role_config_id,
-        "polish_prompt_version_id": config.polish.prompt_version_id,
-        "final_selected_candidate_index": -1,
-    }
-
-    try:
-        outcome = await _run_layers(
-            session,
-            user_input,
-            config,
-            llm,
-            is_wrap_up=is_wrap_up,
-            pipeline_timeout_ms=pipeline_timeout_ms,
-            trace=trace_record,
-        )
-    except Exception as exc:  # noqa: BLE001 — trace must capture all errors
-        logger.exception("pipeline_unexpected_error turn_id=%s", turn_id)
-        trace_record["polish_input"] = {"pipeline_error": str(exc)}
-        outcome = _default_reply_outcome(
-            session, config, error=f"pipeline_unexpected: {exc}"
-        )
-    finally:
-        trace_record["ts_end"] = now_utc()
-        session.pipeline_trace_records.append(trace_record)
-
-    return outcome
-
-
-async def _run_layers(
-    session: CallSession,
-    user_input: str,
-    config: PipelineConfig,
-    llm: LLMProvider,
-    *,
-    is_wrap_up: bool,
-    pipeline_timeout_ms: int,
-    trace: dict[str, Any],
-) -> PipelineOutcome:
-    timeout_s = pipeline_timeout_ms / 1000.0
-
-    # ---- Layer 1: role candidates (PK or single for wrap-up) ----
-    roles = config.roles if not is_wrap_up else config.roles[:1]
-    if not roles:
-        return _default_reply_outcome(
-            session, config, error="no_role_configured", trace=trace
-        )
-
-    candidates = await _call_roles_parallel(
-        session, user_input, roles, config, llm, timeout_s=timeout_s, is_wrap_up=is_wrap_up
+) -> PipelineStream:
+    """Build + start a :class:`PipelineStream` (referee spawned immediately)."""
+    stream = PipelineStream(
+        session,
+        user_input,
+        config,
+        main_llm,
+        referee_llm,
+        is_wrap_up=is_wrap_up,
+        pipeline_timeout_ms=pipeline_timeout_ms,
     )
-    trace["role_candidates"] = [_serialize_candidate(c) for c in candidates]
-
-    surviving = [c for c in candidates if not c.parse_failed and c.error is None]
-    if not surviving:
-        return _default_reply_outcome(
-            session, config, error="all_roles_failed_or_parse", trace=trace
-        )
-
-    # ---- Layer 2: judges (skipped during wrap-up) ----
-    if not is_wrap_up and config.judges:
-        await _run_judges_parallel(
-            surviving, config.judges, llm, session=session, timeout_s=timeout_s
-        )
-        trace["judge_results"] = [
-            judge for c in surviving for judge in c.judge_results
-        ]
-        passing = [c for c in surviving if c.judge_passed]
-        if not passing:
-            return _default_reply_outcome(
-                session, config, error="all_judges_rejected", trace=trace
-            )
-    else:
-        for c in surviving:
-            c.judge_passed = True
-        passing = surviving
-
-    # ---- Layer 3: polish ----
-    polish_input = {
-        "candidates": [c.parsed_reply for c in passing],
-        "polish_role_config_id": config.polish.role_config_id,
-    }
-    trace["polish_input"] = polish_input
-    polish_start = time.monotonic()
-    polish_reply, polish_idx, polish_raw, polish_err = await _call_polish(
-        config.polish, [c.parsed_reply for c in passing], llm, timeout_s=timeout_s
-    )
-    polish_duration_ms = int((time.monotonic() - polish_start) * 1000)
-    trace["polish_duration_ms"] = polish_duration_ms
-
-    if polish_reply is None or polish_idx is None or polish_idx >= len(passing):
-        # Polish failure → first passing candidate.
-        chosen = passing[0]
-        global_index = candidates.index(chosen)
-        trace["polish_output"] = polish_raw
-        trace["final_selected_candidate_index"] = global_index
-        return PipelineOutcome(
-            reply=chosen.parsed_reply,
-            goal_achieved=chosen.parsed_goal_achieved,
-            goal_type=chosen.parsed_goal_type,
-            extracted=chosen.parsed_extracted,
-            selected_candidate_index=global_index,
-            source="polish_fallback" if not is_wrap_up else "wrap_up_simplified",
-            error=polish_err,
-        )
-
-    chosen = passing[polish_idx]
-    global_index = candidates.index(chosen)
-    trace["polish_output"] = polish_reply
-    trace["final_selected_candidate_index"] = global_index
-
-    return PipelineOutcome(
-        reply=polish_reply,
-        goal_achieved=chosen.parsed_goal_achieved,
-        goal_type=chosen.parsed_goal_type,
-        extracted=chosen.parsed_extracted,
-        selected_candidate_index=global_index,
-        source="polished" if not is_wrap_up else "wrap_up_simplified",
-    )
+    stream.start()
+    return stream
 
 
-async def _call_roles_parallel(
-    session: CallSession,
-    user_input: str,
-    roles: list[RoleSpec],
-    config: PipelineConfig,
-    llm: LLMProvider,
-    *,
-    timeout_s: float,
-    is_wrap_up: bool,
-) -> list[_Candidate]:
-    async def _call_one(role: RoleSpec) -> _Candidate:
-        messages = build_role_messages(session, role, config, is_wrap_up=is_wrap_up)
-        start = time.monotonic()
-        try:
-            async with asyncio.timeout(timeout_s):
-                resp = await llm.chat(
-                    messages,
-                    json_mode=True,
-                    temperature=role.temperature,
-                    top_p=role.top_p,
-                )
-        except TimeoutError:
-            return _Candidate(
-                role=role,
-                raw_output="",
-                parsed_reply="",
-                parsed_goal_achieved=False,
-                parsed_goal_type="",
-                parsed_extracted={},
-                duration_ms=int((time.monotonic() - start) * 1000),
-                tokens_in=0,
-                tokens_out=0,
-                error="timeout",
-                parse_failed=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return _Candidate(
-                role=role,
-                raw_output="",
-                parsed_reply="",
-                parsed_goal_achieved=False,
-                parsed_goal_type="",
-                parsed_extracted={},
-                duration_ms=int((time.monotonic() - start) * 1000),
-                tokens_in=0,
-                tokens_out=0,
-                error=f"provider_error: {exc}",
-                parse_failed=True,
-            )
-
-        duration_ms = int((time.monotonic() - start) * 1000)
-        parsed = parse_role_output(resp.content)
-        if parsed.parse_failed:
-            # TEMP DIAG (remove once turn-2 default_reply root cause closed):
-            # surface what the LLM actually returned so we can tell whether
-            # dashscope sent non-JSON, a different schema, or empty reply.
-            logger.warning(
-                "role_parse_failed role_config_id=%s len=%d preview=%r",
-                role.role_config_id,
-                len(resp.content),
-                resp.content[:250],
-            )
-            return _Candidate(
-                role=role,
-                raw_output=resp.content,
-                parsed_reply="",
-                parsed_goal_achieved=False,
-                parsed_goal_type="",
-                parsed_extracted={},
-                duration_ms=duration_ms,
-                tokens_in=resp.tokens_in,
-                tokens_out=resp.tokens_out,
-                parse_failed=True,
-            )
-        return _Candidate(
-            role=role,
-            raw_output=resp.content,
-            parsed_reply=parsed.reply,
-            parsed_goal_achieved=parsed.goal_achieved,
-            parsed_goal_type=parsed.goal_type,
-            parsed_extracted=parsed.extracted,
-            duration_ms=duration_ms,
-            tokens_in=resp.tokens_in,
-            tokens_out=resp.tokens_out,
-        )
-
-    return list(await asyncio.gather(*(_call_one(r) for r in roles)))
-
-
-async def _run_judges_parallel(
-    candidates: list[_Candidate],
-    judges: list[JudgeSpec],
-    llm: LLMProvider,
-    *,
-    session: CallSession,
-    timeout_s: float,
-) -> None:
-    """Mutates each candidate in-place: fills ``judge_results`` + ``judge_passed``.
-
-    ``session`` is threaded through so ``build_judge_messages`` can pull
-    dialog history into the judge's user message (2026-05-29 experiment —
-    judge-history injection, mirrors voxen referee pattern).
-    """
-
-    async def _call_judge(
-        candidate_index: int, judge: JudgeSpec, reply: str
-    ) -> dict[str, Any]:
-        messages = build_judge_messages(judge, reply, session)
-        start = time.monotonic()
-        try:
-            async with asyncio.timeout(timeout_s):
-                resp = await llm.chat(messages, json_mode=True)
-        except TimeoutError:
-            return {
-                "candidate_index": candidate_index,
-                "role_config_id": judge.role_config_id,
-                "prompt_version_id": judge.prompt_version_id,
-                "passed": False,
-                "reason": "timeout",
-                "duration_ms": int((time.monotonic() - start) * 1000),
-            }
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "candidate_index": candidate_index,
-                "role_config_id": judge.role_config_id,
-                "prompt_version_id": judge.prompt_version_id,
-                "passed": False,
-                "reason": f"provider_error: {exc}",
-                "duration_ms": int((time.monotonic() - start) * 1000),
-            }
-        passed, reason = parse_judge_output(resp.content)
-        if reason == "judge_parse_failed" or (not passed):
-            # TEMP DIAG (remove once turn-2 default_reply root cause closed).
-            logger.warning(
-                "judge_result role_config_id=%s passed=%s reason=%s preview=%r",
-                judge.role_config_id,
-                passed,
-                reason,
-                resp.content[:200],
-            )
-        return {
-            "candidate_index": candidate_index,
-            "role_config_id": judge.role_config_id,
-            "prompt_version_id": judge.prompt_version_id,
-            "passed": passed,
-            "reason": reason,
-            "duration_ms": int((time.monotonic() - start) * 1000),
-        }
-
-    tasks: list[asyncio.Task[dict[str, Any]]] = []
-    indexed: list[tuple[int, JudgeSpec]] = []
-    for i, candidate in enumerate(candidates):
-        for judge in judges:
-            tasks.append(
-                asyncio.create_task(_call_judge(i, judge, candidate.parsed_reply))
-            )
-            indexed.append((i, judge))
-
-    results = await asyncio.gather(*tasks, return_exceptions=False)
-    by_candidate: dict[int, list[dict[str, Any]]] = {
-        i: [] for i in range(len(candidates))
-    }
-    for r in results:
-        by_candidate[r["candidate_index"]].append(r)
-
-    for i, candidate in enumerate(candidates):
-        candidate.judge_results = by_candidate[i]
-        candidate.judge_passed = all(j["passed"] for j in candidate.judge_results)
-
-
-async def _call_polish(
-    polish: PolishSpec,
-    candidates: list[str],
-    llm: LLMProvider,
-    *,
-    timeout_s: float,
-) -> tuple[str | None, int | None, str | None, str | None]:
-    messages = build_polish_messages(polish, candidates)
-    try:
-        async with asyncio.timeout(timeout_s):
-            resp = await llm.chat(messages, json_mode=True)
-    except TimeoutError:
-        return None, None, None, "polish_timeout"
-    except Exception as exc:  # noqa: BLE001
-        return None, None, None, f"polish_provider_error: {exc}"
-
-    reply, idx = parse_polish_output(resp.content)
-    if reply is None or idx is None:
-        # TEMP DIAG (remove once turn-2 default_reply root cause closed).
-        logger.warning(
-            "polish_parse_failed len=%d preview=%r",
-            len(resp.content),
-            resp.content[:250],
-        )
-        return None, None, resp.content, "polish_parse_failed"
-    return reply, idx, resp.content, None
-
-
-def _default_reply_outcome(
-    session: CallSession,
-    config: PipelineConfig,
-    *,
-    error: str,
-    trace: dict[str, Any] | None = None,
-) -> PipelineOutcome:
-    reply = (
-        random.choice(config.default_replies)
-        if config.default_replies
-        else "好的，请稍等。"
-    )
-    session.append_event("default_reply_used", text=reply, reason=error)
-    if trace is not None:
-        trace["polish_input"] = {"pipeline_error": error}
-    return PipelineOutcome(
-        reply=reply,
-        goal_achieved=False,
-        goal_type="",
-        extracted={},
-        selected_candidate_index=-1,
-        source="default_reply",
-        error=error,
-    )
-
-
-def _serialize_candidate(c: _Candidate) -> dict[str, Any]:
-    return {
-        "role_config_id": c.role.role_config_id,
-        "prompt_version_id": c.role.prompt_version_id,
-        "raw_output": c.raw_output,
-        "parsed_json": {
-            "reply": c.parsed_reply,
-            "goal_achieved": c.parsed_goal_achieved,
-            "goal_type": c.parsed_goal_type,
-            "extracted": c.parsed_extracted,
-        },
-        "duration_ms": c.duration_ms,
-        "prompt_tokens": c.tokens_in,
-        "completion_tokens": c.tokens_out,
-        "error": c.error,
-        "parse_failed": c.parse_failed,
-    }
-
-
-# Re-exported for the wrap-up wrapper (PR #9 will adopt this directly).
 __all__ = [
-    "PipelineOutcome",
-    "run_pipeline",
+    "PipelineStream",
+    "MainStreamResult",
+    "run_pipeline_stream",
     "PipelineConfig",
-    "RoleSpec",
-    "JudgeSpec",
-    "PolishSpec",
 ]
-
-
-def _ensure_dataclass_serializable(d: Any) -> Any:
-    """Helper for tests."""
-    return asdict(d) if hasattr(d, "__dataclass_fields__") else d

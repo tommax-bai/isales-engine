@@ -1,14 +1,20 @@
-"""Keyword-driven mock LLM.
+"""Keyword-driven mock LLM (dual-LLM architecture).
 
-Spec: ai-pipeline § Requirement: 三层并行管线编排 (drives role / judge / polish
-behaviours); role-prompt § Requirement: JSON Mode 强制策略 (we always emit
-parsable JSON when ``json_mode=True``).
+pipeline-stream-and-referee: the mock now models the two-LLM pipeline:
 
-The orchestrator (PR #6) feeds a single ``user`` message containing the
-3-section text from ``prompt_builder``; the ``system`` message identifies
-whether this is a role / judge / polish call. We pattern-match on simple
-markers in the system or user content to drive deterministic test fixtures
-without running real LLMs.
+* ``chat_stream`` is the **main** path → yields **plain text** (no JSON), token
+  by token, so the sentence splitter + TTS path can be exercised.
+* ``chat(json_mode=True)`` is used by the **referee** + transfer classifiers →
+  emits JSON. Referee dispatch keys off the referee user-primer text; transfer
+  classifiers off ``[transfer_intent]`` / ``[transfer_llm]`` system markers.
+* ``chat`` without those markers is the greeting path → plain text.
+
+Keyword triggers (referee, matched on the substituted system prompt which
+carries ``user_last_utterance``):
+  * ``预约`` / ``成功`` / ``约见`` → ``goal_achieved`` (``appointment``)
+  * ``转人工`` / ``人工`` → ``transfer``
+  * ``拒绝`` / ``不需要`` / ``没兴趣`` / ``do_not_call`` → ``customer_decline``
+  * otherwise → ``continue``
 """
 
 from __future__ import annotations
@@ -22,6 +28,9 @@ from dataclasses import dataclass
 from isales_common.providers._models import LLMResponse, Message
 from isales_common.providers.llm import LLMProvider
 
+# Must match isales_engine.referee._USER_PRIMER (referee user message).
+_REFEREE_PRIMER_MARK = "JSON schema 输出决策"
+
 
 @dataclass
 class _Decision:
@@ -31,32 +40,7 @@ class _Decision:
 
 
 class KeywordDrivenMockLLM(LLMProvider):
-    """Returns deterministic responses based on prompt content.
-
-    Layer markers expected in the ``system`` message:
-
-    * ``[role]`` — three-layer role candidate. Output JSON
-      ``{"reply", "goal_achieved", "goal_type", "extracted"}``.
-    * ``[judge]`` — judge call. Output JSON ``{"passed", "reason"}``.
-    * ``[polish]`` — polish call. Output JSON
-      ``{"reply", "selected_candidate_index"}``.
-    * ``[transfer_intent]`` — intent classifier. Output JSON
-      ``{"intent", "probability"}``.
-    * ``[transfer_llm]`` — independent transfer LLM. Output JSON
-      ``{"transfer"}``.
-
-    Within the user-message content, additional markers override defaults:
-
-    * ``"成功"`` / ``"预约"`` (in role calls) → ``goal_achieved=true``
-      ``goal_type="appointment"``.
-    * ``"请用一句话回应"`` (system message, short_reply strategy) →
-      single-sentence reply.
-    * ``"目标已达成"`` (system message, WRAPPING_UP) → polite goodbye reply
-      with ``goal_achieved=false`` (avoids re-triggering wrap-up).
-    * ``"**reject**"`` (judge user content) → ``passed=false``.
-    * ``"do_not_call"`` (any user content) → role marks
-      ``goal_type="do_not_call"``, ``goal_achieved=true``.
-    """
+    """Deterministic dual-LLM mock for engine tests."""
 
     def __init__(
         self,
@@ -65,11 +49,10 @@ class KeywordDrivenMockLLM(LLMProvider):
         per_token_ms: float = 0.0,
     ) -> None:
         self.calls: list[tuple[list[Message], bool]] = []
-        # Simulated streaming cadence (seconds converted from ms). 0 = no sleep
-        # (default — unit tests stay fast); set non-zero to exercise latency.
         self._first_token_s = first_token_ms / 1000.0
         self._per_token_s = per_token_ms / 1000.0
 
+    # ---- chat (referee / transfer classifiers / greeting) -----------------
     async def chat(
         self,
         messages: list[Message],
@@ -80,7 +63,7 @@ class KeywordDrivenMockLLM(LLMProvider):
         max_tokens: int | None = None,
     ) -> LLMResponse:
         self.calls.append((list(messages), json_mode))
-        decision = self._decide(messages, json_mode=json_mode)
+        decision = self._decide_chat(messages)
         return LLMResponse(
             content=decision.content,
             tokens_in=decision.tokens_in,
@@ -89,6 +72,7 @@ class KeywordDrivenMockLLM(LLMProvider):
             latency_ms=0,
         )
 
+    # ---- chat_stream (main, plain text) -----------------------------------
     async def chat_stream(
         self,
         messages: list[Message],
@@ -97,16 +81,10 @@ class KeywordDrivenMockLLM(LLMProvider):
         top_p: float = 1.0,
         max_tokens: int | None = None,
     ) -> AsyncIterator[str]:
-        """Stream the decided content one character at a time.
-
-        Honours ``first_token_ms`` (delay before the first chunk) and
-        ``per_token_ms`` (delay between subsequent chunks) so tests can
-        simulate realistic streaming latency.
-        """
         self.calls.append((list(messages), False))
-        decision = self._decide(messages, json_mode=False)
+        text = self._decide_main(messages)
         first = True
-        for ch in decision.content:
+        for ch in text:
             if first:
                 if self._first_token_s:
                     await asyncio.sleep(self._first_token_s)
@@ -114,28 +92,11 @@ class KeywordDrivenMockLLM(LLMProvider):
             elif self._per_token_s:
                 await asyncio.sleep(self._per_token_s)
             yield ch
-        self.last_call_tokens_in = decision.tokens_in
-        self.last_call_tokens_out = decision.tokens_out
+        self.last_call_tokens_in = 16
+        self.last_call_tokens_out = max(1, len(text) // 2)
         self.last_call_finish_reason = "stop"
 
     # ------------------------------------------------------------------
-    def _decide(self, messages: list[Message], *, json_mode: bool) -> _Decision:
-        system = self._first_role(messages, "system")
-        user = self._first_role(messages, "user")
-
-        # Layer dispatch based on system tags. The orchestrator stamps these
-        # in PR #6 via prompt_builder.
-        if "[judge]" in system:
-            return self._judge(user)
-        if "[polish]" in system:
-            return self._polish(user)
-        if "[transfer_intent]" in system:
-            return self._transfer_intent(user)
-        if "[transfer_llm]" in system:
-            return self._transfer_llm(user)
-        # Default = role call.
-        return self._role(system, user, json_mode=json_mode)
-
     @staticmethod
     def _first_role(messages: list[Message], role: str) -> str:
         for msg in messages:
@@ -143,97 +104,38 @@ class KeywordDrivenMockLLM(LLMProvider):
                 return msg.content
         return ""
 
-    # ---- Role candidates ---------------------------------------------------
-    def _role(self, system: str, user: str, *, json_mode: bool) -> _Decision:
-        if "do_not_call" in user:
-            return _Decision(
-                content=json.dumps(
-                    {
-                        "reply": "好的，已为您登记勿打扰，再见。",
-                        "goal_achieved": True,
-                        "goal_type": "do_not_call",
-                        "extracted": {},
-                    },
-                    ensure_ascii=False,
-                ),
-            )
+    def _decide_chat(self, messages: list[Message]) -> _Decision:
+        system = self._first_role(messages, "system")
+        user = self._first_role(messages, "user")
+        if "[transfer_intent]" in system:
+            return self._transfer_intent(user)
+        if "[transfer_llm]" in system:
+            return self._transfer_llm(user)
+        if _REFEREE_PRIMER_MARK in user:
+            return self._referee(system)
+        # Greeting / other plain-text chat.
+        return _Decision(content="您好，我是 AI 助手，请问现在方便吗？")
 
-        goal_hit = bool(re.search(r"成功|预约|appointment", user))
-        if goal_hit:
-            content = json.dumps(
-                {
-                    "reply": "好的，已为您预约成功。",
-                    "goal_achieved": True,
-                    "goal_type": "appointment",
-                    "extracted": {"appointment_time": "2026-05-07T10:00:00"},
-                },
-                ensure_ascii=False,
-            )
-            return _Decision(content=content)
-
+    # ---- Main (plain text reply) ------------------------------------------
+    def _decide_main(self, messages: list[Message]) -> str:
+        system = self._first_role(messages, "system")
+        if "目标已达成" in system or "收尾对话" in system:
+            return "好的，期待和您再次联系，再见。"
         if "请用一句话回应" in system:
-            content = json.dumps(
-                {
-                    "reply": "明白了。",
-                    "goal_achieved": False,
-                    "goal_type": "",
-                    "extracted": {},
-                },
-                ensure_ascii=False,
-            )
-            return _Decision(content=content)
+            return "明白了。"
+        return "好的，我明白了。请问您还有什么需要？"
 
-        if "目标已达成" in system:
-            content = json.dumps(
-                {
-                    "reply": "好的，期待和您再次联系，再见。",
-                    "goal_achieved": False,
-                    "goal_type": "",
-                    "extracted": {},
-                },
-                ensure_ascii=False,
-            )
-            return _Decision(content=content)
-
-        # Default role reply.
-        content = json.dumps(
-            {
-                "reply": "好的，请稍等。",
-                "goal_achieved": False,
-                "goal_type": "",
-                "extracted": {},
-            },
-            ensure_ascii=False,
-        )
-        if not json_mode:
-            # Surround with explanatory chatter so the parser must use the
-            # regex fallback (role-prompt spec § Scenario "文本约束兜底").
-            content = "解释：" + content + "\n（以上为输出）"
-        return _Decision(content=content)
-
-    # ---- Judge -------------------------------------------------------------
-    def _judge(self, user: str) -> _Decision:
-        passed = "**reject**" not in user
-        reason = "ok" if passed else "rejected by mock judge"
-        return _Decision(
-            content=json.dumps(
-                {"passed": passed, "reason": reason}, ensure_ascii=False
-            ),
-        )
-
-    # ---- Polish ------------------------------------------------------------
-    def _polish(self, user: str) -> _Decision:
-        # User content is expected to carry candidates as
-        # "candidate[0]: <reply>\ncandidate[1]: <reply>\n...".
-        m = re.search(r"candidate\[(\d+)\]: (.+?)(?=\ncandidate\[|\Z)", user, re.DOTALL)
-        idx = int(m.group(1)) if m else 0
-        reply = (m.group(2).strip() if m else "好的。")
-        return _Decision(
-            content=json.dumps(
-                {"reply": "好的，" + reply, "selected_candidate_index": idx},
-                ensure_ascii=False,
-            ),
-        )
+    # ---- Referee (JSON enum decision) -------------------------------------
+    def _referee(self, system: str) -> _Decision:
+        if re.search(r"预约|成功|约见|appointment", system):
+            payload = {"decision": "goal_achieved", "goal_type": "appointment", "confidence": 0.95}
+        elif re.search(r"转人工|人工", system):
+            payload = {"decision": "transfer", "goal_type": None, "confidence": 0.9}
+        elif re.search(r"拒绝|不需要|没兴趣|do_not_call", system):
+            payload = {"decision": "customer_decline", "goal_type": None, "confidence": 0.9}
+        else:
+            payload = {"decision": "continue", "goal_type": None, "confidence": 0.9}
+        return _Decision(content=json.dumps(payload, ensure_ascii=False))
 
     # ---- Transfer intent ---------------------------------------------------
     def _transfer_intent(self, user: str) -> _Decision:

@@ -15,6 +15,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from typing import Any, Final
 
 import httpx
 from isales_common.providers._models import LLMResponse, Message
@@ -156,7 +157,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                     raise map_http_error(response, provider=self._provider)
                 async for line in response.aiter_lines():
                     chunk = _parse_sse_line(line)
-                    if chunk is _SSE_DONE:
+                    if isinstance(chunk, _SseDone):
                         break
                     if chunk is None:
                         continue
@@ -178,13 +179,17 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             raise map_transport_error(exc, provider=self._provider) from exc
 
 
+class _SseDone:
+    """Typed singleton marking the SSE ``[DONE]`` terminator."""
+
+
 # Sentinel signalling the SSE ``[DONE]`` terminator.
-_SSE_DONE = object()
+_SSE_DONE: Final[_SseDone] = _SseDone()
+
+_SseChunk = tuple[str, str | None, dict[str, Any] | None]
 
 
-def _parse_sse_line(
-    line: str,
-) -> object:
+def _parse_sse_line(line: str) -> _SseDone | _SseChunk | None:
     """Parse one SSE line into ``(delta, finish_reason, usage)`` or a sentinel.
 
     Returns:

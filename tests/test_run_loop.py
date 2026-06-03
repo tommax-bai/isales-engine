@@ -10,14 +10,12 @@ from typing import Any
 
 import pytest
 from isales_common.providers._models import ASRResult
+from isales_common.schemas.pipeline import ExtractorSpec, MainSpec, RefereeSpec
 
 from isales_engine.call_session import CallSession
 from isales_engine.pipeline.prompt_builder import (
-    JudgeSpec,
     LeadInfo,
     PipelineConfig,
-    PolishSpec,
-    RoleSpec,
 )
 from isales_engine.providers.asr_mock import ScriptedMockASR
 from isales_engine.providers.llm_mock import KeywordDrivenMockLLM
@@ -48,28 +46,26 @@ def _make_config(
     wrap_up_max_rounds: int = 1,
     wrap_up_max_seconds: int = 30,
     silence_threshold_ms: int = 500,
+    filler_enabled: bool = False,
+    # Legacy params kept for call-site compatibility; the dual-LLM pipeline has
+    # exactly one main / referee / extractor slot (no N-role / M-judge PK).
     n_roles: int = 1,
     n_judges: int = 0,
 ) -> RuntimeConfig:
     pipeline = PipelineConfig(
-        roles=[
-            RoleSpec(
-                role_config_id=100 + i,
-                prompt_version_id=200 + i,
-                system_prompt=f"role-{i}",
-            )
-            for i in range(n_roles)
-        ],
-        judges=[
-            JudgeSpec(
-                role_config_id=300 + i,
-                prompt_version_id=400 + i,
-                system_prompt=f"judge-{i}",
-            )
-            for i in range(n_judges)
-        ],
-        polish=PolishSpec(
-            role_config_id=999, prompt_version_id=1999, system_prompt="polish"
+        main=MainSpec(
+            role_config_id=100, prompt_version_id=200, system_prompt="你是销售助手。"
+        ),
+        referee=RefereeSpec(
+            role_config_id=300,
+            prompt_version_id=400,
+            system_prompt=(
+                "判定对话状态。用户最后一句话：{{user_last_utterance}}\n"
+                "最近对话：\n{{recent_dialog_history}}"
+            ),
+        ),
+        extractor=ExtractorSpec(
+            role_config_id=500, prompt_version_id=600, system_prompt="抽取字段。"
         ),
         default_replies=["好的，请稍等。"],
         lead=LeadInfo(name="李四", phone="+8613800000000", custom_data={}),
@@ -119,6 +115,7 @@ def _make_config(
         voice_id="default",
         fixed_greeting="您好我是 AI 助手。",
         max_no_progress_seconds=None,
+        filler_enabled=filler_enabled,
     )
 
 

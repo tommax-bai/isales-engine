@@ -47,7 +47,7 @@ from isales_common.schemas.messages.engine_event import (
 from isales_engine.call_session import CallSession
 from isales_engine.event_publisher import EventPublisher
 from isales_engine.pipeline.greeting import generate_greeting
-from isales_engine.pipeline.orchestrator import run_pipeline
+from isales_engine.pipeline.orchestrator import PipelineStream, run_pipeline_stream
 from isales_engine.realtime.filler_manager import FillerManager
 from isales_engine.realtime.interruption_detector import (
     InterruptionConfig,
@@ -58,6 +58,7 @@ from isales_engine.realtime.silence_detector import SilenceConfig, evaluate_sile
 from isales_engine.realtime.telephony_client import TelephonyClient
 from isales_engine.runtime_config import RuntimeConfig
 from isales_engine.state_machine import StateMachine
+from isales_engine.streaming.types import RefereeResult
 from isales_engine.transcript_recorder import now_utc
 from isales_engine.transfer.manager import evaluate_transfer
 from isales_engine.wrapup.manager import evaluate_wrap_up
@@ -373,7 +374,6 @@ async def _main_turn_loop(
     listen_ctx: _ListenContext,
 ) -> None:
     asr_finals_q = listen_ctx.asr_finals_q
-    asr_partials_q = listen_ctx.asr_partials_q
     hangup_event = listen_ctx.hangup_event
     asr_finished = listen_ctx.asr_finished
     pump_asr = listen_ctx.pump_asr
@@ -520,9 +520,19 @@ async def _main_turn_loop(
 
             sm.transition_to(CallStatus.PROCESSING, reason="speech_end")
             _publish_status(publisher, session, "speech_end")
+            ts_start = now_utc()
+            processing_start = time.monotonic()
 
+            # prompt_versions snapshot: mark the wrap-up append flag for this
+            # call (role-prompt § prompt_versions 快照标记).
+            if is_wrap_up and isinstance(session.prompt_versions_snapshot, dict):
+                session.prompt_versions_snapshot["wrap_up_appended"] = True
+
+            # FILLER is off by default (streaming reaches first audio ~500ms).
+            # When a campaign opts in, filler overlaps the main stream and is
+            # preempted by the first main sentence — no blocking gate.
             filler: FillerManager | None = None
-            if not is_wrap_up:
+            if config.filler_enabled and not is_wrap_up:
                 filler = FillerManager(
                     session,
                     config.fillers,
@@ -532,42 +542,77 @@ async def _main_turn_loop(
                 )
                 await filler.start()
 
-            result = await run_pipeline(
+            # Spawn main streaming + referee (referee skipped during wrap-up).
+            stream = run_pipeline_stream(
                 session,
                 user_text,
                 config.pipeline,
-                providers.llm,
+                providers.llm,  # main_llm
+                providers.llm,  # referee_llm (same provider in v1 — see note)
                 is_wrap_up=is_wrap_up,
                 pipeline_timeout_ms=pipeline_timeout_ms,
             )
-            if filler is not None:
-                await filler.wait_finished()
 
-            # Token budget bookkeeping (PR #7 wires accumulation; PR #6 just
-            # ensures the trace records persist token fields).
-            for cand in session.pipeline_trace_records[-1]["role_candidates"]:
-                session.total_tokens_in += int(cand.get("prompt_tokens") or 0)
-                session.total_tokens_out += int(cand.get("completion_tokens") or 0)
-
-            sm.transition_to(CallStatus.SPEAKING, reason="pipeline_done")
-            played = await _play_tts(
-                session, telephony, providers.tts, result.reply,
+            sm.transition_to(CallStatus.SPEAKING, reason="main_stream_started")
+            first_audio_ms, played = await _play_streaming(
+                session,
+                telephony,
+                providers.tts,
+                stream,
                 voice_id=config.voice_id,
+                filler=filler,
+                processing_start=processing_start,
+            )
+
+            # Await the referee decision (main TTS already played; this is the
+            # only place the main link "waits" on referee — fail-open continue).
+            referee_result, referee_trace_decision = await _await_referee(stream)
+
+            # Token bookkeeping from the main streaming call.
+            session.total_tokens_in += stream.result.tokens_in
+            session.total_tokens_out += stream.result.tokens_out
+
+            session.pipeline_trace_records.append(
+                {
+                    "turn_id": stream.turn_id,
+                    "ts_start": ts_start,
+                    "ts_end": now_utc(),
+                    "user_input": user_text,
+                    "main_reply_text": stream.result.reply_text,
+                    "main_duration_ms": stream.result.duration_ms,
+                    "main_tokens_in": stream.result.tokens_in,
+                    "main_tokens_out": stream.result.tokens_out,
+                    "main_fallback_used": stream.result.fallback_used,
+                    "referee_decision": referee_trace_decision,
+                    "referee_goal_type": (
+                        referee_result.goal_type if referee_result else None
+                    ),
+                    "referee_confidence": (
+                        referee_result.confidence if referee_result else None
+                    ),
+                    "referee_duration_ms": (
+                        referee_result.duration_ms if referee_result else None
+                    ),
+                    "first_audio_ms": first_audio_ms,
+                    "error": stream.result.error,
+                }
+            )
+
+            goal_achieved = bool(
+                referee_result and referee_result.decision == "goal_achieved"
+            )
+            goal_type = (
+                referee_result.goal_type if (referee_result and goal_achieved) else ""
             )
             session.append_event(
                 "ai_reply",
-                text=result.reply,
-                turn_id=session.current_turn_id,
-                selected_role_config_id=(
-                    config.pipeline.roles[
-                        result.selected_candidate_index
-                    ].role_config_id
-                    if 0 <= result.selected_candidate_index < len(config.pipeline.roles)
-                    else None
-                ),
-                goal_achieved=result.goal_achieved,
-                goal_type=result.goal_type,
-                extracted=result.extracted,
+                text=stream.result.reply_text,
+                turn_id=stream.turn_id,
+                selected_role_config_id=config.pipeline.main.role_config_id or None,
+                goal_achieved=goal_achieved,
+                goal_type=goal_type or "",
+                # extracted is now produced post-call by the worker extractor.
+                extracted={},
                 is_wrap_up=is_wrap_up,
                 interrupted=not played,
             )
@@ -584,24 +629,52 @@ async def _main_turn_loop(
             # Successful SPEAKING — clear the counter per spec.
             session.consecutive_interruption_count = 0
 
-            if result.goal_achieved and not is_wrap_up:
-                sm.transition_to(CallStatus.WRAPPING_UP, reason="goal_achieved")
-                session.wrap_up_started_at_monotonic = time.monotonic()
-                session.wrap_up_started_at_wallclock = now_utc()
-                session.append_event(
-                    "wrap_up_started",
-                    rounds_remaining=config.wrap_up.max_rounds,
-                    seconds_remaining=config.wrap_up.max_seconds,
-                )
-                session.append_event(
-                    "goal_achieved",
-                    goal_type=result.goal_type,
-                    extracted=result.extracted,
-                )
-                # Stay in WRAPPING_UP for subsequent turns — it serves as the
-                # umbrella "listen" state during wrap-up (per goal-achievement
-                # spec § 切换到简化管线 + § 当前轮回复正常播放).
-                continue
+            # ---- referee-driven state transitions (skipped during wrap-up) ----
+            if referee_result is not None and not is_wrap_up:
+                if referee_result.decision == "goal_achieved":
+                    sm.transition_to(
+                        CallStatus.WRAPPING_UP, reason=goal_type or "goal_achieved"
+                    )
+                    session.wrap_up_started_at_monotonic = time.monotonic()
+                    session.wrap_up_started_at_wallclock = now_utc()
+                    session.append_event(
+                        "wrap_up_started",
+                        rounds_remaining=config.wrap_up.max_rounds,
+                        seconds_remaining=config.wrap_up.max_seconds,
+                    )
+                    session.append_event(
+                        "goal_achieved", goal_type=goal_type, extracted={}
+                    )
+                    continue
+                if referee_result.decision == "transfer":
+                    sm.transition_to(
+                        CallStatus.TRANSFERRING, reason="referee_decision"
+                    )
+                    session.append_event(
+                        "transfer_initiated",
+                        trigger_type="referee",
+                        trigger_detail="referee_decision",
+                    )
+                    session.transfer_status = TransferStatus.MARKED_FOR_HANDOFF.value
+                    session.transfer_reason = "referee"
+                    session.append_event("transfer_marked", handoff_task_id=0)
+                    await _attempt_hangup(telephony, session.call_record_id)
+                    sm.transition_to(
+                        CallStatus.END, reason="marked_for_handoff", force=True
+                    )
+                    session.hangup_cause = HangupCause.MARKED_FOR_HANDOFF.value
+                    session.append_event(
+                        "hangup", reason="marked_for_handoff", initiated_by="ai"
+                    )
+                    return
+                if referee_result.decision == "customer_decline":
+                    sm.transition_to(
+                        CallStatus.ACTIVATING, reason="customer_decline_recovery"
+                    )
+                    sm.transition_to(
+                        CallStatus.LISTENING, reason="customer_decline_done"
+                    )
+                    continue
 
             if is_wrap_up:
                 session.wrap_up_round_count += 1
@@ -711,6 +784,71 @@ async def _await_user_or_silence(
     if decision.decision == "hangup":
         return _UserAwait(kind="silence_hangup", text=decision.phrase)
     return _UserAwait(kind="no_progress")
+
+
+async def _play_streaming(
+    session: CallSession,
+    telephony: TelephonyClient,
+    tts: TTSProvider,
+    stream: PipelineStream,
+    *,
+    voice_id: str,
+    filler: FillerManager | None,
+    processing_start: float,
+) -> tuple[int | None, bool]:
+    """Feed the main LLM streaming reply into TTS sentence-by-sentence.
+
+    Returns ``(first_audio_ms, fully_played)``. ``first_audio_ms`` is measured
+    from PROCESSING entry to the first PCM-bearing sentence. On a real-time
+    interruption mid-sentence, returns ``(first_audio_ms, False)``; the main
+    stream generator is closed in the ``finally`` so the underlying
+    ``chat_stream`` stops pulling tokens.
+    """
+    first_audio_ms: int | None = None
+    fully_played = True
+    sentences = stream.sentences()
+    try:
+        async for sentence in sentences:
+            if first_audio_ms is None:
+                first_audio_ms = int((time.monotonic() - processing_start) * 1000)
+                if filler is not None:
+                    # Preempt the filler audio channel with the real reply
+                    # (same cancel path as 5/28 barge-in).
+                    await filler.stop()
+            played = await _play_tts(
+                session, telephony, tts, sentence, voice_id=voice_id
+            )
+            if not played:
+                fully_played = False
+                break
+    finally:
+        await sentences.aclose()
+        if filler is not None:
+            await filler.stop()
+    return first_audio_ms, fully_played
+
+
+async def _await_referee(
+    stream: PipelineStream,
+) -> tuple[RefereeResult | None, str | None]:
+    """Await the referee task with a 2s fail-open budget (ai-pipeline § 35).
+
+    Returns ``(result, trace_decision)``. ``result`` is ``None`` only when no
+    referee was spawned (wrap-up). On timeout the task is cancelled and a
+    fail-open ``continue`` result is returned with trace label ``"timeout"``.
+    """
+    if stream.referee_task is None:
+        return None, None
+    try:
+        result = await asyncio.wait_for(
+            asyncio.shield(stream.referee_task), timeout=2.0
+        )
+    except TimeoutError:
+        stream.referee_task.cancel()
+        return RefereeResult.fail_open(), "timeout"
+    except Exception:  # noqa: BLE001 — referee failure never blocks the call
+        return RefereeResult.fail_open(), "invalid"
+    return result, result.decision
 
 
 async def _play_tts(
