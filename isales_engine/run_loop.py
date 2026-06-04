@@ -1211,25 +1211,15 @@ async def _partial_monitor(
         if verdict.verdict != "triggered":
             continue
 
-        # Corroborate via VAD before cancelling: require the RMS monitor to
-        # have seen voice energy above ``voice_rms_threshold`` for at least
-        # ``min_duration_ms`` before trusting a duration-pass partial.
-        # NOTE (2026-06-04): the original rationale for this gate — that
-        # DingRTC mixed-playback self-loopback made ASR mis-transcribe the
-        # engine's own TTS, so a partial alone couldn't prove the user spoke
-        # — is RETRACTED (call 138 evidence does not support it; and during
-        # SPEAKING the ASR connection is closed, so it can't transcribe a
-        # loopback at all). This gate + ``voice_rms_threshold`` are pending an
-        # evidence-based re-evaluation; do not re-justify them via loopback.
-        if session.vad_voice_active_ms < interruption_cfg.min_duration_ms:
-            logger.warning(
-                "partial_monitor_skip_no_vad_corroboration text=%r "
-                "elapsed_ms=%s vad_active_ms=%s",
-                text[:40],
-                now_ms - session.current_user_speech_started_ms,
-                session.vad_voice_active_ms,
-            )
-            continue
+        # The VAD-corroboration gate that used to sit here (require
+        # vad_voice_active_ms ≥ min_duration before trusting the partial) was
+        # removed 2026-06-04: its rationale was the retracted DingRTC
+        # self-loopback theory, and with the persistent ASR connection the
+        # ASR is reliably listening during SPEAKING, so a `triggered` partial
+        # (evaluate_partial already gates on text length ≥2 + duration +
+        # whitelist) is the barge-in signal. (call 143: the partial monitor
+        # got the user's "1234" during SPEAKING but this gate wrongly blocked
+        # the cancel.)
 
         # Lock in the interruption: signal first, then cancel. If cancellation
         # arrives while the play_task hasn't started awaiting yet, the signal
