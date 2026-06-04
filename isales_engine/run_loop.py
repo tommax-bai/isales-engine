@@ -794,10 +794,26 @@ async def _await_user_or_silence(
         hangup_wait.cancel()
         with contextlib.suppress(asyncio.CancelledError, BaseException):
             await hangup_wait
-        if result.text.strip() in interruption_cfg.whitelist:
+        # Coalesce any finals that queued while the AI was busy speaking: when
+        # the user out-paces the AI (or talks through a long reply that didn't
+        # barge in), multiple finals pile up in asr_finals_q while the main
+        # loop is blocked in playback. Responding to each one turn-by-turn is
+        # the "憋住 then flood" symptom — drain the backlog and answer ONCE to
+        # the combined input (the user's most recent intent), instead of
+        # replaying the whole queue.
+        texts = [result.text.strip()]
+        while True:
+            try:
+                extra = asr_finals_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if extra.text.strip():
+                texts.append(extra.text.strip())
+        combined = " ".join(t for t in texts if t)
+        if not combined or combined in interruption_cfg.whitelist:
             return _UserAwait(kind="no_progress")
         session.last_user_speech_end_at = time.monotonic()
-        return _UserAwait(kind="user_final", text=result.text)
+        return _UserAwait(kind="user_final", text=combined)
 
     # Silence timeout — leave pumps running, just decide.
     asr_get.cancel()
