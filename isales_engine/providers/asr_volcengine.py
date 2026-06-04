@@ -236,6 +236,7 @@ class VolcengineASRProvider(ASRProvider):
         sample_rate: int = 16000,
         reconnect_backoffs_s: tuple[float, ...] = DEFAULT_RECONNECT_BACKOFFS_S,
         partial_stable_s: float | None = None,
+        ws_close_timeout_s: float = 0.2,
         override_url: str | None = None,
     ) -> None:
         if not api_key and not (app_key and access_key):
@@ -258,6 +259,16 @@ class VolcengineASRProvider(ASRProvider):
             partial_stable_s if partial_stable_s is not None
             else DEFAULT_PARTIAL_STABLE_S
         )
+        # WebSocket close-handshake wait cap (asr-speaking-ear-close-timeout).
+        # The default websockets close_timeout is 10s; since
+        # _partial_stability_monitor proactively ws.close() after each
+        # EOS-promote, the outer loop's ws_ctx.__aexit__ would otherwise block
+        # ~10s waiting for the vendor close handshake before reconnecting —
+        # leaving the ASR connection dead for the AI's entire SPEAKING turn so
+        # _partial_monitor (barge-in) gets no partials (call 138 实证: ~9.7s
+        # 失聪窗口). A short close_timeout makes the reconnect fast (~200ms) so
+        # ASR stays "listening" during SPEAKING.
+        self._ws_close_timeout_s = ws_close_timeout_s
         self._url = override_url or V3_SAUC_BIDI_URL
 
     def _headers(self) -> dict[str, str]:
@@ -347,7 +358,11 @@ class VolcengineASRProvider(ASRProvider):
             self._url, self._resource_id,
         )
         try:
-            ws_ctx = websockets_module.connect(self._url, additional_headers=headers)
+            ws_ctx = websockets_module.connect(
+                self._url,
+                additional_headers=headers,
+                close_timeout=self._ws_close_timeout_s,
+            )
             ws = await ws_ctx.__aenter__()
         except Exception as exc:  # noqa: BLE001
             logger.exception("volcengine_asr_connect_failed: %s", exc)

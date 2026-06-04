@@ -71,6 +71,63 @@ def test_asr_partial_stable_s_default_and_override() -> None:
     assert overridden._partial_stable_s == 0.25
 
 
+async def test_asr_ws_close_timeout_default_and_passed_to_connect() -> None:
+    """asr-speaking-ear-close-timeout: default 0.2s, passed to websockets.connect
+    so the post-EOS reconnect isn't blocked ~10s by the library default."""
+    import sys
+    import types
+
+    from isales_engine.providers._errors import ProviderServerError
+    from isales_engine.providers.asr_volcengine import VolcengineASRProvider
+
+    provider = VolcengineASRProvider(api_key="k")
+    assert provider._ws_close_timeout_s == 0.2
+
+    overridden = VolcengineASRProvider(api_key="k", ws_close_timeout_s=0.5)
+    assert overridden._ws_close_timeout_s == 0.5
+
+    # Capture the kwargs passed to websockets.connect. stream_recognize does
+    # `import websockets` inside the function, so inject a fake module.
+    captured: dict[str, object] = {}
+
+    class _StopHere(Exception):
+        pass
+
+    def _fake_connect(url: str, **kwargs: object) -> object:
+        captured["url"] = url
+        captured.update(kwargs)
+        raise _StopHere
+
+    fake_ws = types.ModuleType("websockets")
+    fake_ws.connect = _fake_connect  # type: ignore[attr-defined]
+    fake_exc = types.ModuleType("websockets.exceptions")
+    fake_exc.ConnectionClosed = type("ConnectionClosed", (Exception,), {})  # type: ignore[attr-defined]
+    fake_ws.exceptions = fake_exc  # type: ignore[attr-defined]
+
+    async def _one_chunk():  # pragma: no cover - trivial async gen
+        yield b"\x00\x00"
+
+    old_ws = sys.modules.get("websockets")
+    old_exc = sys.modules.get("websockets.exceptions")
+    sys.modules["websockets"] = fake_ws
+    sys.modules["websockets.exceptions"] = fake_exc
+    try:
+        with pytest.raises(ProviderServerError):
+            async for _ in provider.stream_recognize(_one_chunk()):
+                pass
+    finally:
+        if old_ws is not None:
+            sys.modules["websockets"] = old_ws
+        else:
+            sys.modules.pop("websockets", None)
+        if old_exc is not None:
+            sys.modules["websockets.exceptions"] = old_exc
+        else:
+            sys.modules.pop("websockets.exceptions", None)
+
+    assert captured.get("close_timeout") == 0.2
+
+
 def test_factory_builds_openai_llm_from_store() -> None:
     """Smoke: store 含 api_key → build_llm 不抛。
 
