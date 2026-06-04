@@ -18,7 +18,7 @@ def make_session(call_record_id: int = 1) -> CallSession:
         campaign_id=42,
         lead_id=7,
         caller_id="+8613800000000",
-        prompt_versions_snapshot={"role_llms": [], "judge_llm": None, "polish_llm": None},
+        prompt_versions_snapshot={"main_llm": None, "referee_llm": None, "extractor_llm": None},
     )
 
 
