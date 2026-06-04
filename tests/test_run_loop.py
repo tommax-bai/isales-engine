@@ -43,6 +43,7 @@ def _make_session(call_id: int = 1) -> CallSession:
 def _make_config(
     *,
     transfer_keywords: tuple[str, ...] = (),
+    transfer_llm_enabled: bool = False,
     wrap_up_max_rounds: int = 1,
     wrap_up_max_seconds: int = 30,
     silence_threshold_ms: int = 500,
@@ -94,8 +95,8 @@ def _make_config(
             intent_system_prompt="",
             round_enabled=False,
             round_threshold=None,
-            llm_enabled=False,
-            llm_system_prompt="",
+            llm_enabled=transfer_llm_enabled,
+            llm_system_prompt="独立判定是否转人工。",
             phrases=("您稍等，专员稍后联系您。",),
         ),
         wrap_up=WrapUpConfig(
@@ -199,6 +200,41 @@ async def test_run_session_transfer_keyword_marks_handoff() -> None:
     assert "transfer_marked" in types
     # The pipeline should NOT have run for a transfer turn.
     assert session.pipeline_trace_records == []
+
+
+async def test_run_session_transfer_llm_parallel_marks_handoff() -> None:
+    """pipeline-latency-tail § D: transfer_llm runs in parallel with main
+    streaming (not before PROCESSING). The main pipeline still runs that turn,
+    and the parallel detector drives the handoff when the referee did not."""
+    session = _make_session()
+    # "投诉" trips the mock independent transfer_llm (transfer=true) but NOT the
+    # mock referee (its 转人工/人工 regex misses 投诉 → decision=continue), so the
+    # parallel detector is what marks the handoff.
+    config = _make_config(transfer_llm_enabled=True, silence_threshold_ms=3000)
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    async def driver() -> None:
+        await asyncio.sleep(0.05)
+        await asr.feed_turn("我要投诉你们的服务")
+        await asyncio.sleep(0.15)
+
+    driver_task = asyncio.create_task(driver())
+    await run_session(
+        session,
+        phone="+8613800000000",
+        config=config,
+        telephony=tel,
+        providers=providers,
+    )
+    await driver_task
+
+    assert session.state.value == "end"
+    assert session.transfer_status == "marked_for_handoff"
+    assert session.transfer_reason == "llm"
+    # The main pipeline DID run this turn — transfer_llm did not gate PROCESSING.
+    assert session.pipeline_trace_records != []
 
 
 # ---- goal_achieved → wrap-up → exhausted → END ----------------------------

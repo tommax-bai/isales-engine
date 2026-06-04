@@ -206,7 +206,11 @@ def _make_runner(
 
         providers = Providers(
             llm=build_llm(settings.engine_llm_provider, store=credentials),
-            asr=build_asr(settings.engine_asr_provider, store=credentials),
+            asr=build_asr(
+                settings.engine_asr_provider,
+                store=credentials,
+                partial_stable_s=runtime.asr_partial_stable_s,
+            ),
             tts=build_tts(settings.engine_tts_provider, store=credentials),
         )
 
@@ -218,16 +222,26 @@ def _make_runner(
         if callable(hint):
             hint(session.call_record_id, session.device_id)
 
-        await run_session(
-            session,
-            phone=phone,
-            config=runtime,
-            telephony=telephony,
-            providers=providers,
-            publisher=publisher,
-            pipeline_timeout_ms=settings.engine_pipeline_default_timeout_ms,
-            token_budget_per_call=settings.engine_token_budget_per_call,
-        )
+        try:
+            await run_session(
+                session,
+                phone=phone,
+                config=runtime,
+                telephony=telephony,
+                providers=providers,
+                publisher=publisher,
+                pipeline_timeout_ms=settings.engine_pipeline_default_timeout_ms,
+                token_budget_per_call=settings.engine_token_budget_per_call,
+            )
+        finally:
+            # Providers are per-call; release the TTS provider's persistent
+            # HTTP client so its keep-alive connections aren't leaked
+            # (pipeline-latency-tail § C). Other providers hold no such
+            # resource today.
+            tts_aclose = getattr(providers.tts, "aclose", None)
+            if callable(tts_aclose):
+                with contextlib.suppress(Exception):
+                    await tts_aclose()
 
     return _run
 

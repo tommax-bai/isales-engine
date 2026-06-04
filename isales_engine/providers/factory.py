@@ -134,8 +134,18 @@ def build_llm(
 
 
 def build_asr(
-    name: str, *, store: CredentialStore | None = None
+    name: str,
+    *,
+    store: CredentialStore | None = None,
+    partial_stable_s: float | None = None,
 ) -> ASRProvider:
+    """Return an ASR provider instance.
+
+    ``partial_stable_s`` overrides the provider's default EOS endpoint
+    (pipeline-latency-tail § A — fed from campaign.asr_eos_silence_ms via
+    load_runtime_config). None keeps the provider default. Ignored for the
+    mock provider, which has no endpoint detection.
+    """
     if name == "mock":
         return ScriptedMockASR()
     if name not in KNOWN_ASR_PROVIDERS:
@@ -161,10 +171,12 @@ def build_asr(
         resource_id = (
             s.get("volcengine", "asr_resource_id") or DEFAULT_ASR_RESOURCE_ID
         )
+        # None lets the provider keep its own DEFAULT_PARTIAL_STABLE_S.
         if api_key:
             return VolcengineASRProvider(
                 api_key=api_key,
                 resource_id=resource_id,
+                partial_stable_s=partial_stable_s,
             )
         # legacy fallback
         app_key = _require_field(s, "volcengine", "app_key")
@@ -173,6 +185,7 @@ def build_asr(
             app_key=app_key,
             access_key=app_token,
             resource_id=resource_id,
+            partial_stable_s=partial_stable_s,
         )
     raise NotImplementedError(name)  # pragma: no cover
 

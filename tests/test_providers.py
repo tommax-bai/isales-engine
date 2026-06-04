@@ -48,6 +48,29 @@ def test_factory_rejects_real_providers_without_credentials() -> None:
         build_asr("volcengine", store=empty_store)
 
 
+def test_asr_partial_stable_s_default_and_override() -> None:
+    """pipeline-latency-tail § A: ASR EOS endpoint defaults to 0.4 and is
+    overridable per-campaign via build_asr(partial_stable_s=...)."""
+    from isales_common.credentials import CredentialStore
+
+    from isales_engine.providers.asr_volcengine import (
+        DEFAULT_PARTIAL_STABLE_S,
+        VolcengineASRProvider,
+    )
+
+    assert DEFAULT_PARTIAL_STABLE_S == 0.4
+    assert VolcengineASRProvider(api_key="k")._partial_stable_s == 0.4
+
+    store = CredentialStore({"volcengine": {"api_key": "k"}})
+    default_provider = build_asr("volcengine", store=store)
+    assert isinstance(default_provider, VolcengineASRProvider)
+    assert default_provider._partial_stable_s == 0.4
+
+    overridden = build_asr("volcengine", store=store, partial_stable_s=0.25)
+    assert isinstance(overridden, VolcengineASRProvider)
+    assert overridden._partial_stable_s == 0.25
+
+
 def test_factory_builds_openai_llm_from_store() -> None:
     """Smoke: store 含 api_key → build_llm 不抛。
 

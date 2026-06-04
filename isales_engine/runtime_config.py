@@ -49,6 +49,11 @@ class RuntimeConfig:
     voice_id: str
     fixed_greeting: str | None
     max_no_progress_seconds: int | None
+    # ASR EOS endpoint in seconds (pipeline-latency-tail § A). Derived from
+    # campaign.asr_eos_silence_ms (ms); NULL → default 0.4s. main.py passes
+    # this into build_asr so the per-campaign threshold replaces the
+    # hardwired ASR-provider constant.
+    asr_partial_stable_s: float = 0.4
     # filler opt-in (pipeline-stream-and-referee). Default off — the streaming
     # main link reaches first audio in ~500ms so filler usually just adds delay.
     filler_enabled: bool = False
@@ -259,6 +264,12 @@ async def load_runtime_config(
     # ``generate_greeting(fixed_template=None)`` branch).
     fixed_greeting: str | None = campaign.greeting
 
+    # ASR EOS endpoint (pipeline-latency-tail § A). campaign.asr_eos_silence_ms
+    # is ms; NULL → engine default 400ms. Convert to seconds for the ASR
+    # provider's partial_stable_s.
+    asr_eos_ms = campaign.asr_eos_silence_ms
+    asr_partial_stable_s = (asr_eos_ms if asr_eos_ms is not None else 400) / 1000.0
+
     strategy_value = (
         campaign.continuous_interruption_strategy
         if isinstance(campaign.continuous_interruption_strategy, str)
@@ -275,6 +286,7 @@ async def load_runtime_config(
         voice_id="default",
         fixed_greeting=fixed_greeting,
         max_no_progress_seconds=campaign.max_no_progress_seconds,
+        asr_partial_stable_s=asr_partial_stable_s,
         filler_enabled=campaign.filler_enabled,
         _max_continuous_interruptions=campaign.max_continuous_interruptions,
         _continuous_interruption_strategy=strategy_value,

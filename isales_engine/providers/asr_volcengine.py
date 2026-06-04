@@ -110,6 +110,14 @@ V3_SAUC_BIDI_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
 # volc.seedasr.sauc.duration`` in env.
 DEFAULT_ASR_RESOURCE_ID = "volc.bigasr.sauc.duration"
 
+# Default ASR EOS endpoint (pipeline-latency-tail § A): seconds of
+# text-stable vendor partial output before we promote-to-final + EOS.
+# Lowered from the old hardwired 0.7 to 0.4 (≈ campaign default
+# asr_eos_silence_ms=400). Smaller opens the AI's turn faster but risks
+# clipping a hesitating caller's pause as "done"; per-campaign override
+# via campaign.asr_eos_silence_ms.
+DEFAULT_PARTIAL_STABLE_S = 0.4
+
 # Frame protocol constants -----------------------------------------------------
 
 PROTO_VERSION = 0b0001
@@ -227,6 +235,7 @@ class VolcengineASRProvider(ASRProvider):
         resource_id: str = DEFAULT_ASR_RESOURCE_ID,
         sample_rate: int = 16000,
         reconnect_backoffs_s: tuple[float, ...] = DEFAULT_RECONNECT_BACKOFFS_S,
+        partial_stable_s: float | None = None,
         override_url: str | None = None,
     ) -> None:
         if not api_key and not (app_key and access_key):
@@ -240,6 +249,15 @@ class VolcengineASRProvider(ASRProvider):
         self._resource_id = resource_id
         self._sample_rate = sample_rate
         self._reconnect_backoffs_s = reconnect_backoffs_s
+        # EOS endpoint: how long vendor partial output must be text-stable
+        # before we promote it as final + send EOS (pipeline-latency-tail § A).
+        # Default lowered 0.7 → 0.4 to open the AI's turn ~300ms sooner;
+        # campaign.asr_eos_silence_ms overrides this per-campaign via
+        # load_runtime_config → factory build_asr. None → DEFAULT.
+        self._partial_stable_s = (
+            partial_stable_s if partial_stable_s is not None
+            else DEFAULT_PARTIAL_STABLE_S
+        )
         self._url = override_url or V3_SAUC_BIDI_URL
 
     def _headers(self) -> dict[str, str]:
@@ -501,7 +519,7 @@ class VolcengineASRProvider(ASRProvider):
                     finalize.
                 """
                 import time as _t2  # noqa: PLC0415
-                _PARTIAL_STABLE_S = 0.7  # phone-conversation standard
+                _PARTIAL_STABLE_S = self._partial_stable_s
                 while True:
                     try:
                         await asyncio.sleep(0.1)

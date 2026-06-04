@@ -6,6 +6,8 @@ from isales_engine.providers.llm_mock import KeywordDrivenMockLLM
 from isales_engine.transfer.manager import (
     TransferConfig,
     evaluate_transfer,
+    evaluate_transfer_cheap,
+    evaluate_transfer_llm,
 )
 from isales_engine.wrapup.manager import WrapUpConfig, evaluate_wrap_up
 
@@ -141,6 +143,62 @@ async def test_transfer_or_keyword_first_match_wins() -> None:
     assert decision.triggered is True
     # Keyword check is first → keyword wins.
     assert decision.trigger_type == "keyword"
+
+
+# ---- split: cheap (inline, zero LLM) vs llm (parallel) --------------------
+# pipeline-latency-tail § D
+
+
+def test_transfer_cheap_takes_no_llm_and_ignores_llm_triggers() -> None:
+    """evaluate_transfer_cheap is sync, has no ``llm`` parameter, and only
+    fires on keyword / round — intent / llm config is ignored here (those run
+    off the hot path via evaluate_transfer_llm)."""
+    # intent + llm enabled but no keyword/round → cheap returns not-triggered
+    # without ever touching an LLM (structurally — no llm arg).
+    decision = evaluate_transfer_cheap(
+        user_text="我要转人工",  # would trip intent/llm, but cheap ignores them
+        turn_count=1,
+        goal_achieved=False,
+        config=_config(intent_enabled=True, intent_threshold=0.5, llm_enabled=True),
+    )
+    assert decision.triggered is False
+
+
+def test_transfer_cheap_keyword_and_round() -> None:
+    kw = evaluate_transfer_cheap(
+        user_text="转人工",
+        turn_count=1,
+        goal_achieved=False,
+        config=_config(keyword_enabled=True, keywords=("转人工",)),
+    )
+    assert kw.triggered is True and kw.trigger_type == "keyword"
+
+    rnd = evaluate_transfer_cheap(
+        user_text="嗯",
+        turn_count=10,
+        goal_achieved=False,
+        config=_config(round_enabled=True, round_threshold=8),
+    )
+    assert rnd.triggered is True and rnd.trigger_type == "round"
+
+
+async def test_transfer_llm_only_evaluates_llm_triggers() -> None:
+    """evaluate_transfer_llm ignores keyword / round (handled inline) and only
+    fires on intent / independent-llm."""
+    # keyword config present but evaluate_transfer_llm ignores it.
+    decision = await evaluate_transfer_llm(
+        user_text="转人工",
+        config=_config(keyword_enabled=True, keywords=("转人工",)),
+        llm=KeywordDrivenMockLLM(),
+    )
+    assert decision.triggered is False  # no intent/llm enabled → no trigger
+
+    intent = await evaluate_transfer_llm(
+        user_text="我要转人工",  # mock probability=0.95
+        config=_config(intent_enabled=True, intent_threshold=0.8),
+        llm=KeywordDrivenMockLLM(),
+    )
+    assert intent.triggered is True and intent.trigger_type == "intent"
 
 
 # ---- wrapup ----------------------------------------------------------------

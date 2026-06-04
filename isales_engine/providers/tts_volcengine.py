@@ -130,6 +130,21 @@ class VolcengineTTSProvider(TTSProvider):
         self._audio_format = audio_format
         self._timeout_s = timeout_s
         self._url = override_url or V3_SSE_URL
+        # Persistent client (pipeline-latency-tail § C): the V3 SSE service is
+        # one short HTTP request per sentence, but a fresh httpx.AsyncClient
+        # per sentence pays a full TLS handshake every time. A provider-lived
+        # client keeps the keep-alive connection pool warm so consecutive
+        # sentences in a call reuse the same TCP+TLS connection. httpx
+        # transparently reconnects a half-open / vendor-idle-dropped
+        # connection, so correctness is unaffected. Released via aclose().
+        self._client = httpx.AsyncClient(
+            timeout=self._timeout_s,
+            limits=httpx.Limits(max_keepalive_connections=4, keepalive_expiry=60.0),
+        )
+
+    async def aclose(self) -> None:
+        """Release the persistent HTTP client (provider 弃用 / 进程退出)."""
+        await self._client.aclose()
 
     def _headers(self) -> dict[str, str]:
         common = {
@@ -194,7 +209,7 @@ class VolcengineTTSProvider(TTSProvider):
         start = time.monotonic()
         first_byte_logged = False
 
-        async with httpx.AsyncClient(timeout=self._timeout_s) as client, client.stream(
+        async with self._client.stream(
             "POST", self._url, headers=self._headers(), json=payload
         ) as response:
             if response.status_code >= 400:

@@ -60,7 +60,11 @@ from isales_engine.runtime_config import RuntimeConfig
 from isales_engine.state_machine import StateMachine
 from isales_engine.streaming.types import RefereeResult
 from isales_engine.transcript_recorder import now_utc
-from isales_engine.transfer.manager import evaluate_transfer
+from isales_engine.transfer.manager import (
+    TransferDecision,
+    evaluate_transfer_cheap,
+    evaluate_transfer_llm,
+)
 from isales_engine.wrapup.manager import evaluate_wrap_up
 
 logger = logging.getLogger(__name__)
@@ -468,36 +472,24 @@ async def _main_turn_loop(
                 )
             last_progress_ms = _to_ms(time.monotonic())
 
-            decision = await evaluate_transfer(
+            # Cheap (keyword / round) transfer triggers stay inline — zero LLM,
+            # deterministic (pipeline-latency-tail § D). The LLM-backed triggers
+            # are evaluated off the hot path: preferred via the referee's
+            # ``transfer`` decision, with a parallel detector spawned below for
+            # campaigns that explicitly configure transfer_intent / transfer_llm.
+            decision = evaluate_transfer_cheap(
                 user_text=user_text,
                 turn_count=len(session.dialog_history),
                 goal_achieved=False,
                 config=config.transfer,
-                llm=providers.llm,
             )
             if decision.triggered:
-                sm.transition_to(
-                    CallStatus.TRANSFERRING, reason=decision.trigger_type or "transfer"
-                )
-                session.append_event(
-                    "transfer_initiated",
-                    trigger_type=decision.trigger_type or "",
+                await _perform_handoff(
+                    session, sm, telephony, providers.tts,
+                    trigger_type=decision.trigger_type or "transfer",
                     trigger_detail=decision.trigger_detail,
-                )
-                await _play_tts(
-                    session, telephony, providers.tts, decision.phrase,
+                    phrase=decision.phrase,
                     voice_id=config.voice_id,
-                )
-                session.transfer_status = TransferStatus.MARKED_FOR_HANDOFF.value
-                session.transfer_reason = decision.trigger_type
-                session.append_event("transfer_marked", handoff_task_id=0)
-                await _attempt_hangup(telephony, session.call_record_id)
-                sm.transition_to(
-                    CallStatus.END, reason="marked_for_handoff", force=True
-                )
-                session.hangup_cause = HangupCause.MARKED_FOR_HANDOFF.value
-                session.append_event(
-                    "hangup", reason="marked_for_handoff", initiated_by="ai"
                 )
                 return
 
@@ -528,6 +520,25 @@ async def _main_turn_loop(
             _publish_status(publisher, session, "speech_end")
             ts_start = now_utc()
             processing_start = time.monotonic()
+
+            # Transfer LLM detection (pipeline-latency-tail § D): for campaigns
+            # that explicitly configure transfer_intent / transfer_llm, spawn
+            # the LLM detector in parallel with main streaming so it never
+            # blocks the PROCESSING entry. Resolved before this SPEAKING turn
+            # finalizes (alongside the referee). Off → None, zero cost.
+            transfer_llm_task: asyncio.Task[TransferDecision] | None = None
+            if (
+                not is_wrap_up
+                and (config.transfer.intent_enabled or config.transfer.llm_enabled)
+            ):
+                transfer_llm_task = asyncio.create_task(
+                    evaluate_transfer_llm(
+                        user_text=user_text,
+                        config=config.transfer,
+                        llm=providers.llm,
+                    ),
+                    name="transfer_llm",
+                )
 
             # prompt_versions snapshot: mark the wrap-up append flag for this
             # call (role-prompt § prompt_versions 快照标记).
@@ -624,7 +635,11 @@ async def _main_turn_loop(
             )
 
             if not played:
-                # Real-time interruption fired: SPEAKING got cancelled.
+                # Real-time interruption fired: SPEAKING got cancelled. The
+                # parallel transfer-LLM detector is moot for this turn — cancel
+                # it so we don't wait on (or act on) a stale result.
+                if transfer_llm_task is not None:
+                    transfer_llm_task.cancel()
                 session.consecutive_interruption_count += 1
                 session.interruption_signaled = False
                 sm.transition_to(
@@ -634,6 +649,30 @@ async def _main_turn_loop(
                 continue
             # Successful SPEAKING — clear the counter per spec.
             session.consecutive_interruption_count = 0
+
+            # Parallel transfer-LLM detector (pipeline-latency-tail § D): resolve
+            # before referee-driven transitions. The referee's ``transfer``
+            # decision is the preferred path; only act on the dedicated detector
+            # when the referee did not already mark a transfer.
+            transfer_llm_decision = await _resolve_transfer_llm(transfer_llm_task)
+            referee_transfer = (
+                referee_result is not None
+                and referee_result.decision == "transfer"
+                and not is_wrap_up
+            )
+            if (
+                transfer_llm_decision is not None
+                and transfer_llm_decision.triggered
+                and not referee_transfer
+            ):
+                await _perform_handoff(
+                    session, sm, telephony, providers.tts,
+                    trigger_type=transfer_llm_decision.trigger_type or "transfer",
+                    trigger_detail=transfer_llm_decision.trigger_detail,
+                    phrase=transfer_llm_decision.phrase,
+                    voice_id=config.voice_id,
+                )
+                return
 
             # ---- referee-driven state transitions (skipped during wrap-up) ----
             if referee_result is not None and not is_wrap_up:
@@ -653,24 +692,14 @@ async def _main_turn_loop(
                     )
                     continue
                 if referee_result.decision == "transfer":
-                    sm.transition_to(
-                        CallStatus.TRANSFERRING, reason="referee_decision"
-                    )
-                    session.append_event(
-                        "transfer_initiated",
+                    # Referee-driven transfer: no extra phrase (the main reply
+                    # already played) — just mark + hang up.
+                    await _perform_handoff(
+                        session, sm, telephony, providers.tts,
                         trigger_type="referee",
                         trigger_detail="referee_decision",
-                    )
-                    session.transfer_status = TransferStatus.MARKED_FOR_HANDOFF.value
-                    session.transfer_reason = "referee"
-                    session.append_event("transfer_marked", handoff_task_id=0)
-                    await _attempt_hangup(telephony, session.call_record_id)
-                    sm.transition_to(
-                        CallStatus.END, reason="marked_for_handoff", force=True
-                    )
-                    session.hangup_cause = HangupCause.MARKED_FOR_HANDOFF.value
-                    session.append_event(
-                        "hangup", reason="marked_for_handoff", initiated_by="ai"
+                        phrase="",
+                        voice_id=config.voice_id,
                     )
                     return
                 if referee_result.decision == "customer_decline":
@@ -792,6 +821,60 @@ async def _await_user_or_silence(
     return _UserAwait(kind="no_progress")
 
 
+class _SynthJob:
+    """A pre-synthesizing TTS job (pipeline-latency-tail § B).
+
+    Construction immediately spawns a background task that drains
+    ``tts.synthesize_stream(text)`` into an internal buffer — so the vendor
+    is already producing audio for sentence N+1 while the consumer plays
+    sentence N. ``stream()`` replays the buffered PCM (and re-raises any
+    synthesis error after draining). ``aclose()`` cancels the in-flight
+    synthesis (barge-in / teardown) so we don't leak a vendor connection.
+    """
+
+    def __init__(self, text: str, tts: TTSProvider, voice_id: str) -> None:
+        self.text = text
+        self._buffer: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self._error: BaseException | None = None
+        # Own the TTS iterator so aclose() can close it even when the drain
+        # task's own cleanup gets cut short by cancellation.
+        self._gen = tts.synthesize_stream(text, voice_id)
+        self._task = asyncio.create_task(self._drain(), name="tts_presynth")
+
+    async def _drain(self) -> None:
+        try:
+            async for chunk in self._gen:
+                await self._buffer.put(chunk)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — surfaced via stream()
+            self._error = exc
+        finally:
+            await self._buffer.put(None)  # sentinel: synthesis done
+
+    async def stream(self) -> AsyncIterator[bytes]:
+        while True:
+            chunk = await self._buffer.get()
+            if chunk is None:
+                break
+            yield chunk
+        if self._error is not None:
+            raise self._error
+
+    async def aclose(self) -> None:
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
+        # Explicitly close the TTS iterator so its vendor connection / SSE
+        # stream is released NOW (on barge-in / teardown). The drain task's
+        # own cleanup can be cut short by its cancellation, so we close the
+        # generator here — _play_streaming's finally runs uncancelled.
+        aclose = getattr(self._gen, "aclose", None)
+        if aclose is not None:
+            with contextlib.suppress(Exception):
+                await aclose()
+
+
 async def _play_streaming(
     session: CallSession,
     telephony: TelephonyClient,
@@ -802,36 +885,174 @@ async def _play_streaming(
     filler: FillerManager | None,
     processing_start: float,
 ) -> tuple[int | None, bool]:
-    """Feed the main LLM streaming reply into TTS sentence-by-sentence.
+    """Play the main LLM streaming reply via a producer/consumer pipeline.
+
+    Producer consumes ``chat_stream → split_sentences`` and, for each
+    sentence, **immediately** kicks off TTS synthesis (``_SynthJob``),
+    pushing the ready job onto a bounded queue (``maxsize=2``). The consumer
+    pulls jobs and plays them — so while sentence N plays, sentence N+1 is
+    already synthesizing in the vendor. This kills the per-sentence TTS
+    first-byte silence gap and stops the main LLM from being suspended by
+    playback (pipeline-latency-tail § B).
 
     Returns ``(first_audio_ms, fully_played)``. ``first_audio_ms`` is measured
-    from PROCESSING entry to the first PCM-bearing sentence. On a real-time
-    interruption mid-sentence, returns ``(first_audio_ms, False)``; the main
-    stream generator is closed in the ``finally`` so the underlying
-    ``chat_stream`` stops pulling tokens.
+    from PROCESSING entry to the first PCM chunk the consumer actually plays.
+    On a real-time interruption (partial monitor cancels the audio_out task)
+    returns ``(first_audio_ms, False)``; the producer, the main stream
+    generator, and every queued/in-flight synthesis are cancelled in the
+    ``finally`` so ``chat_stream`` and the vendor TTS connections stop.
     """
     first_audio_ms: int | None = None
     fully_played = True
     sentences = stream.sentences()
-    try:
-        async for sentence in sentences:
-            if first_audio_ms is None:
-                first_audio_ms = int((time.monotonic() - processing_start) * 1000)
-                if filler is not None:
-                    # Preempt the filler audio channel with the real reply
-                    # (same cancel path as 5/28 barge-in).
-                    await filler.stop()
-            played = await _play_tts(
-                session, telephony, tts, sentence, voice_id=voice_id
+    # maxsize=2: producer leads the consumer by at most 2 sentences — enough
+    # to hide TTS first-byte latency, bounded so a fast LLM doesn't pre-pay
+    # synthesis for many sentences that a barge-in would discard.
+    job_q: asyncio.Queue[_SynthJob | None] = asyncio.Queue(maxsize=2)
+
+    async def _producer() -> None:
+        pending: _SynthJob | None = None
+        try:
+            async for sentence in sentences:
+                pending = _SynthJob(sentence, tts, voice_id)
+                await job_q.put(pending)
+                pending = None
+        except asyncio.CancelledError:
+            # Consumer's finally drains + closes queued jobs; just clean up
+            # the one job we created but never enqueued. No sentinel needed.
+            if pending is not None:
+                await pending.aclose()
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Sentence generator failed mid-stream (rare — sentences() catches
+            # its own LLM errors). Stop producing but still drop the sentinel
+            # below so the consumer drains what's queued instead of hanging.
+            logger.warning(
+                "tts_producer_stream_error turn=%s: %s", stream.turn_id, exc
             )
+            if stream.result.error is None:
+                stream.result.error = f"main_stream_producer: {exc}"
+        await job_q.put(None)  # completion sentinel (normal or handled-error)
+
+    producer_task = asyncio.create_task(_producer(), name="tts_producer")
+    current_job: _SynthJob | None = None
+    filler_stopped = False
+    try:
+        while True:
+            next_job = await job_q.get()
+            if next_job is None:
+                break
+            job: _SynthJob = next_job  # narrowed non-Optional for the closure
+            current_job = job
+            if not filler_stopped and filler is not None:
+                # Preempt the filler audio channel with the real reply
+                # (same cancel path as 5/28 barge-in).
+                await filler.stop()
+                filler_stopped = True
+
+            async def _marked(j: _SynthJob = job) -> AsyncIterator[bytes]:
+                nonlocal first_audio_ms
+                async for chunk in j.stream():
+                    if first_audio_ms is None:
+                        first_audio_ms = int(
+                            (time.monotonic() - processing_start) * 1000
+                        )
+                    yield chunk
+
+            try:
+                played = await _play_chunks(
+                    session, telephony, _marked(), interruptible=True
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # TTS synthesis / playback error for this sentence: log + stop
+                # this turn's playback without crashing the call (consumer 不
+                # 卡死 + 落 error). Remaining queued jobs are closed in finally.
+                logger.warning(
+                    "tts_playback_error turn=%s text=%r: %s",
+                    stream.turn_id, job.text, exc,
+                )
+                if stream.result.error is None:
+                    stream.result.error = f"tts_playback: {exc}"
+                break
             if not played:
+                # Barge-in: keep current_job set so the finally closes its
+                # (possibly still-synthesizing) TTS iterator.
                 fully_played = False
                 break
+            current_job = None  # fully played — nothing to clean up
     finally:
+        producer_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await producer_task
         await sentences.aclose()
+        if current_job is not None:
+            await current_job.aclose()
+        # Drain + close any jobs still queued so their pre-synth TTS iterators
+        # are released (avoid leaking vendor connections on barge-in).
+        while not job_q.empty():
+            pending_job = job_q.get_nowait()
+            if pending_job is not None:
+                await pending_job.aclose()
         if filler is not None:
             await filler.stop()
     return first_audio_ms, fully_played
+
+
+async def _perform_handoff(
+    session: CallSession,
+    sm: StateMachine,
+    telephony: TelephonyClient,
+    tts: TTSProvider,
+    *,
+    trigger_type: str,
+    trigger_detail: str,
+    phrase: str,
+    voice_id: str,
+) -> None:
+    """Run the TRANSFERRING → marked-for-handoff → hangup → END flow.
+
+    Shared by the inline cheap triggers, the parallel transfer-LLM detector,
+    and the referee transfer decision (pipeline-latency-tail § D). ``phrase``
+    is played only when non-empty (the referee path plays nothing — the main
+    reply already went out).
+    """
+    sm.transition_to(CallStatus.TRANSFERRING, reason=trigger_type or "transfer")
+    session.append_event(
+        "transfer_initiated",
+        trigger_type=trigger_type or "",
+        trigger_detail=trigger_detail,
+    )
+    if phrase:
+        await _play_tts(session, telephony, tts, phrase, voice_id=voice_id)
+    session.transfer_status = TransferStatus.MARKED_FOR_HANDOFF.value
+    session.transfer_reason = trigger_type
+    session.append_event("transfer_marked", handoff_task_id=0)
+    await _attempt_hangup(telephony, session.call_record_id)
+    sm.transition_to(CallStatus.END, reason="marked_for_handoff", force=True)
+    session.hangup_cause = HangupCause.MARKED_FOR_HANDOFF.value
+    session.append_event("hangup", reason="marked_for_handoff", initiated_by="ai")
+
+
+async def _resolve_transfer_llm(
+    task: asyncio.Task[TransferDecision] | None,
+) -> TransferDecision | None:
+    """Await the parallel transfer-LLM detector with a fail-open budget.
+
+    Mirrors ``_await_referee``: ``None`` when no detector was spawned; on
+    timeout / failure the task is cancelled and ``None`` returned (transfer
+    never blocks or crashes the turn).
+    """
+    if task is None:
+        return None
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+    except TimeoutError:
+        task.cancel()
+        return None
+    except Exception:  # noqa: BLE001 — transfer detection never blocks the call
+        return None
 
 
 async def _await_referee(
@@ -857,16 +1078,14 @@ async def _await_referee(
     return result, result.decision
 
 
-async def _play_tts(
+async def _play_chunks(
     session: CallSession,
     telephony: TelephonyClient,
-    tts: TTSProvider,
-    text: str,
+    chunk_iter: AsyncIterator[bytes],
     *,
-    voice_id: str,
     interruptible: bool = True,
 ) -> bool:
-    """Stream TTS PCM out via the telephony client.
+    """Push a PCM chunk stream out via the telephony client.
 
     Returns ``True`` on full playback, ``False`` if cancelled mid-stream by
     the partial monitor (real-time interruption). The audio_out implementation
@@ -875,14 +1094,13 @@ async def _play_tts(
 
     When ``interruptible=False`` the partial monitor is bypassed for this
     playback (used for protection cues like "您请说" that MUST complete).
+
+    Shared by single-shot ``_play_tts`` (greeting / cues / silence phrases)
+    and the producer/consumer ``_play_streaming`` pipeline
+    (pipeline-latency-tail § B).
     """
-
-    async def chunks() -> AsyncIterator[bytes]:
-        async for chunk in tts.synthesize_stream(text, voice_id):
-            yield chunk
-
     play_task = asyncio.create_task(
-        telephony.audio_out(session.call_record_id, chunks()), name="audio_out"
+        telephony.audio_out(session.call_record_id, chunk_iter), name="audio_out"
     )
     if interruptible:
         session.current_speaking_task = play_task
@@ -899,6 +1117,26 @@ async def _play_tts(
 
     session.last_tts_end_at = time.monotonic()
     return True
+
+
+async def _play_tts(
+    session: CallSession,
+    telephony: TelephonyClient,
+    tts: TTSProvider,
+    text: str,
+    *,
+    voice_id: str,
+    interruptible: bool = True,
+) -> bool:
+    """Synthesize ``text`` and stream the PCM out (single-shot path)."""
+
+    async def chunks() -> AsyncIterator[bytes]:
+        async for chunk in tts.synthesize_stream(text, voice_id):
+            yield chunk
+
+    return await _play_chunks(
+        session, telephony, chunks(), interruptible=interruptible
+    )
 
 
 async def _partial_monitor(
