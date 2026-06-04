@@ -188,12 +188,14 @@ class _CallState:
         max_rms_window = 0
         first_sender_uid: str | None = None
         skipped_sender_count = 0
-        # DIAG-REMOVE-AFTER-ECHO-TEST: raw stereo 48k dump (前 15s)
-        # 用于 verify SDK 是否把 own publish (engine TTS) mix 进
-        # OnPlaybackAudioFrame self-loopback path. 测试方法: user 不说话,
-        # 跑 smoke 让 greeting + silence_activation 兜底 TTS 自然播放,
-        # 之后 afplay 听 dump — 若含 AI TTS 内容 = SDK 真的 self-loopback;
-        # 若纯静音 = 真因在别处 (VAD 阈值 / 真说话 race).
+        # DIAG: raw stereo 48k dump of the first 15 s of inbound, for
+        # measuring the real inbound signal (per-channel RMS over time).
+        # Controlled test: user stays SILENT during the greeting, then afplay /
+        # measure the dump — non-silent inbound while only the AI is talking
+        # would indicate the engine's own TTS reaching inbound; pure silence
+        # rules that out. (Use this to ground the VAD-threshold re-evaluation;
+        # the earlier "self-loopback" conclusion is retracted, pending this
+        # measurement.)
         _raw_dump_path = "/tmp/inbound_raw_48k_stereo.pcm"
         _raw_dump_fh: Any = None
         _raw_dump_max_bytes = 15 * 48000 * 2 * 2  # 15s @ 48k stereo int16

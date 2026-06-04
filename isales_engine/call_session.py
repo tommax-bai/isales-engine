@@ -135,12 +135,10 @@ class CallSession:
     current_user_speech_started_ms: int | None = None
     # Updated by _vad_monitor on every inbound audio frame — the current
     # consecutive voice-active duration (with hangover tolerance). Read by
-    # _partial_monitor as a corroboration signal: ASR partials transcribed
-    # from DingRTC mixed-playback self-loopback (engine's own TTS coming
-    # back as inbound) would otherwise mis-trigger barge-in, since the
-    # text is plausible Chinese. partial_monitor only fires cancel when
-    # this counter confirms there's also voice energy *above* the TTS
-    # self-loopback baseline (see ``voice_rms_threshold`` in run_loop.py).
+    # _partial_monitor as a corroboration signal before cancelling.
+    # (The original "guards against DingRTC self-loopback ASR mis-transcription"
+    # rationale is retracted 2026-06-04 — unsupported by evidence; this gate
+    # is pending re-evaluation. See run_loop.py voice_rms_threshold note.)
     vad_voice_active_ms: int = 0
 
     # Token budget bookkeeping (impl-engine-providers PR #7).

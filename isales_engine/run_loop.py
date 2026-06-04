@@ -1183,16 +1183,16 @@ async def _partial_monitor(
         if verdict.verdict != "triggered":
             continue
 
-        # Corroborate via VAD before cancelling — see comment below. — DingRTC's mixed playback
-        # frames include the engine's own TTS uplink (Linux 3.9.0 SDK self-
-        # loopback, see _session.py POSITION_PLAYBACK note). ASR happily
-        # transcribes that loopback as plausible Chinese (audited 2026-05-28
-        # "胃可以打造" mis-transcription of the greeting's "我是智联招聘"),
-        # so a duration-pass partial alone isn't enough to prove the user
-        # actually spoke. The VAD monitor's RMS threshold is tuned above
-        # the TTS self-loopback baseline, so a non-zero
-        # ``vad_voice_active_ms`` means voice energy ABOVE the loopback,
-        # i.e. genuine user speech overlaid on the AI playback.
+        # Corroborate via VAD before cancelling: require the RMS monitor to
+        # have seen voice energy above ``voice_rms_threshold`` for at least
+        # ``min_duration_ms`` before trusting a duration-pass partial.
+        # NOTE (2026-06-04): the original rationale for this gate — that
+        # DingRTC mixed-playback self-loopback made ASR mis-transcribe the
+        # engine's own TTS, so a partial alone couldn't prove the user spoke
+        # — is RETRACTED (call 138 evidence does not support it; and during
+        # SPEAKING the ASR connection is closed, so it can't transcribe a
+        # loopback at all). This gate + ``voice_rms_threshold`` are pending an
+        # evidence-based re-evaluation; do not re-justify them via loopback.
         if session.vad_voice_active_ms < interruption_cfg.min_duration_ms:
             logger.warning(
                 "partial_monitor_skip_no_vad_corroboration text=%r "
@@ -1253,19 +1253,16 @@ async def _vad_monitor(
     # is 20–60 ms depending on the SDK build) and infer the duration from
     # the byte count.
     bytes_per_ms = 16_000 * 2 // 1000  # = 32
-    # RMS threshold tuned empirically against DingRTC's mixed-playback
-    # background-noise floor (~30–80 with no peer speech). Voice utterances
-    # typically register ≥ 500–2000. 200 is a safe "above-noise" cutoff
-    # that catches normal speech while ignoring DingRTC's mixer hum.
-    # RMS threshold chosen to ride ABOVE the DingRTC mixed-playback self-
-    # loopback baseline. On Linux 3.9.0 the SDK's POSITION_PLAYBACK frames
-    # include this peer's own external-audio source; engine TTS playback
-    # therefore registers RMS ~600-800 even when the remote peer is silent
-    # (vad_diag 2026-05-28). Real user speech overlaid on top totals
-    # ~1100-2600; setting the threshold to 1200 keeps the self-loopback
-    # baseline ignored while still firing on a normal-volume user.
-    # POSITION_REMOTE_USER would solve this cleanly but the SDK's per-uid
-    # callback is dormant on this version (see _session.py).
+    # RMS threshold for "voice present" on the inbound mono PCM.
+    # NOTE (2026-06-04): the value 1200 was originally justified as riding
+    # "above the DingRTC self-loopback baseline ~600-800". That rationale is
+    # RETRACTED — call 138's inbound RMS does not show a sustained loopback
+    # floor, and the self-loopback causal theory is unsupported. 1200 is kept
+    # AS-IS for now (changing it without fresh measurement would repeat the
+    # guess-driven mistake); it is pending an evidence-based re-evaluation
+    # against a controlled call (user silent during greeting → measure the
+    # real inbound floor; user barge-in → measure real user-speech RMS). See
+    # the interruption-detection re-eval openspec change.
     voice_rms_threshold = 1200
     # Hangover window: Chinese / Mandarin speech has natural ~50-100 ms
     # micro-pauses between syllables / words / breath. If we reset on
