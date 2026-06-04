@@ -127,20 +127,14 @@ async def run_session(
         sm.transition_to(CallStatus.GREETING, reason="connected")
         _publish_status(publisher, session, "connected")
 
-        # NOTE on greeting interruptibility: an earlier draft of this commit
-        # moved _start_listen_pumps to BEFORE _do_greeting so users could
-        # barge in mid-greeting. That ran into a DingRTC Linux 3.9.0 SDK
-        # limitation — POSITION_PLAYBACK mixed frames include this peer's
-        # own external-audio source, so the engine's TTS uplink loops back
-        # as inbound. ASR then transcribes the loopback as gibberish text
-        # (e.g. "胃可以打造" from the greeting "我是智联招聘"), which
-        # partial_monitor / VAD then mis-treat as the user speaking and
-        # cancel the greeting on itself. POSITION_REMOTE_USER would solve
-        # this but the SDK doesn't fire its per-uid callback on this
-        # version (audited 2026-05-28 by switching position and observing
-        # zero inbound frames). Until a real AEC subtracts our own TTS
-        # reference signal from the inbound mix, greeting playback stays
-        # uninterruptible — pumps start only after greeting completes.
+        # NOTE on greeting interruptibility: listen pumps start AFTER the
+        # greeting, so the greeting cannot be barged in on. (An earlier
+        # 2026-05-28 rationale attributing mid-greeting false-triggers to a
+        # DingRTC POSITION_PLAYBACK self-loopback / mixed-playback echo was
+        # retracted 2026-06-04 — call 138 evidence does not support it. If
+        # mid-greeting barge-in is revisited, diagnose against the real ASR
+        # connection lifecycle first; do not reintroduce the loopback/AEC
+        # theory without fresh evidence.)
 
         await _do_greeting(session, config, providers, telephony)
         sm.transition_to(CallStatus.LISTENING, reason="greeting_done")
