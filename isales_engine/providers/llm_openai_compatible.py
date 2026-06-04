@@ -64,9 +64,21 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         # Optional injected transport (tests pass httpx.MockTransport). None →
         # the default real transport.
         self._transport = transport
+        # Persistent client (pipeline-latency-tail § C, extended to LLM):
+        # a fresh AsyncClient per call paid a full TLS handshake to the vendor
+        # (e.g. ark.cn-beijing.volces.com) on every turn — ~100-200ms straight
+        # onto the user-perceived "stopped talking → AI first token" latency.
+        # A provider-lived client keeps the keep-alive pool warm across turns
+        # (main + referee + transfer share this instance). Released via aclose().
+        self._http = httpx.AsyncClient(
+            timeout=self._timeout_s,
+            transport=self._transport,
+            limits=httpx.Limits(max_keepalive_connections=4, keepalive_expiry=60.0),
+        )
 
-    def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(timeout=self._timeout_s, transport=self._transport)
+    async def aclose(self) -> None:
+        """Release the persistent HTTP client (provider 弃用 / 进程退出)."""
+        await self._http.aclose()
 
     async def chat(
         self,
@@ -96,8 +108,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
 
         start = time.monotonic()
         try:
-            async with self._client() as client:
-                response = await client.post(url, headers=headers, json=payload)
+            response = await self._http.post(url, headers=headers, json=payload)
         except httpx.HTTPError as exc:
             raise map_transport_error(exc, provider=self._provider) from exc
 
@@ -148,7 +159,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         self.last_call_finish_reason = None
 
         try:
-            async with self._client() as client, client.stream(
+            async with self._http.stream(
                 "POST", url, headers=headers, json=payload
             ) as response:
                 if response.status_code >= 400:

@@ -234,14 +234,14 @@ def _make_runner(
                 token_budget_per_call=settings.engine_token_budget_per_call,
             )
         finally:
-            # Providers are per-call; release the TTS provider's persistent
-            # HTTP client so its keep-alive connections aren't leaked
-            # (pipeline-latency-tail § C). Other providers hold no such
-            # resource today.
-            tts_aclose = getattr(providers.tts, "aclose", None)
-            if callable(tts_aclose):
-                with contextlib.suppress(Exception):
-                    await tts_aclose()
+            # Providers are per-call; release the TTS + LLM providers'
+            # persistent HTTP clients so their keep-alive connections aren't
+            # leaked (pipeline-latency-tail § C — TTS + LLM connection reuse).
+            for provider in (providers.tts, providers.llm):
+                aclose = getattr(provider, "aclose", None)
+                if callable(aclose):
+                    with contextlib.suppress(Exception):
+                        await aclose()
 
     return _run
 
