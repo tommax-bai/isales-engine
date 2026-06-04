@@ -100,6 +100,34 @@ async def _connected(tel: MockTelephonyClient, call_id: int) -> None:
         break
 
 
+class _FakeFiller:
+    """Stand-in for FillerManager: records start/stop (tts-cache-and-gated-filler)."""
+
+    def __init__(self) -> None:
+        self.start_called = 0
+        self.stop_called = 0
+
+    async def start(self) -> None:
+        self.start_called += 1
+
+    async def stop(self) -> None:
+        self.stop_called += 1
+
+
+class _SlowFirstSentenceStream(_FakeStream):
+    """Delays the first sentence (simulates a slow LLM TTFT)."""
+
+    def __init__(self, sentences: list[str], *, delay_s: float) -> None:
+        super().__init__(sentences)
+        self._delay_s = delay_s
+
+    async def sentences(self) -> AsyncIterator[str]:
+        await asyncio.sleep(self._delay_s)
+        for s in self._sentences:
+            self.result.reply_text += s
+            yield s
+
+
 # ---- happy path: ordered playback + first_audio_ms -------------------------
 
 
@@ -274,3 +302,48 @@ async def test_producer_stream_error_is_isolated() -> None:
     assert first_audio_ms is not None
     assert [c.decode() for c in tel.outbound_log[session.call_record_id]] == ["第一句。#0"]
     assert tts.active == 0
+
+
+# ---- time-gated filler (tts-cache-and-gated-filler § B) ---------------------
+
+
+async def test_filler_not_played_on_fast_turn() -> None:
+    """First audio arrives before filler_delay → filler never starts."""
+    session = _make_session()
+    tel = MockTelephonyClient(connect_delay_ms=0)
+    await _connected(tel, session.call_record_id)
+    tts = _RecordingTTS(chunks_per_sentence=1)
+    stream = _FakeStream(["你好。", "再见。"])
+    filler = _FakeFiller()
+
+    _first, played = await _play_streaming(
+        session, tel, tts, stream,  # type: ignore[arg-type]
+        voice_id="v", filler=filler, filler_delay_s=5.0,  # type: ignore[arg-type]
+        processing_start=time.monotonic(),
+    )
+    assert played is True
+    assert filler.start_called == 0  # fast turn — no filler
+
+
+async def test_filler_played_on_slow_turn() -> None:
+    """First audio delayed past filler_delay (slow LLM TTFT) → filler plays,
+    then stops when the real reply arrives."""
+    session = _make_session()
+    tel = MockTelephonyClient(connect_delay_ms=0)
+    await _connected(tel, session.call_record_id)
+    tts = _RecordingTTS(chunks_per_sentence=1)
+    stream = _SlowFirstSentenceStream(["你好。", "再见。"], delay_s=0.12)
+    filler = _FakeFiller()
+
+    _first, played = await _play_streaming(
+        session, tel, tts, stream,  # type: ignore[arg-type]
+        voice_id="v", filler=filler, filler_delay_s=0.03,  # type: ignore[arg-type]
+        processing_start=time.monotonic(),
+    )
+    assert played is True
+    assert filler.start_called == 1  # slow turn — filler masked the gap
+    assert filler.stop_called >= 1   # stopped when the real reply arrived
+    # The real reply still played in full.
+    assert [c.decode() for c in tel.outbound_log[session.call_record_id]] == [
+        "你好。#0", "再见。#0",
+    ]

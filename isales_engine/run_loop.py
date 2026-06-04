@@ -542,6 +542,11 @@ async def _main_turn_loop(
             # FILLER is off by default (streaming reaches first audio ~500ms).
             # When a campaign opts in, filler overlaps the main stream and is
             # preempted by the first main sentence — no blocking gate.
+            # Time-gated filler (tts-cache-and-gated-filler § B): build the
+            # manager but do NOT start it here — _play_streaming starts it only
+            # if the main reply's first audio hasn't begun within
+            # ``filler_delay_ms``. (Cached filler audio masks a slow LLM TTFT
+            # without polluting fast turns.)
             filler: FillerManager | None = None
             if config.filler_enabled and not is_wrap_up:
                 filler = FillerManager(
@@ -551,7 +556,6 @@ async def _main_turn_loop(
                     tts=providers.tts,
                     voice_id=config.voice_id,
                 )
-                await filler.start()
 
             # Spawn main streaming + referee (referee skipped during wrap-up).
             stream = run_pipeline_stream(
@@ -572,6 +576,7 @@ async def _main_turn_loop(
                 stream,
                 voice_id=config.voice_id,
                 filler=filler,
+                filler_delay_s=config.filler_delay_ms / 1000.0,
                 processing_start=processing_start,
             )
 
@@ -877,6 +882,7 @@ async def _play_streaming(
     *,
     voice_id: str,
     filler: FillerManager | None,
+    filler_delay_s: float = 0.6,
     processing_start: float,
 ) -> tuple[int | None, bool]:
     """Play the main LLM streaming reply via a producer/consumer pipeline.
@@ -929,6 +935,19 @@ async def _play_streaming(
         await job_q.put(None)  # completion sentinel (normal or handled-error)
 
     producer_task = asyncio.create_task(_producer(), name="tts_producer")
+
+    # Time-gated filler (tts-cache-and-gated-filler § B): only play a filler if
+    # the first real audio hasn't begun within ``filler_delay_s``. Fast turns
+    # never hear it; slow turns get a cached (zero-synth) filler masking the
+    # LLM TTFT. Cancelled + stopped the moment the first job plays.
+    filler_task: asyncio.Task[None] | None = None
+    if filler is not None:
+        async def _maybe_filler() -> None:
+            await asyncio.sleep(filler_delay_s)
+            if first_audio_ms is None:
+                await filler.start()
+        filler_task = asyncio.create_task(_maybe_filler(), name="filler_gate")
+
     current_job: _SynthJob | None = None
     filler_stopped = False
     try:
@@ -939,8 +958,13 @@ async def _play_streaming(
             job: _SynthJob = next_job  # narrowed non-Optional for the closure
             current_job = job
             if not filler_stopped and filler is not None:
-                # Preempt the filler audio channel with the real reply
-                # (same cancel path as 5/28 barge-in).
+                # First real audio is ready: cancel the pending filler timer
+                # and preempt any filler already playing (same cancel path as
+                # 5/28 barge-in).
+                if filler_task is not None:
+                    filler_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await filler_task
                 await filler.stop()
                 filler_stopped = True
 
@@ -977,6 +1001,10 @@ async def _play_streaming(
                 break
             current_job = None  # fully played — nothing to clean up
     finally:
+        if filler_task is not None:
+            filler_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await filler_task
         producer_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await producer_task

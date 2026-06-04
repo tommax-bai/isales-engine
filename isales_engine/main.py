@@ -33,6 +33,7 @@ from isales_engine.dial_consumer import dial_loop
 from isales_engine.event_consumer import subscribe_loop
 from isales_engine.event_publisher import EventPublisher
 from isales_engine.providers.factory import build_asr, build_llm, build_tts
+from isales_engine.providers.tts_cache import CachingTTSProvider, TtsCacheStore
 from isales_engine.realtime.mock_telephony import MockTelephonyClient
 from isales_engine.realtime.real_telephony import RealTelephonyClient
 from isales_engine.realtime.rtc_telephony import RtcTelephonyClient
@@ -166,6 +167,7 @@ def _make_runner(
     publisher: EventPublisher,
     settings: Settings,
     credentials: CredentialStore,
+    tts_cache: TtsCacheStore,
 ) -> Callable[[CallSession], Awaitable[None]]:
     """Return the ``runner`` callable consumed by ``dial_consumer.dial_loop``."""
 
@@ -211,7 +213,10 @@ def _make_runner(
                 store=credentials,
                 partial_stable_s=runtime.asr_partial_stable_s,
             ),
-            tts=build_tts(settings.engine_tts_provider, store=credentials),
+            tts=CachingTTSProvider(
+                build_tts(settings.engine_tts_provider, store=credentials),
+                tts_cache,
+            ),
         )
 
         # The DialCommand on the edge carries the scheduler-selected
@@ -293,12 +298,18 @@ async def _main() -> None:
 
     credentials = await _load_credentials(sessionmaker, settings)
 
+    # Process-level fixed-phrase TTS cache shared across all calls
+    # (tts-cache-and-gated-filler § A): greeting / silence / transfer / filler
+    # phrases synthesize once per process, then replay zero-synth.
+    tts_cache = TtsCacheStore()
+
     runner = _make_runner(
         sessionmaker=sessionmaker,
         telephony=telephony,
         publisher=publisher,
         settings=settings,
         credentials=credentials,
+        tts_cache=tts_cache,
     )
 
     async def _on_manual_hangup(call_record_id: int, _operator: str | None) -> None:

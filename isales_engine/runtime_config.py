@@ -57,6 +57,10 @@ class RuntimeConfig:
     # filler opt-in (pipeline-stream-and-referee). Default off — the streaming
     # main link reaches first audio in ~500ms so filler usually just adds delay.
     filler_enabled: bool = False
+    # filler time-gate in ms (tts-cache-and-gated-filler § B). Derived from
+    # campaign.filler_delay_ms; NULL → 600. Only play a filler when the main
+    # reply's first audio hasn't started within this window.
+    filler_delay_ms: int = 600
     # Continuous-interruption protection (ai-pipeline spec delta). Read by
     # run_loop._decide_protection. Stored at RuntimeConfig level (not on
     # InterruptionConfig) because the strategy is a campaign-level policy,
@@ -270,6 +274,11 @@ async def load_runtime_config(
     asr_eos_ms = campaign.asr_eos_silence_ms
     asr_partial_stable_s = (asr_eos_ms if asr_eos_ms is not None else 400) / 1000.0
 
+    # filler time-gate (tts-cache-and-gated-filler § B); NULL → 600ms.
+    filler_delay_ms = (
+        campaign.filler_delay_ms if campaign.filler_delay_ms is not None else 600
+    )
+
     strategy_value = (
         campaign.continuous_interruption_strategy
         if isinstance(campaign.continuous_interruption_strategy, str)
@@ -288,6 +297,7 @@ async def load_runtime_config(
         max_no_progress_seconds=campaign.max_no_progress_seconds,
         asr_partial_stable_s=asr_partial_stable_s,
         filler_enabled=campaign.filler_enabled,
+        filler_delay_ms=filler_delay_ms,
         _max_continuous_interruptions=campaign.max_continuous_interruptions,
         _continuous_interruption_strategy=strategy_value,
     )
