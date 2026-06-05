@@ -164,8 +164,13 @@ def test_build_asr_volcengine_with_credentials() -> None:
 
 
 def test_build_tts_volcengine_requires_credentials() -> None:
+    # TTS 构造下沉 isales-common 后, 缺凭据由 build_volcengine_tts 抛
+    # ProviderInvalidRequest (campaign-greeting-tts-preview § 决策 1), 不再是
+    # NotImplementedError — LLM / ASR 仍走 engine _require_field 的 NotImplementedError.
+    from isales_common.providers._errors import ProviderInvalidRequest
+
     empty_store = CredentialStore()
-    with pytest.raises(NotImplementedError, match="app_key"):
+    with pytest.raises(ProviderInvalidRequest, match="app_key"):
         build_tts("volcengine", store=empty_store)
 
 
