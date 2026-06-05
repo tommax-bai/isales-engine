@@ -55,6 +55,10 @@ class MainStreamResult:
     fallback_used: bool = False
     used_default_reply: bool = False
     error: str | None = None
+    # Timing instrumentation (ms from sentences() start): when the main LLM's
+    # first token / first splittable sentence arrived.
+    first_token_ms: int | None = None
+    first_sentence_ms: int | None = None
 
 
 class PipelineStream:
@@ -110,13 +114,25 @@ class PipelineStream:
         )
         start = time.monotonic()
         yielded_any = False
-        try:
-            token_stream = self._main_llm.chat_stream(
+
+        async def _timed_tokens() -> AsyncIterator[str]:
+            async for tok in self._main_llm.chat_stream(
                 messages,
                 temperature=self._config.main.temperature,
                 top_p=self._config.main.top_p,
-            )
-            async for sentence in split_sentences(token_stream):
+            ):
+                if self.result.first_token_ms is None:
+                    self.result.first_token_ms = int(
+                        (time.monotonic() - start) * 1000
+                    )
+                yield tok
+
+        try:
+            async for sentence in split_sentences(_timed_tokens()):
+                if self.result.first_sentence_ms is None:
+                    self.result.first_sentence_ms = int(
+                        (time.monotonic() - start) * 1000
+                    )
                 yielded_any = True
                 self.result.reply_text += sentence
                 yield sentence

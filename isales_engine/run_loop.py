@@ -452,6 +452,7 @@ async def _main_turn_loop(
                 continue
 
             user_text = outcome.text
+            turn_recv_at = time.monotonic()  # timing: user final reached the loop
             session.append_event("user_speech", text=user_text)
             if publisher is not None:
                 publisher.publish(
@@ -578,6 +579,28 @@ async def _main_turn_loop(
                 filler=filler,
                 filler_delay_s=config.filler_delay_ms / 1000.0,
                 processing_start=processing_start,
+            )
+
+            # Per-turn timing breakdown (ms), all relative to the user final
+            # reaching the loop (turn_recv_at):
+            #   recv→proc  : transfer/protection checks before PROCESSING
+            #   →llm_token : main LLM first token (TTFT)
+            #   →llm_sent  : main LLM first splittable sentence
+            #   →audio_out : first PCM chunk pushed toward DingRTC (first_audio_ms
+            #                is measured from processing_start, so add the
+            #                recv→proc offset for the recv-relative figure)
+            _recv_to_proc_ms = int((processing_start - turn_recv_at) * 1000)
+            logger.info(
+                "turn_timing user=%r recv_to_proc_ms=%s llm_first_token_ms=%s "
+                "llm_first_sentence_ms=%s first_audio_ms=%s "
+                "recv_to_audio_ms=%s main_dur_ms=%s",
+                user_text[:24],
+                _recv_to_proc_ms,
+                stream.result.first_token_ms,
+                stream.result.first_sentence_ms,
+                first_audio_ms,
+                (_recv_to_proc_ms + first_audio_ms) if first_audio_ms is not None else None,
+                stream.result.duration_ms,
             )
 
             # Await the referee decision (main TTS already played; this is the
