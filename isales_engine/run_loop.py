@@ -591,10 +591,11 @@ async def _main_turn_loop(
             #                recv→proc offset for the recv-relative figure)
             _recv_to_proc_ms = int((processing_start - turn_recv_at) * 1000)
             logger.info(
-                "turn_timing user=%r recv_to_proc_ms=%s llm_first_token_ms=%s "
-                "llm_first_sentence_ms=%s first_audio_ms=%s "
+                "turn_timing user=%r reply=%r recv_to_proc_ms=%s "
+                "llm_first_token_ms=%s llm_first_sentence_ms=%s first_audio_ms=%s "
                 "recv_to_audio_ms=%s main_dur_ms=%s",
                 user_text[:24],
+                stream.result.reply_text[:60],
                 _recv_to_proc_ms,
                 stream.result.first_token_ms,
                 stream.result.first_sentence_ms,
