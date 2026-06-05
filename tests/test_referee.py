@@ -1,4 +1,4 @@
-"""Tests for the referee module (pipeline-stream-and-referee)."""
+"""Tests for the referee module (engine-multi-referee-and-restructure)."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from isales_engine.referee import (
 )
 
 
-def _spec() -> RefereeSpec:
+def _spec(label: str = "main_judge") -> RefereeSpec:
     return RefereeSpec(
         role_config_id=2,
         prompt_version_id=8,
@@ -27,6 +27,7 @@ def _spec() -> RefereeSpec:
             "最近对话：\n{{recent_dialog_history}}\n输出 JSON。"
         ),
         model="qwen-turbo",
+        label=label,
     )
 
 
@@ -77,31 +78,39 @@ def test_recent_dialog_rounds_caps_at_3_rounds():
     assert recent[-1].text == "19"
 
 
-# ---- decision enums --------------------------------------------------------
+# ---- category output -------------------------------------------------------
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "payload,expected_decision,expected_goal",
+    "payload,expected_category",
     [
-        ({"decision": "continue", "goal_type": None, "confidence": 0.9}, "continue", None),
-        (
-            {"decision": "goal_achieved", "goal_type": "appointment", "confidence": 0.95},
-            "goal_achieved",
-            "appointment",
-        ),
-        (
-            {"decision": "customer_decline", "goal_type": None, "confidence": 0.88},
-            "customer_decline",
-            None,
-        ),
-        ({"decision": "transfer", "goal_type": None, "confidence": 0.9}, "transfer", None),
+        ({"category": "continue", "confidence": 0.9}, "continue"),
+        ({"category": "goal_achieved", "confidence": 0.95}, "goal_achieved"),
+        ({"category": "NEGATIVE", "confidence": 0.88}, "NEGATIVE"),
+        ({"category": "OPERATOR", "confidence": 0.9}, "OPERATOR"),
     ],
 )
-async def test_four_decisions(payload, expected_decision, expected_goal):
+async def test_category_passthrough(payload, expected_category):
     result = await run_referee(None, "好的", [], _spec(), _llm(payload))
-    assert result.decision == expected_decision
-    assert result.goal_type == expected_goal
+    assert result.label == "main_judge"
+    assert result.category == expected_category
+    assert result.confidence == payload["confidence"]
+    assert result.failopen_reason is None
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_not_downgraded_in_parser():
+    """The confidence floor is a decider concern — the parser keeps the raw
+    category + confidence so the decider can drive the low-confidence path."""
+    result = await run_referee(
+        None, "x", [], _spec(), _llm({"category": "goal_achieved", "confidence": 0.5})
+    )
+    assert result.category == "goal_achieved"
+    assert result.confidence == 0.5
+    # below the floor → not usable for rule matching
+    assert result.effective_category() is None
+    assert result.trace_category() == "low_confidence"
 
 
 # ---- fail-open paths -------------------------------------------------------
@@ -110,37 +119,16 @@ async def test_four_decisions(payload, expected_decision, expected_goal):
 @pytest.mark.asyncio
 async def test_fail_open_on_invalid_json():
     result = await run_referee(None, "x", [], _spec(), _raw_llm("not json at all"))
-    assert result.decision == "continue"
-    assert result.confidence == 0.0
+    assert result.category is None
+    assert result.failopen_reason == "invalid"
+    assert result.effective_category() is None
 
 
 @pytest.mark.asyncio
-async def test_fail_open_on_unknown_decision():
-    result = await run_referee(
-        None, "x", [], _spec(), _llm({"decision": "explode", "confidence": 0.9})
-    )
-    assert result.decision == "continue"
-
-
-@pytest.mark.asyncio
-async def test_low_confidence_downgraded_to_continue():
-    result = await run_referee(
-        None,
-        "x",
-        [],
-        _spec(),
-        _llm({"decision": "goal_achieved", "goal_type": "sale", "confidence": 0.5}),
-    )
-    assert result.decision == "continue"
-    assert result.confidence == 0.5
-
-
-@pytest.mark.asyncio
-async def test_goal_achieved_without_goal_type_downgrades():
-    result = await run_referee(
-        None, "x", [], _spec(), _llm({"decision": "goal_achieved", "confidence": 0.95})
-    )
-    assert result.decision == "continue"
+async def test_fail_open_on_missing_category():
+    result = await run_referee(None, "x", [], _spec(), _llm({"confidence": 0.9}))
+    assert result.category is None
+    assert result.failopen_reason == "invalid"
 
 
 @pytest.mark.asyncio
@@ -150,12 +138,13 @@ async def test_fail_open_on_llm_exception():
             raise RuntimeError("provider down")
 
     result = await run_referee(None, "x", [], _spec(), BoomLLM())
-    assert result.decision == "continue"
+    assert result.category is None
+    assert result.label == "main_judge"
 
 
 @pytest.mark.asyncio
 async def test_placeholder_substituted_into_prompt():
-    llm = _llm({"decision": "continue", "confidence": 0.9})
+    llm = _llm({"category": "continue", "confidence": 0.9})
     await run_referee(None, "周三方便", [DialogTurn(role="user", text="嗯", ts_ms=0)], _spec(), llm)
     system_msg = llm.calls[0].messages[0].content
     assert "周三方便" in system_msg

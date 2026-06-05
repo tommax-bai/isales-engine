@@ -38,7 +38,8 @@ class _FakeStream:
         self._sentences = sentences
         self.turn_id = turn_id
         self.result = SimpleNamespace(error=None, reply_text="")
-        self.referee_task = None
+        self.referee_tasks: list = []
+        self.is_restructure = False
 
     async def sentences(self) -> AsyncIterator[str]:
         for s in self._sentences:

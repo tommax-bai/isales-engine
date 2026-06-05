@@ -211,7 +211,8 @@ async def test_runner_forwards_device_id_hint_to_rtc_client(
         caller_id="+86133",
         prompt_versions_snapshot={
             "main_llm": None,
-            "referee_llm": None,
+            "referee_llms": [],
+            "restructure_llm": None,
             "extractor_llm": None,
             "wrap_up_appended": False,
         },
@@ -272,7 +273,8 @@ async def test_runner_skips_hint_for_mock_telephony(
         caller_id="+86133",
         prompt_versions_snapshot={
             "main_llm": None,
-            "referee_llm": None,
+            "referee_llms": [],
+            "restructure_llm": None,
             "extractor_llm": None,
             "wrap_up_appended": False,
         },

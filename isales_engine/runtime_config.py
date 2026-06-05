@@ -21,7 +21,12 @@ from isales_common.models import (
     RoleConfig,
 )
 from isales_common.schemas.messages.dial import DialRequest
-from isales_common.schemas.pipeline import ExtractorSpec, MainSpec, RefereeSpec
+from isales_common.schemas.pipeline import (
+    ExtractorSpec,
+    MainSpec,
+    RefereeSpec,
+    RestructureSpec,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -119,6 +124,9 @@ async def load_runtime_config(
                 return rc
         return None
 
+    def _all_enabled(kind: RoleKind) -> list[RoleConfig]:
+        return [rc for rc in role_configs if rc.kind == kind.value and rc.enabled]
+
     def _main_spec(rc: RoleConfig | None) -> MainSpec:
         if rc is None:
             # No main slot configured → empty prompt; main stream produces a
@@ -134,12 +142,7 @@ async def load_runtime_config(
             top_p=rc.top_p or 1.0,
         )
 
-    def _referee_spec(rc: RoleConfig | None) -> RefereeSpec:
-        if rc is None:
-            # No referee slot → empty prompt; run_referee fail-opens to continue.
-            return RefereeSpec(
-                role_config_id=0, prompt_version_id=0, system_prompt=""
-            )
+    def _referee_spec(rc: RoleConfig) -> RefereeSpec:
         model, prompt, pv_id = _spec_for(rc)
         return RefereeSpec(
             role_config_id=rc.id,
@@ -148,6 +151,22 @@ async def load_runtime_config(
             model=model,
             temperature=rc.temperature or 1.0,
             top_p=rc.top_p or 1.0,
+            # label binds routing rules; api enforces non-empty for referees.
+            label=rc.label or f"referee_{rc.id}",
+        )
+
+    def _restructure_spec(rc: RoleConfig | None) -> RestructureSpec | None:
+        if rc is None:
+            return None
+        model, prompt, pv_id = _spec_for(rc)
+        return RestructureSpec(
+            role_config_id=rc.id,
+            prompt_version_id=pv_id,
+            system_prompt=prompt,
+            model=model,
+            temperature=rc.temperature or 1.0,
+            top_p=rc.top_p or 1.0,
+            label=rc.label or f"restructure_{rc.id}",
         )
 
     def _extractor_spec(rc: RoleConfig | None) -> ExtractorSpec:
@@ -167,7 +186,11 @@ async def load_runtime_config(
 
     pipeline = PipelineConfig(
         main=_main_spec(_first(RoleKind.MAIN)),
-        referee=_referee_spec(_first(RoleKind.REFEREE)),
+        referees=[_referee_spec(rc) for rc in _all_enabled(RoleKind.REFEREE)],
+        restructure=_restructure_spec(_first(RoleKind.RESTRUCTURE)),
+        routing_rules=[dict(r) for r in (campaign.routing_rules or [])],
+        max_continuous_restructure=campaign.max_continuous_restructure,
+        primary_referee_label=campaign.primary_referee_label,
         extractor=_extractor_spec(_first(RoleKind.EXTRACTOR)),
         default_replies=[str(r) for r in (campaign.default_replies or [])],
         lead=LeadInfo(

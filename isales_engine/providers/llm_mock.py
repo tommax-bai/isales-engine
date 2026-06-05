@@ -29,7 +29,7 @@ from isales_common.providers._models import LLMResponse, Message
 from isales_common.providers.llm import LLMProvider
 
 # Must match isales_engine.referee._USER_PRIMER (referee user message).
-_REFEREE_PRIMER_MARK = "JSON schema 输出决策"
+_REFEREE_PRIMER_MARK = "JSON schema 输出"
 
 
 @dataclass
@@ -125,16 +125,20 @@ class KeywordDrivenMockLLM(LLMProvider):
             return "明白了。"
         return "好的，我明白了。请问您还有什么需要？"
 
-    # ---- Referee (JSON enum decision) -------------------------------------
+    # ---- Referee (JSON {category, confidence}) ----------------------------
+    # engine-multi-referee-and-restructure: a referee emits a free category
+    # string (not a strong decision enum). The categories below match the
+    # backward-compatible default routing rules seeded by the migration
+    # (goal_achieved / transfer / customer_decline; "continue" matches no rule).
     def _referee(self, system: str) -> _Decision:
         if re.search(r"预约|成功|约见|appointment", system):
-            payload = {"decision": "goal_achieved", "goal_type": "appointment", "confidence": 0.95}
+            payload = {"category": "goal_achieved", "confidence": 0.95}
         elif re.search(r"转人工|人工", system):
-            payload = {"decision": "transfer", "goal_type": None, "confidence": 0.9}
+            payload = {"category": "transfer", "confidence": 0.9}
         elif re.search(r"拒绝|不需要|没兴趣|do_not_call", system):
-            payload = {"decision": "customer_decline", "goal_type": None, "confidence": 0.9}
+            payload = {"category": "customer_decline", "confidence": 0.9}
         else:
-            payload = {"decision": "continue", "goal_type": None, "confidence": 0.9}
+            payload = {"category": "continue", "confidence": 0.9}
         return _Decision(content=json.dumps(payload, ensure_ascii=False))
 
     # ---- Transfer intent ---------------------------------------------------

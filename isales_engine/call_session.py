@@ -133,6 +133,14 @@ class CallSession:
     # monitor sees first non-whitelist partial; cleared on speech_end /
     # interruption.
     current_user_speech_started_ms: int | None = None
+    # restructure stream (engine-multi-referee-and-restructure D5). When a
+    # barge-in discards the main reply mid-stream, the not-yet-spoken sentence
+    # buffer text is captured here; the next turn's restructure rule (source=
+    # interrupt_remaining) re-voices it, then clears it. NULL → nothing pending.
+    interrupt_remaining_text: str | None = None
+    # Count of consecutive restructure turns; reset on any normal main reply.
+    # Caps repeated "let me rephrase" loops at max_continuous_restructure (D5).
+    consecutive_restructure_count: int = 0
     # Updated by _vad_monitor on every inbound audio frame — the current
     # consecutive voice-active duration (with hangover tolerance). Read by
     # _partial_monitor as a corroboration signal before cancelling.

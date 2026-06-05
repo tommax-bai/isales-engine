@@ -64,8 +64,9 @@ class MainStreamResult:
 class PipelineStream:
     """Handle for one streaming PROCESSING turn.
 
-    ``referee_task`` is the side-band decision task (``None`` during wrap-up).
-    ``result`` is populated once ``sentences()`` has been fully consumed.
+    ``referee_tasks`` are the side-band decision tasks (empty during wrap-up /
+    restructure). ``result`` is populated once ``sentences()`` has been fully
+    consumed.
     """
 
     def __init__(
@@ -78,6 +79,7 @@ class PipelineStream:
         *,
         is_wrap_up: bool,
         pipeline_timeout_ms: int,
+        restructure_text: str | None = None,
     ) -> None:
         self._session = session
         self._user_input = user_input
@@ -86,40 +88,78 @@ class PipelineStream:
         self._referee_llm = referee_llm
         self._is_wrap_up = is_wrap_up
         self._timeout_s = pipeline_timeout_ms / 1000.0
-        self.referee_task: asyncio.Task[RefereeResult] | None = None
+        # restructure mode (engine-multi-referee-and-restructure D4): when set,
+        # this stream re-voices ``restructure_text`` via the restructure slot
+        # with no dialog history and no referees.
+        self._restructure_text = restructure_text
+        # N parallel referee tasks (was a single referee_task). Empty during
+        # wrap-up / restructure turns. ``referee_labels`` is the parallel list of
+        # labels so the awaiter can build a labelled fail-open on timeout.
+        self.referee_tasks: list[asyncio.Task[RefereeResult]] = []
+        self.referee_labels: list[str] = []
         self.result = MainStreamResult()
         self.turn_id = 0
 
+    @property
+    def is_restructure(self) -> bool:
+        return self._restructure_text is not None
+
     def start(self) -> None:
-        """Spawn the referee task (concurrent with main streaming)."""
+        """Spawn the referee tasks (concurrent with main streaming).
+
+        One task per configured referee runs in parallel via the event loop
+        (awaited together later). No referees during wrap-up or restructure.
+        """
         self._session.current_turn_id += 1
         self.turn_id = self._session.current_turn_id
-        if not self._is_wrap_up:
-            recent = recent_dialog_rounds(self._session.dialog_history)
-            self.referee_task = asyncio.create_task(
-                run_referee(
-                    self._session,
-                    self._user_input,
-                    recent,
-                    self._config.referee,
-                    self._referee_llm,
-                ),
-                name=f"referee-turn-{self.turn_id}",
+        if self._is_wrap_up or self.is_restructure:
+            return
+        recent = recent_dialog_rounds(self._session.dialog_history)
+        for spec in self._config.referees:
+            self.referee_tasks.append(
+                asyncio.create_task(
+                    run_referee(
+                        self._session,
+                        self._user_input,
+                        recent,
+                        spec,
+                        self._referee_llm,
+                    ),
+                    name=f"referee-{spec.label}-turn-{self.turn_id}",
+                )
             )
+            self.referee_labels.append(spec.label)
 
-    async def sentences(self) -> AsyncGenerator[str, None]:
-        """Yield TTS-ready sentences from the main LLM streaming reply."""
-        messages = build_main_messages(
+    def _stream_params(self) -> tuple[float, float]:
+        """(temperature, top_p) for this stream's LLM slot."""
+        if self.is_restructure and self._config.restructure is not None:
+            return self._config.restructure.temperature, self._config.restructure.top_p
+        return self._config.main.temperature, self._config.main.top_p
+
+    def _build_messages(self) -> list[Message]:
+        if self.is_restructure and self._config.restructure is not None:
+            # D4: restructure input is ONLY {system: restructure_prompt,
+            # user: InterruptText} — no dialog_history, no latest utterance.
+            return [
+                Message(role="system", content=self._config.restructure.system_prompt),
+                Message(role="user", content=self._restructure_text or ""),
+            ]
+        return build_main_messages(
             self._session, self._config, is_wrap_up=self._is_wrap_up
         )
+
+    async def sentences(self) -> AsyncGenerator[str, None]:
+        """Yield TTS-ready sentences from the streaming reply (main/restructure)."""
+        messages = self._build_messages()
+        temperature, top_p = self._stream_params()
         start = time.monotonic()
         yielded_any = False
 
         async def _timed_tokens() -> AsyncIterator[str]:
             async for tok in self._main_llm.chat_stream(
                 messages,
-                temperature=self._config.main.temperature,
-                top_p=self._config.main.top_p,
+                temperature=temperature,
+                top_p=top_p,
             ):
                 if self.result.first_token_ms is None:
                     self.result.first_token_ms = int(
@@ -175,12 +215,13 @@ class PipelineStream:
 
     async def _chat_fallback(self, messages: list[Message]) -> AsyncIterator[str]:
         """One-shot non-streaming fallback (removal-tracked)."""
+        temperature, top_p = self._stream_params()
         try:
             async with asyncio.timeout(self._timeout_s):
                 resp = await self._main_llm.chat(
                     messages,
-                    temperature=self._config.main.temperature,
-                    top_p=self._config.main.top_p,
+                    temperature=temperature,
+                    top_p=top_p,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("main_chat_fallback_failed turn=%s: %s", self.turn_id, exc)
@@ -221,9 +262,38 @@ def run_pipeline_stream(
     return stream
 
 
+def run_restructure_stream(
+    session: CallSession,
+    restructure_text: str,
+    config: PipelineConfig,
+    llm: LLMProvider,
+    *,
+    pipeline_timeout_ms: int = 8000,
+) -> PipelineStream:
+    """Build + start a restructure :class:`PipelineStream` (no referees).
+
+    Re-voices ``restructure_text`` via the restructure slot. The caller plays
+    it through the same ``_play_streaming`` path and returns to LISTENING
+    without running referees (D4).
+    """
+    stream = PipelineStream(
+        session,
+        "",  # restructure ignores user_input
+        config,
+        llm,
+        llm,
+        is_wrap_up=False,
+        pipeline_timeout_ms=pipeline_timeout_ms,
+        restructure_text=restructure_text,
+    )
+    stream.start()
+    return stream
+
+
 __all__ = [
     "PipelineStream",
     "MainStreamResult",
     "run_pipeline_stream",
+    "run_restructure_stream",
     "PipelineConfig",
 ]

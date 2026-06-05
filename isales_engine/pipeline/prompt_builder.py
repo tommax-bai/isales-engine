@@ -18,7 +18,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from isales_common.providers._models import Message
-from isales_common.schemas.pipeline import ExtractorSpec, MainSpec, RefereeSpec
+from isales_common.schemas.pipeline import (
+    ExtractorSpec,
+    MainSpec,
+    RefereeSpec,
+    RestructureSpec,
+)
 
 from isales_engine.call_session import CallSession
 
@@ -58,10 +63,18 @@ class PipelineConfig:
     """
 
     main: MainSpec
-    referee: RefereeSpec
+    # engine-multi-referee-and-restructure: N parallel referees (was a single
+    # ``referee``) + an optional restructure (re-voice) slot + the campaign's
+    # ordered routing rules and restructure caps.
+    referees: list[RefereeSpec]
     extractor: ExtractorSpec
     default_replies: list[str]
     lead: LeadInfo
+    restructure: RestructureSpec | None = None
+    # Raw routing rules (list of dicts) as stored in campaign.routing_rules.
+    routing_rules: list[dict[str, Any]] = field(default_factory=list)
+    max_continuous_restructure: int = 2
+    primary_referee_label: str | None = None
     last_call_summary: str | None = None
     follow_up_count: int = 0
     short_reply_active: bool = False

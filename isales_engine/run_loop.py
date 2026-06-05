@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import random
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -46,8 +47,13 @@ from isales_common.schemas.messages.engine_event import (
 
 from isales_engine.call_session import CallSession
 from isales_engine.event_publisher import EventPublisher
+from isales_engine.pipeline.decider import DeciderAction, decide
 from isales_engine.pipeline.greeting import generate_greeting
-from isales_engine.pipeline.orchestrator import PipelineStream, run_pipeline_stream
+from isales_engine.pipeline.orchestrator import (
+    PipelineStream,
+    run_pipeline_stream,
+    run_restructure_stream,
+)
 from isales_engine.realtime.filler_manager import FillerManager
 from isales_engine.realtime.interruption_detector import (
     InterruptionConfig,
@@ -604,65 +610,33 @@ async def _main_turn_loop(
                 stream.result.duration_ms,
             )
 
-            # Await the referee decision (main TTS already played; this is the
-            # only place the main link "waits" on referee — fail-open continue).
-            referee_result, referee_trace_decision = await _await_referee(stream)
-
             # Token bookkeeping from the main streaming call.
             session.total_tokens_in += stream.result.tokens_in
             session.total_tokens_out += stream.result.tokens_out
 
-            session.pipeline_trace_records.append(
-                {
-                    "turn_id": stream.turn_id,
-                    "ts_start": ts_start,
-                    "ts_end": now_utc(),
-                    "user_input": user_text,
-                    "main_reply_text": stream.result.reply_text,
-                    "main_duration_ms": stream.result.duration_ms,
-                    "main_tokens_in": stream.result.tokens_in,
-                    "main_tokens_out": stream.result.tokens_out,
-                    "main_fallback_used": stream.result.fallback_used,
-                    "referee_decision": referee_trace_decision,
-                    "referee_goal_type": (
-                        referee_result.goal_type if referee_result else None
-                    ),
-                    "referee_confidence": (
-                        referee_result.confidence if referee_result else None
-                    ),
-                    "referee_duration_ms": (
-                        referee_result.duration_ms if referee_result else None
-                    ),
-                    "first_audio_ms": first_audio_ms,
-                    "error": stream.result.error,
-                }
-            )
-
-            goal_achieved = bool(
-                referee_result and referee_result.decision == "goal_achieved"
-            )
-            goal_type = (
-                referee_result.goal_type if (referee_result and goal_achieved) else ""
-            )
-            session.append_event(
-                "ai_reply",
-                text=stream.result.reply_text,
-                turn_id=stream.turn_id,
-                selected_role_config_id=config.pipeline.main.role_config_id or None,
-                goal_achieved=goal_achieved,
-                goal_type=goal_type or "",
-                # extracted is now produced post-call by the worker extractor.
-                extracted={},
-                is_wrap_up=is_wrap_up,
-                interrupted=not played,
-            )
-
             if not played:
-                # Real-time interruption fired: SPEAKING got cancelled. The
-                # parallel transfer-LLM detector is moot for this turn — cancel
-                # it so we don't wait on (or act on) a stale result.
+                # Real-time interruption fired mid main reply. The referees +
+                # transfer detector ran on the pre-interruption input and are
+                # now stale — cancel them. The not-yet-spoken sentence buffer was
+                # captured into session.interrupt_remaining_text by
+                # _play_streaming for a possible next-turn restructure.
+                _cancel_referees(stream)
                 if transfer_llm_task is not None:
                     transfer_llm_task.cancel()
+                session.pipeline_trace_records.append(
+                    _base_trace(stream, ts_start, user_text, first_audio_ms)
+                )
+                session.append_event(
+                    "ai_reply",
+                    text=stream.result.reply_text,
+                    turn_id=stream.turn_id,
+                    selected_role_config_id=config.pipeline.main.role_config_id or None,
+                    goal_achieved=False,
+                    goal_type="",
+                    extracted={},
+                    is_wrap_up=is_wrap_up,
+                    interrupted=True,
+                )
                 session.consecutive_interruption_count += 1
                 session.interruption_signaled = False
                 sm.transition_to(
@@ -673,20 +647,78 @@ async def _main_turn_loop(
             # Successful SPEAKING — clear the counter per spec.
             session.consecutive_interruption_count = 0
 
+            # Await all referees (main TTS already played; this is the only place
+            # the main link "waits" — each referee fail-opens), then route via the
+            # ordered routing-rule decider (first-match-wins).
+            referee_results = await _await_referees(stream)
+            restructure_enabled = config.pipeline.restructure is not None
+            action: DeciderAction = decide(
+                referee_results,
+                config.pipeline.routing_rules,
+                primary_referee_label=config.pipeline.primary_referee_label,
+                restructure_enabled=restructure_enabled,
+            )
+
+            # Resolve restructure InterruptText up front so the trace can record
+            # the source text and we know whether restructure actually fires.
+            restructure_text: str | None = None
+            restructure_capped = False
+            if action.kind == "restructure" and not is_wrap_up:
+                if (
+                    session.consecutive_restructure_count
+                    >= config.pipeline.max_continuous_restructure
+                ):
+                    restructure_capped = True  # D6: stop re-voicing, play default
+                else:
+                    restructure_text = _assemble_interrupt_text(session, action.source)
+
+            goal_achieved = (
+                action.kind == "transition"
+                and action.to == "goal_achieved"
+                and not is_wrap_up
+            )
+            goal_type = action.goal_type or "" if goal_achieved else ""
+
+            session.pipeline_trace_records.append(
+                {
+                    **_base_trace(stream, ts_start, user_text, first_audio_ms),
+                    "referee_results": [r.as_trace() for r in referee_results],
+                    "matched_rule": action.matched_rule,
+                    "restructure_active": restructure_text is not None,
+                    "restructure_trigger": (
+                        action.restructure_trigger if restructure_text is not None else None
+                    ),
+                    "restructure_source_text": restructure_text,
+                }
+            )
+
+            session.append_event(
+                "ai_reply",
+                text=stream.result.reply_text,
+                turn_id=stream.turn_id,
+                selected_role_config_id=config.pipeline.main.role_config_id or None,
+                goal_achieved=goal_achieved,
+                goal_type=goal_type or "",
+                # extracted is now produced post-call by the worker extractor.
+                extracted={},
+                is_wrap_up=is_wrap_up,
+                interrupted=False,
+            )
+
             # Parallel transfer-LLM detector (pipeline-latency-tail § D): resolve
-            # before referee-driven transitions. The referee's ``transfer``
-            # decision is the preferred path; only act on the dedicated detector
-            # when the referee did not already mark a transfer.
+            # before decider-driven transitions. The decider's transfer routing is
+            # the preferred path; only act on the dedicated detector when the
+            # decider did not already route a transfer.
             transfer_llm_decision = await _resolve_transfer_llm(transfer_llm_task)
-            referee_transfer = (
-                referee_result is not None
-                and referee_result.decision == "transfer"
+            action_transfer = (
+                action.kind == "transition"
+                and action.to == "transfer"
                 and not is_wrap_up
             )
             if (
                 transfer_llm_decision is not None
                 and transfer_llm_decision.triggered
-                and not referee_transfer
+                and not action_transfer
             ):
                 await _perform_handoff(
                     session, sm, telephony, providers.tts,
@@ -697,9 +729,9 @@ async def _main_turn_loop(
                 )
                 return
 
-            # ---- referee-driven state transitions (skipped during wrap-up) ----
-            if referee_result is not None and not is_wrap_up:
-                if referee_result.decision == "goal_achieved":
+            # ---- decider-driven outcome (skipped during wrap-up) ----
+            if not is_wrap_up:
+                if action.kind == "transition" and action.to == "goal_achieved":
                     sm.transition_to(
                         CallStatus.WRAPPING_UP, reason=goal_type or "goal_achieved"
                     )
@@ -714,8 +746,8 @@ async def _main_turn_loop(
                         "goal_achieved", goal_type=goal_type, extracted={}
                     )
                     continue
-                if referee_result.decision == "transfer":
-                    # Referee-driven transfer: no extra phrase (the main reply
+                if action.kind == "transition" and action.to == "transfer":
+                    # Decider-driven transfer: no extra phrase (the main reply
                     # already played) — just mark + hang up.
                     await _perform_handoff(
                         session, sm, telephony, providers.tts,
@@ -725,7 +757,7 @@ async def _main_turn_loop(
                         voice_id=config.voice_id,
                     )
                     return
-                if referee_result.decision == "customer_decline":
+                if action.kind == "transition" and action.to == "customer_decline":
                     sm.transition_to(
                         CallStatus.ACTIVATING, reason="customer_decline_recovery"
                     )
@@ -733,6 +765,41 @@ async def _main_turn_loop(
                         CallStatus.LISTENING, reason="customer_decline_done"
                     )
                     continue
+                if action.kind == "restructure":
+                    if restructure_capped:
+                        # D6: consecutive cap reached — stop re-voicing; play a
+                        # default reply (if any) and reset the counter.
+                        if config.pipeline.default_replies:
+                            await _play_tts(
+                                session, telephony, providers.tts,
+                                random.choice(config.pipeline.default_replies),
+                                voice_id=config.voice_id,
+                            )
+                        session.consecutive_restructure_count = 0
+                        sm.transition_to(
+                            CallStatus.LISTENING, reason="restructure_capped"
+                        )
+                        continue
+                    if restructure_text is not None:
+                        played_rs = await _run_restructure(
+                            session, telephony, providers, config, restructure_text,
+                            pipeline_timeout_ms=pipeline_timeout_ms,
+                        )
+                        session.consecutive_restructure_count += 1
+                        if not played_rs:
+                            session.consecutive_interruption_count += 1
+                            session.interruption_signaled = False
+                            sm.transition_to(
+                                CallStatus.INTERRUPTED, reason="restructure_interrupted"
+                            )
+                            continue
+                        sm.transition_to(
+                            CallStatus.LISTENING, reason="restructure_done"
+                        )
+                        continue
+                    # restructure degraded (no InterruptText available) → continue.
+                # Normal main reply (continue / degraded): reset restructure cap.
+                session.consecutive_restructure_count = 0
 
             if is_wrap_up:
                 session.wrap_up_round_count += 1
@@ -1041,6 +1108,16 @@ async def _play_streaming(
                 break
             current_job = None  # fully played — nothing to clean up
     finally:
+        # Barge-in remainder capture (engine-multi-referee-and-restructure D5 b):
+        # on a real interruption of the *main* reply, the not-yet-spoken sentence
+        # buffer (the interrupted sentence + still-queued sentences) is preserved
+        # so a next-turn restructure rule (source=interrupt_remaining) can
+        # re-voice it. Restructure turns don't re-capture (would loop). This does
+        # not change the discard timing / cancellation semantics below.
+        capture = not fully_played and not stream.is_restructure
+        captured: list[str] = []
+        if capture and current_job is not None:
+            captured.append(current_job.text)
         if filler_task is not None:
             filler_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1056,9 +1133,14 @@ async def _play_streaming(
         while not job_q.empty():
             pending_job = job_q.get_nowait()
             if pending_job is not None:
+                if capture:
+                    captured.append(pending_job.text)
                 await pending_job.aclose()
         if filler is not None:
             await filler.stop()
+        if capture:
+            remaining = "".join(captured).strip()
+            session.interrupt_remaining_text = remaining or None
     return first_audio_ms, fully_played
 
 
@@ -1102,7 +1184,7 @@ async def _resolve_transfer_llm(
 ) -> TransferDecision | None:
     """Await the parallel transfer-LLM detector with a fail-open budget.
 
-    Mirrors ``_await_referee``: ``None`` when no detector was spawned; on
+    Mirrors ``_await_referees``: ``None`` when no detector was spawned; on
     timeout / failure the task is cancelled and ``None`` returned (transfer
     never blocks or crashes the turn).
     """
@@ -1117,27 +1199,140 @@ async def _resolve_transfer_llm(
         return None
 
 
-async def _await_referee(
-    stream: PipelineStream,
-) -> tuple[RefereeResult | None, str | None]:
-    """Await the referee task with a 2s fail-open budget (ai-pipeline § 35).
+async def _await_referees(stream: PipelineStream) -> list[RefereeResult]:
+    """Await all N referee tasks with a per-referee 2s fail-open budget.
 
-    Returns ``(result, trace_decision)``. ``result`` is ``None`` only when no
-    referee was spawned (wrap-up). On timeout the task is cancelled and a
-    fail-open ``continue`` result is returned with trace label ``"timeout"``.
+    Returns one :class:`RefereeResult` per referee (empty when none were
+    spawned — wrap-up / restructure). A timed-out / errored referee yields a
+    labelled fail-open result so it simply matches no routing rule; one slow
+    referee never blocks the others (they are awaited concurrently).
     """
-    if stream.referee_task is None:
-        return None, None
-    try:
-        result = await asyncio.wait_for(
-            asyncio.shield(stream.referee_task), timeout=2.0
+    if not stream.referee_tasks:
+        return []
+
+    async def _await_one(task: asyncio.Task[RefereeResult], label: str) -> RefereeResult:
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        except TimeoutError:
+            task.cancel()
+            return RefereeResult.fail_open(label=label, reason="timeout")
+        except Exception:  # noqa: BLE001 — a referee failure never blocks the call
+            return RefereeResult.fail_open(label=label, reason="invalid")
+
+    return list(
+        await asyncio.gather(
+            *(
+                _await_one(t, label)
+                for t, label in zip(stream.referee_tasks, stream.referee_labels, strict=False)
+            )
         )
-    except TimeoutError:
-        stream.referee_task.cancel()
-        return RefereeResult.fail_open(), "timeout"
-    except Exception:  # noqa: BLE001 — referee failure never blocks the call
-        return RefereeResult.fail_open(), "invalid"
-    return result, result.decision
+    )
+
+
+def _cancel_referees(stream: PipelineStream) -> None:
+    """Cancel any still-running referee tasks (e.g. when a barge-in makes their
+    pre-interruption input stale)."""
+    for task in stream.referee_tasks:
+        if not task.done():
+            task.cancel()
+
+
+def _assemble_interrupt_text(session: CallSession, source: str | None) -> str | None:
+    """Build the restructure InterruptText for the matched source (D5).
+
+    ``interrupt_remaining`` consumes (and clears) the captured barge-in
+    remainder, degrading to ``last_reply`` when empty. ``last_reply`` (also the
+    low-confidence trigger) takes the last assistant utterance in
+    dialog_history. Returns ``None`` when nothing is available (→ restructure
+    degrades to continue).
+    """
+    if source == "interrupt_remaining":
+        remaining = session.interrupt_remaining_text
+        session.interrupt_remaining_text = None  # take-and-clear
+        if remaining and remaining.strip():
+            return remaining
+        source = "last_reply"  # degrade
+    # last_reply (and low_confidence): last assistant utterance.
+    for turn in reversed(session.dialog_history):
+        if turn.role == "assistant" and turn.text.strip():
+            return turn.text
+    return None
+
+
+def _base_trace(
+    stream: PipelineStream,
+    ts_start: object,
+    user_text: str,
+    first_audio_ms: int | None,
+) -> dict[str, object]:
+    """The main-LLM portion of a pipeline_trace record (referee/restructure
+    fields are merged in by the caller)."""
+    return {
+        "turn_id": stream.turn_id,
+        "ts_start": ts_start,
+        "ts_end": now_utc(),
+        "user_input": user_text,
+        "main_reply_text": stream.result.reply_text,
+        "main_duration_ms": stream.result.duration_ms,
+        "main_tokens_in": stream.result.tokens_in,
+        "main_tokens_out": stream.result.tokens_out,
+        "main_fallback_used": stream.result.fallback_used,
+        "referee_results": [],
+        "matched_rule": None,
+        "restructure_active": False,
+        "restructure_trigger": None,
+        "restructure_source_text": None,
+        "first_audio_ms": first_audio_ms,
+        "error": stream.result.error,
+    }
+
+
+async def _run_restructure(
+    session: CallSession,
+    telephony: TelephonyClient,
+    providers: Providers,
+    config: RuntimeConfig,
+    interrupt_text: str,
+    *,
+    pipeline_timeout_ms: int,
+) -> bool:
+    """Run + play the restructure stream and record its ai_reply.
+
+    Re-voices ``interrupt_text`` via the restructure slot (no referees). Returns
+    whether it fully played (False on barge-in). The caller drives state.
+    """
+    rs = run_restructure_stream(
+        session,
+        interrupt_text,
+        config.pipeline,
+        providers.llm,
+        pipeline_timeout_ms=pipeline_timeout_ms,
+    )
+    _first_audio, played = await _play_streaming(
+        session,
+        telephony,
+        providers.tts,
+        rs,
+        voice_id=config.voice_id,
+        filler=None,
+        filler_delay_s=config.filler_delay_ms / 1000.0,
+        processing_start=time.monotonic(),
+    )
+    restructure_rc_id = (
+        config.pipeline.restructure.role_config_id if config.pipeline.restructure else 0
+    )
+    session.append_event(
+        "ai_reply",
+        text=rs.result.reply_text,
+        turn_id=rs.turn_id,
+        selected_role_config_id=restructure_rc_id or None,
+        goal_achieved=False,
+        goal_type="",
+        extracted={},
+        is_wrap_up=False,
+        interrupted=not played,
+    )
+    return played
 
 
 async def _play_chunks(
