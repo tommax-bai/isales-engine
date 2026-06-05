@@ -19,7 +19,6 @@ from isales_common.models import (
     Lead,
     PromptVersion,
     RoleConfig,
-    VoiceModel,
 )
 from isales_common.schemas.messages.dial import DialRequest
 from isales_common.schemas.pipeline import ExtractorSpec, MainSpec, RefereeSpec
@@ -269,17 +268,11 @@ async def load_runtime_config(
     # ``generate_greeting(fixed_template=None)`` branch).
     fixed_greeting: str | None = campaign.greeting
 
-    # Resolve the campaign's selected voice to the vendor speaker string the
-    # TTS provider expects (campaign-greeting-tts-preview). ``campaign.voice_id``
-    # is the VoiceModel FK; ``VoiceModel.voice_id`` is the vendor speaker name
-    # (e.g. "zh_female_xiaohe_uranus_bigtts"). NULL / missing row → "default",
-    # which the provider maps to its own default speaker. This makes the real
-    # call honour the campaign's voice selection, matching the web 试听.
-    voice_speaker = "default"
-    if campaign.voice_id is not None:
-        voice = await db.get(VoiceModel, campaign.voice_id)
-        if voice is not None:
-            voice_speaker = voice.voice_id
+    # ``campaign.voice_id`` now holds the vendor speaker string directly
+    # (campaign-greeting-tts-preview § 4C — admin types it in the form), so the
+    # engine passes it straight to the TTS provider. NULL / empty → "default",
+    # which the provider maps to its own default speaker. Matches the web 试听.
+    voice_speaker = campaign.voice_id or "default"
 
     # ASR EOS endpoint (pipeline-latency-tail § A). campaign.asr_eos_silence_ms
     # is ms; NULL → engine default 400ms. Convert to seconds for the ASR
