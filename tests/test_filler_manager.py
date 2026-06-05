@@ -57,16 +57,38 @@ async def _new_mock_telephony(call_id: int = 1) -> MockTelephonyClient:
 # ---- selection -------------------------------------------------------------
 
 
-async def test_filler_skip_when_no_ready_phrase() -> None:
+async def test_filler_skip_when_text_empty() -> None:
+    """filler spec § 失败兜底 — empty phrase text is skipped silently."""
+
     session = _session()
     tel = await _new_mock_telephony()
     tts = TextLengthMockTTS(pcm_bytes_per_char=10)
-    sets = [_set(1, (1, "hi", "pending"))]
+    sets = [_set(1, (1, "   ", "pending"))]
     fm = FillerManager(session, sets, telephony=tel, tts=tts)
     await fm.start()
     await fm.wait_finished()
     assert tel.outbound_log[1] == []
     assert all(e["type"] != "filler" for e in session.full_transcript)
+
+
+async def test_filler_plays_pending_phrase_via_realtime_synth() -> None:
+    """v1.0 (filler spec § 预生成 + 动态补充音频): a phrase with non-empty
+    text is synthesized live regardless of audio_url / generation_status —
+    gating on those stage-6 OSS fields would make filler never fire."""
+
+    session = _session()
+    tel = await _new_mock_telephony()
+    tts = TextLengthMockTTS(pcm_bytes_per_char=10)
+    # pending → audio_url is None via _set helper; must still play.
+    sets = [_set(1, (1, "嗯稍等", "pending"))]
+    fm = FillerManager(session, sets, telephony=tel, tts=tts)
+    await fm.start()
+    await fm.wait_finished()
+
+    assert len(tel.outbound_log[1]) > 0  # PCM forwarded despite no audio_url
+    fillers = [e for e in session.full_transcript if e["type"] == "filler"]
+    assert len(fillers) == 1
+    assert fillers[0]["filler_phrase_id"] == 1
 
 
 async def test_filler_picks_ready_phrase_and_writes_event() -> None:

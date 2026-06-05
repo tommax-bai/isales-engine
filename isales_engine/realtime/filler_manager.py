@@ -3,10 +3,11 @@
 Spec: filler § all Requirements.
 
 The orchestrator (PR #6) launches a PROCESSING turn; in parallel the
-``FillerManager`` selects a phrase, downloads its pre-generated audio, and
-streams it via the telephony client. When the pipeline returns a reply,
-``CallSession.run()`` (PR #11) calls ``await wait_finished()`` before
-starting the reply TTS so the conversation rhythm stays consistent.
+``FillerManager`` selects a phrase, synthesizes its audio in real time via
+the (cache-wrapped) TTS provider, and streams it via the telephony client.
+When the pipeline returns a reply, ``CallSession.run()`` (PR #11) calls
+``await wait_finished()`` before starting the reply TTS so the conversation
+rhythm stays consistent.
 
 Selection rules (filler spec § 多 filler_set 轮询 + § 集合内随机不重复):
 
@@ -14,8 +15,11 @@ Selection rules (filler spec § 多 filler_set 轮询 + § 集合内随机不重
   stability), wrapping around forever.
 * Each call session keeps a per-set "used" set of phrase ids; pick one not
   in that set; if all are used, reset and pick again.
-* Phrases without a ready audio URL are skipped silently — no anonymous
-  fallback.
+* Phrases with empty text are skipped silently — no anonymous fallback.
+  ``audio_url`` / ``generation_status`` are *not* selection gates in v1.0:
+  they belong to the stage-6 OSS pre-render path, which has no producer yet,
+  so gating on them would make filler never fire (see filler spec §
+  预生成 + 动态补充音频).
 
 The manager is *passive* w.r.t. interruption: when the interruption detector
 fires (PR #8) it calls ``stop()`` which cancels the playback task.
@@ -30,7 +34,6 @@ import random
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
-from isales_common.enums import GenerationStatus
 from isales_common.providers.tts import TTSProvider
 
 from isales_engine.call_session import CallSession
@@ -125,11 +128,12 @@ class FillerManager:
             chosen_set = self._sets[set_idx]
             self._session.current_filler_set_index += 1
 
-            ready = [
-                p
-                for p in chosen_set.phrases
-                if p.generation_status == GenerationStatus.READY.value and p.audio_url
-            ]
+            # v1.0 selects on text only — the phrase is synthesized live in
+            # _stream_audio. audio_url / generation_status are stage-6 OSS
+            # fields with no producer yet; gating on them = filler never fires.
+            # Stage-6 (OSS + regenerate_filler_audio worker) restores an
+            # "audio_url ready → stream, else synth" branch in a separate change.
+            ready = [p for p in chosen_set.phrases if p.text.strip()]
             if not ready:
                 continue
 
@@ -179,11 +183,14 @@ class FillerManager:
             )
 
     async def _stream_audio(self, phrase: FillerPhraseSpec) -> int:
-        """Generate audio chunks via TTS and forward them to the telephony out path.
+        """Synthesize the phrase live via TTS and forward chunks to telephony.
 
-        Real production stage 6 will skip TTS and stream the pre-rendered
-        audio file from OSS; for stage 4 we run the mock TTS which emits PCM
-        deterministically based on the phrase text.
+        v1.0 path: the TTS provider is cache-wrapped (CachingTTSProvider), so
+        a repeated (text, voice_id) replays cached PCM with no re-synthesis.
+        ``phrase.audio_url`` is intentionally unused here — stage-6 (OSS +
+        regenerate_filler_audio worker) will add an "audio_url ready → stream
+        the pre-rendered file, else synth" branch in a separate change once
+        that worker exists.
         """
 
         async def chunks() -> AsyncIterator[bytes]:
