@@ -181,6 +181,20 @@ class _CallState:
             audioop = None
         target_rate = 16000
         ratecv_state: Any = None
+        # asr-noise-gate (experiment 2026-06-05) ----------------------------
+        # 与 asr_volcengine._push_audio 的 100ms 攒包配套使用。喂 ASR 那一路里,
+        # 低于阈值且已连续静音超过 hangover 的帧, 替换成数字静音 (全 0 PCM),
+        # 让 vendor 在规格正确的包下按 end_window_size(400ms) 及时切句。
+        # VAD 那一路 (self.vad_q) 保持原始音频, 不门控 (barge-in 检测要原信号)。
+        # 阈值/hangover 走 env; gate_rms=0 关闭。
+        # Removal/promote trigger: 真机验证空档塌到 <1s 且不碎句/不削轻声用户 →
+        # 固化为 campaign 配置 + 落 openspec change; 若碎句/削轻声, 回退本块。
+        import os as _os  # noqa: PLC0415
+        _gate_rms = int(_os.environ.get("ISALES_ASR_NOISE_GATE_RMS", "1500"))
+        _gate_hangover_ms = float(_os.environ.get("ISALES_ASR_NOISE_GATE_HANGOVER_MS", "300"))
+        _gate_silence_ms = 0.0
+        _gate_active = False
+        # asr-noise-gate end -------------------------------------------------
         # DIAG-REMOVE-AFTER-MIC-DEBUG begin ----------------------------------
         recv_count = 0
         last_log_t = _time.monotonic()
@@ -291,7 +305,27 @@ class _CallState:
                         _final_rms = audioop.rms(pcm, 2)
                     except Exception:  # noqa: BLE001
                         pass
-                await self.inbound_q.put(pcm)
+                # asr-noise-gate: 见 _inbound_loop 顶部说明。低于阈值且已连续
+                # 静音超过 hangover → 喂 vendor 数字静音, 触发 end_window 及时切句。
+                _asr_pcm = pcm
+                if _gate_rms > 0 and pcm:
+                    _frame_ms = (len(pcm) / 2.0) / (target_rate / 1000.0)
+                    if _final_rms >= _gate_rms:
+                        _gate_silence_ms = 0.0
+                    else:
+                        _gate_silence_ms += _frame_ms
+                        if _gate_silence_ms > _gate_hangover_ms:
+                            _asr_pcm = b"\x00" * len(pcm)
+                    _now_gating = _asr_pcm is not pcm
+                    if _now_gating != _gate_active:
+                        _gate_active = _now_gating
+                        logger.info(
+                            "asr_noise_gate sid=%s state=%s final_rms=%s "
+                            "silence_ms=%.0f gate_rms=%s",
+                            self.sid, "ENGAGED" if _now_gating else "RELEASED",
+                            _final_rms, _gate_silence_ms, _gate_rms,
+                        )
+                await self.inbound_q.put(_asr_pcm)
                 # Fork the same PCM to the VAD lane. Non-blocking put_nowait
                 # would risk dropping frames; await is safe because the VAD
                 # monitor drains as fast as ASR.

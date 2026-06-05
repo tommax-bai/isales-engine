@@ -387,22 +387,33 @@ class VolcengineASRProvider(ASRProvider):
             ))
 
             async def _push_audio() -> None:
-                """Push every inbound PCM chunk to the vendor, continuously.
+                """Push inbound PCM to the vendor batched into ~100ms packets.
 
-                No per-turn EOS / close: the connection lives for the whole
-                call and the vendor segments turns via end_window_size.
+                Vendor SAUC doc 明确: 单包 100~200ms、发包间隔 100~200ms,
+                "不能过大或者过小,否则均会影响性能"。上游 DingRTC 是 10ms 帧,
+                若 1:1 转发 (~100 包/s) 比规格小 10-20×, 实测 (call 150/151)
+                导致 definite finalize 拖到 1-4s + keepalive ping timeout 重连。
+                这里攒到 ~100ms (sample_rate × 0.1 × 2B) 成一包再发。
+                连续音频保证 buffer 每 100ms 满一次, 不会饿死。
+                No per-turn EOS / close: 连接活满整通, vendor 按 end_window_size
+                切句 (配合上游 asr-noise-gate 喂真静音让 end_window 及时触发)。
                 """
+                target_bytes = int(self._sample_rate * 0.1) * 2  # 100ms mono int16
+                buf = bytearray()
                 try:
                     async for chunk in audio_chunks:
                         if not chunk:
                             continue
-                        await ws.send(_encode_frame(
-                            msg_type=MSG_AUDIO_ONLY_REQUEST,
-                            flags=FLAGS_NO_SEQ,
-                            serialization=SERIALIZATION_RAW,
-                            compression=COMPRESSION_NONE,
-                            payload=chunk,
-                        ))
+                        buf += chunk
+                        while len(buf) >= target_bytes:
+                            await ws.send(_encode_frame(
+                                msg_type=MSG_AUDIO_ONLY_REQUEST,
+                                flags=FLAGS_NO_SEQ,
+                                serialization=SERIALIZATION_RAW,
+                                compression=COMPRESSION_NONE,
+                                payload=bytes(buf[:target_bytes]),
+                            ))
+                            del buf[:target_bytes]
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001
