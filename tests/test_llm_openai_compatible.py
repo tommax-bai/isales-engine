@@ -225,3 +225,51 @@ async def test_real_chat_with_timeout_raises_provider_timeout() -> None:
     )
     with pytest.raises((ProviderTimeout, ProviderServerError)):
         await provider.chat([Message(role="user", content="x")])
+
+
+# ---- connection reuse (pipeline-latency-tail § C, extended to LLM) ----------
+
+
+def _ok_chat_response() -> dict[str, Any]:
+    return {
+        "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+
+
+async def test_reuses_persistent_client_across_calls() -> None:
+    """Consecutive chat() calls go through the same provider-lived client —
+    no per-call client rebuild (avoids a TLS handshake per turn)."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=_ok_chat_response())
+
+    provider = OpenAICompatibleLLMProvider(
+        provider="openai",
+        api_key="sk-test",
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o-mini",
+        transport=httpx.MockTransport(handler),
+    )
+    client_before = provider._http
+    for _ in range(3):
+        await provider.chat([Message(role="user", content="hi")])
+
+    assert calls["n"] == 3
+    assert provider._http is client_before  # same client reused every turn
+    assert provider._http.is_closed is False
+
+
+async def test_aclose_releases_client() -> None:
+    provider = OpenAICompatibleLLMProvider(
+        provider="openai",
+        api_key="sk-test",
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o-mini",
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=_ok_chat_response())),
+    )
+    assert provider._http.is_closed is False
+    await provider.aclose()
+    assert provider._http.is_closed is True

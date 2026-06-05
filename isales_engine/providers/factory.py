@@ -134,8 +134,18 @@ def build_llm(
 
 
 def build_asr(
-    name: str, *, store: CredentialStore | None = None
+    name: str,
+    *,
+    store: CredentialStore | None = None,
+    partial_stable_s: float | None = None,
 ) -> ASRProvider:
+    """Return an ASR provider instance.
+
+    ``partial_stable_s`` overrides the provider's default EOS endpoint
+    (pipeline-latency-tail § A — fed from campaign.asr_eos_silence_ms via
+    load_runtime_config). None keeps the provider default. Ignored for the
+    mock provider, which has no endpoint detection.
+    """
     if name == "mock":
         return ScriptedMockASR()
     if name not in KNOWN_ASR_PROVIDERS:
@@ -145,14 +155,37 @@ def build_asr(
         )
     s = _require(store, name)
     if name == "volcengine":
+        # 豆包 V3 SAUC ASR 两套鉴权 (vendor 文档 § 鉴权), 跟 TTS V3 同一模型:
+        #   1. 新版控制台: X-Api-Key 单 UUID (provider_credential.volcengine.api_key)
+        #   2. 旧版控制台: X-Api-App-Key + X-Api-Access-Key (复用 volcengine.app_key
+        #      / app_token 的现存值, 注意 ASR 用 X-Api-App-Key header 名,TTS 用
+        #      X-Api-App-Id, vendor 文档命名不一致但本质同一字段)
+        # resource_id 决定 ASR 模型版本 (volc.bigasr.sauc.duration 1.0 /
+        # volc.seedasr.sauc.duration 2.0 / .concurrent 并发版).
+        from isales_engine.providers.asr_volcengine import (  # noqa: PLC0415
+            DEFAULT_ASR_RESOURCE_ID,
+            VolcengineASRProvider,
+        )
+
+        api_key = s.get("volcengine", "api_key")
+        resource_id = (
+            s.get("volcengine", "asr_resource_id") or DEFAULT_ASR_RESOURCE_ID
+        )
+        # None lets the provider keep its own DEFAULT_PARTIAL_STABLE_S.
+        if api_key:
+            return VolcengineASRProvider(
+                api_key=api_key,
+                resource_id=resource_id,
+                partial_stable_s=partial_stable_s,
+            )
+        # legacy fallback
         app_key = _require_field(s, "volcengine", "app_key")
         app_token = _require_field(s, "volcengine", "app_token")
-        from isales_engine.providers.asr_volcengine import VolcengineASRProvider
-
         return VolcengineASRProvider(
-            endpoint=s.get("volcengine", "asr_endpoint") or _DEFAULT_ENDPOINT["volcengine_asr"],
             app_key=app_key,
-            app_token=app_token,
+            access_key=app_token,
+            resource_id=resource_id,
+            partial_stable_s=partial_stable_s,
         )
     raise NotImplementedError(name)  # pragma: no cover
 
@@ -169,13 +202,10 @@ def build_tts(
         )
     s = _require(store, name)
     if name == "volcengine":
-        app_key = _require_field(s, "volcengine", "app_key")
-        app_token = _require_field(s, "volcengine", "app_token")
-        from isales_engine.providers.tts_volcengine import VolcengineTTSProvider
+        # 豆包 V3 SSE TTS 构造统一下沉到 isales-common, 供 engine + api 共用
+        # (campaign-greeting-tts-preview § 决策 1). 新版 X-Api-Key 优先, 没配
+        # 再降旧版 app_key/app_token 三件套; resource_id 决定模型 SKU.
+        from isales_common.providers.tts_volcengine import build_volcengine_tts
 
-        return VolcengineTTSProvider(
-            endpoint=s.get("volcengine", "tts_endpoint") or _DEFAULT_ENDPOINT["volcengine_tts"],
-            app_key=app_key,
-            app_token=app_token,
-        )
+        return build_volcengine_tts(s)
     raise NotImplementedError(name)  # pragma: no cover

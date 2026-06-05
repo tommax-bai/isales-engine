@@ -1,26 +1,32 @@
 """Call state machine.
 
-Spec: call-state-machine § Requirement: 状态集合 / 关键状态转换;
-      impl-engine spec delta § Scenario "非法转移抛异常并写 state_error".
+Spec: call-state-machine § Requirement: 状态集合 / 关键状态转换 /
+      § "非法 transition 改 advisory 警告".
 
 The single allowed mutation entry point is :meth:`StateMachine.transition_to`.
 Any caller (orchestrator / filler / silence / transfer / wrap_up) goes through
 this method so transcript events stay aligned with state changes.
 
-Illegal transitions raise :class:`IllegalTransition` and append a
-``state_error`` event to ``full_transcript``. Callers decide whether to ignore
-(stay in current state) or force a terminal transition via ``force=True``
-(used for ``END(reason="engine_internal_error")``).
+Transition guard is **advisory**: a transition not listed in
+``LEGAL_TRANSITIONS`` emits a ``state_warning`` transcript event +
+``logger.warning("state_transition_unusual ...")`` log line, but **does NOT
+block the transition** — ``session.state`` is updated unconditionally.
+``IllegalTransition`` is retained for import compatibility but is never raised.
+Rationale: see spec call-state-machine § "非法 transition 改 advisory 警告".
 """
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from isales_common.enums import CallStatus
 
 if TYPE_CHECKING:
     from isales_engine.call_session import CallSession
+
+
+logger = logging.getLogger(__name__)
 
 
 CallState = CallStatus
@@ -99,7 +105,12 @@ LEGAL_TRANSITIONS: dict[CallState, set[CallState]] = {
 
 
 class IllegalTransition(RuntimeError):
-    """Raised when a non-``force`` ``transition_to`` violates ``LEGAL_TRANSITIONS``."""
+    """Retained for import compatibility; ``transition_to`` no longer raises it.
+
+    Kept as a class definition so existing ``except IllegalTransition`` blocks
+    (if any) and ``from isales_engine.state_machine import IllegalTransition``
+    imports keep working. A followup change cleans up dead handlers.
+    """
 
     def __init__(self, from_state: CallState, to_state: CallState, reason: str | None = None):
         self.from_state = from_state
@@ -127,20 +138,28 @@ class StateMachine:
     ) -> None:
         """Move ``session.state`` to ``new_state``.
 
-        On illegal transitions, append ``state_error`` to ``full_transcript``
-        and raise :class:`IllegalTransition`. ``force=True`` skips the legality
-        check (used for unrecoverable shutdowns into ``END``).
+        Transitions not present in ``LEGAL_TRANSITIONS[current]`` are
+        **advisory-only**: a ``state_warning`` event is appended to
+        ``full_transcript`` and a ``state_transition_unusual`` warning is
+        logged, but the transition still completes. ``force=True`` is retained
+        for backward-compat with the 8 existing END-shutdown callers but no
+        longer has any behavioral effect (the guard never blocks).
         """
 
         current = self._session.state
-        if not force and new_state not in LEGAL_TRANSITIONS.get(current, set()):
+        if new_state not in LEGAL_TRANSITIONS.get(current, set()):
+            logger.warning(
+                "state_transition_unusual current=%s new=%s reason=%s",
+                current.value,
+                new_state.value,
+                reason,
+            )
             self._session.append_event(
-                "state_error",
+                "state_warning",
                 attempted=reason or "transition",
                 from_state=current.value,
                 to_state=new_state.value,
             )
-            raise IllegalTransition(current, new_state, reason=reason)
 
         self._session.previous_state = current
         self._session.state = new_state

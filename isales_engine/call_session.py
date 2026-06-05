@@ -41,7 +41,12 @@ TRANSCRIPT_EVENT_TYPES: frozenset[str] = frozenset(
         "hangup",
         # Engine-internal events introduced by impl-engine spec deltas.
         "state_changed",
+        # state_error: historical, written by transition_to pre-soften-guard.
+        # state_warning: current, written when a transition falls outside
+        # LEGAL_TRANSITIONS (advisory, non-blocking). See call-state-machine
+        # § "非法 transition 改 advisory 警告".
         "state_error",
+        "state_warning",
     }
 )
 
@@ -74,6 +79,12 @@ class CallSession:
     # Threaded through to RtcTelephonyClient.set_device_for_session so
     # DialCommand.device_id reaches the edge.
     device_id: int = 0
+
+    # post-call extractor (pipeline-stream-and-referee): the extractor slot ids
+    # stashed by run_session so finalize_session can LPUSH the isales:extract
+    # task. 0 → no extractor configured → no extract LPUSH.
+    extractor_role_config_id: int = 0
+    extractor_prompt_version_id: int = 0
 
     # Mutable state.
     state: CallStatus = CallStatus.INIT
@@ -122,6 +133,21 @@ class CallSession:
     # monitor sees first non-whitelist partial; cleared on speech_end /
     # interruption.
     current_user_speech_started_ms: int | None = None
+    # restructure stream (engine-multi-referee-and-restructure D5). When a
+    # barge-in discards the main reply mid-stream, the not-yet-spoken sentence
+    # buffer text is captured here; the next turn's restructure rule (source=
+    # interrupt_remaining) re-voices it, then clears it. NULL → nothing pending.
+    interrupt_remaining_text: str | None = None
+    # Count of consecutive restructure turns; reset on any normal main reply.
+    # Caps repeated "let me rephrase" loops at max_continuous_restructure (D5).
+    consecutive_restructure_count: int = 0
+    # Updated by _vad_monitor on every inbound audio frame — the current
+    # consecutive voice-active duration (with hangover tolerance). Read by
+    # _partial_monitor as a corroboration signal before cancelling.
+    # (The original "guards against DingRTC self-loopback ASR mis-transcription"
+    # rationale is retracted 2026-06-04 — unsupported by evidence; this gate
+    # is pending re-evaluation. See run_loop.py voice_rms_threshold note.)
+    vad_voice_active_ms: int = 0
 
     # Token budget bookkeeping (impl-engine-providers PR #7).
     total_tokens_in: int = 0

@@ -161,8 +161,15 @@ def _pack_service(channel_id: str, user_id: str, privilege: int | None) -> bytes
 
 
 def _pack_options(engine_options: dict[str, str] | None) -> bytes:
+    # Vendor's reference impl distinguishes ``None`` (omit options block, 1
+    # byte ``False``) from an empty dict (emit block header with count 0, 5
+    # bytes ``True`` + ``uint32(0)``). DingRTC 3.x's GSLB verifier — and its
+    # console "Token生成器" — defaults engine_options to an empty dict, so a
+    # ``None`` here produces a token whose body bytes differ from vendor's by
+    # 4 bytes, breaking the HMAC signature. (Caught 2026-05-26 via byte-diff
+    # of console-issued token vs. self-signed token for same channel/user.)
     buf = io.BytesIO()
-    if not engine_options:
+    if engine_options is None:
         buf.write(struct.pack(">?", False))
         return buf.getvalue()
     buf.write(struct.pack(">?I", True, len(engine_options)))
@@ -223,7 +230,9 @@ class RtcTokenIssuer:
         now: int | None = None,
         issue_ts: int | None = None,
         salt: int | None = None,
-        engine_options: dict[str, str] | None = None,
+        # Default ``{}`` (not ``None``) so the token body emits the options
+        # block header — vendor's GSLB requires this. See _pack_options docstring.
+        engine_options: dict[str, str] | None = {},  # noqa: B006 -- frozen by `sign`
         privilege: int | None = None,
         # legacy compat: callers from the old algorithm may pass nonce —
         # ignored (no longer in the protocol). Keep param so we don't

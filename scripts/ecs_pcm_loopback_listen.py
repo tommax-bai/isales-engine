@@ -1,10 +1,12 @@
 """ECS-side PCM loopback listener (pybind §9.5 对端).
 
-Spec: joint-mvp-gate-13301035545 § 4；windows-artc-pybind11 §9.5。
+Spec: joint-mvp-gate-13301035545 § 4；windows-artc-pybind11 §9.5；
+      engine-rtc-dingrtc-migration § 5.4.
 
-ECS 上 join 同一 RTC channel 作为对端，counter inbound PCM frames + 反推
-silence。运行在 ARTC Linux Python wrapper (vendor SDK 路径见
-``ISALES_RTC_SDK_PATH`` env 或默认 /opt/isales/current/vendor/...).
+ECS 上 join 同一 DingRTC channel 作为对端，counter inbound PCM frames +
+反推 silence。运行在 DingRTC Linux C++ SDK + 项目内 pybind11 binding
+(vendor SDK 路径见 ``ISALES_DINGRTC_LINUX_SDK_PATH`` env 或默认
+``/opt/isales/vendor/DingRTC_Linux_SDK_3_9_0/``).
 
 启动顺序: **ECS 端先跑本脚本** → Windows 端再跑
 ``pybind_pcm_loopback_smoke.py``。本脚本默认 listen `--duration` 秒后退出
@@ -28,7 +30,7 @@ import os
 import sys
 import time
 
-from isales_engine.transport.aliyun_rtc import AliyunRtcSession, SdkLoadError
+from isales_engine.transport.dingrtc import DingRtcSession, SdkLoadError
 from isales_engine.transport.rtc_token import RtcTokenIssuer
 
 
@@ -52,12 +54,14 @@ async def listen(
     )
 
     try:
-        session = AliyunRtcSession.production(app_id=app_id)
+        session = DingRtcSession.production(app_id=app_id)
     except SdkLoadError as e:
         sys.exit(
-            f"error: ARTC Linux SDK not loadable: {e}\n"
-            "提示: 检查 ISALES_RTC_SDK_PATH env / LD_LIBRARY_PATH / "
-            "PYTHONPATH 含 vendor /opt/isales/current/vendor/aliyun-artc-linux-python/Python"
+            f"error: DingRTC Linux SDK / binding not loadable: {e}\n"
+            "提示: 1) 跑 deploy/cloud/scripts/build-dingrtc-binding.sh 编译 "
+            "dingrtc_pywrap; 2) 检查 ISALES_DINGRTC_LINUX_SDK_PATH env 或默认 "
+            "/opt/isales/vendor/DingRTC_Linux_SDK_3_9_0/ 含 api/ + lib/x86_64/; "
+            "3) 检查 LD_LIBRARY_PATH 含 lib/x86_64/"
         )
 
     print(f"[2/4] join channel={channel!r} as uid={user_id!r} ...", file=sys.stderr)

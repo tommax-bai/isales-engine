@@ -193,12 +193,15 @@ async def test_runner_forwards_device_id_hint_to_rtc_client(
     publisher = MagicMock()
     sessionmaker = _StubSessionmaker(lead=_StubLead(lead_id=1, phone="+1"))
     from isales_common.credentials import CredentialStore
+
+    from isales_engine.providers.tts_cache import TtsCacheStore
     runner = _make_runner(
         sessionmaker=sessionmaker,
         telephony=client,
         publisher=publisher,
         settings=s,
         credentials=CredentialStore(),
+        tts_cache=TtsCacheStore(),
     )
 
     session = CallSession(
@@ -207,9 +210,10 @@ async def test_runner_forwards_device_id_hint_to_rtc_client(
         lead_id=1,
         caller_id="+86133",
         prompt_versions_snapshot={
-            "role_llms": [],
-            "judge_llm": None,
-            "polish_llm": None,
+            "main_llm": None,
+            "referee_llms": [],
+            "restructure_llm": None,
+            "extractor_llm": None,
             "wrap_up_appended": False,
         },
         device_id=7,
@@ -251,12 +255,15 @@ async def test_runner_skips_hint_for_mock_telephony(
     publisher = MagicMock()
     sessionmaker = _StubSessionmaker(lead=_StubLead(lead_id=1, phone="+1"))
     from isales_common.credentials import CredentialStore
+
+    from isales_engine.providers.tts_cache import TtsCacheStore
     runner = _make_runner(
         sessionmaker=sessionmaker,
         telephony=client,
         publisher=publisher,
         settings=s,
         credentials=CredentialStore(),
+        tts_cache=TtsCacheStore(),
     )
 
     session = CallSession(
@@ -265,9 +272,10 @@ async def test_runner_skips_hint_for_mock_telephony(
         lead_id=1,
         caller_id="+86133",
         prompt_versions_snapshot={
-            "role_llms": [],
-            "judge_llm": None,
-            "polish_llm": None,
+            "main_llm": None,
+            "referee_llms": [],
+            "restructure_llm": None,
+            "extractor_llm": None,
             "wrap_up_appended": False,
         },
         device_id=7,

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import random
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -46,8 +47,13 @@ from isales_common.schemas.messages.engine_event import (
 
 from isales_engine.call_session import CallSession
 from isales_engine.event_publisher import EventPublisher
+from isales_engine.pipeline.decider import DeciderAction, decide
 from isales_engine.pipeline.greeting import generate_greeting
-from isales_engine.pipeline.orchestrator import run_pipeline
+from isales_engine.pipeline.orchestrator import (
+    PipelineStream,
+    run_pipeline_stream,
+    run_restructure_stream,
+)
 from isales_engine.realtime.filler_manager import FillerManager
 from isales_engine.realtime.interruption_detector import (
     InterruptionConfig,
@@ -58,8 +64,13 @@ from isales_engine.realtime.silence_detector import SilenceConfig, evaluate_sile
 from isales_engine.realtime.telephony_client import TelephonyClient
 from isales_engine.runtime_config import RuntimeConfig
 from isales_engine.state_machine import StateMachine
+from isales_engine.streaming.types import RefereeResult
 from isales_engine.transcript_recorder import now_utc
-from isales_engine.transfer.manager import evaluate_transfer
+from isales_engine.transfer.manager import (
+    TransferDecision,
+    evaluate_transfer_cheap,
+    evaluate_transfer_llm,
+)
 from isales_engine.wrapup.manager import evaluate_wrap_up
 
 logger = logging.getLogger(__name__)
@@ -90,6 +101,12 @@ async def run_session(
     # separate parameter plumbed through every helper.
     session._token_budget_per_call = token_budget_per_call
 
+    # Stash extractor slot ids so finalize_session can LPUSH the post-call
+    # extract task without re-loading the runtime config (pipeline-stream-and-
+    # referee § post-call extractor).
+    session.extractor_role_config_id = config.pipeline.extractor.role_config_id
+    session.extractor_prompt_version_id = config.pipeline.extractor.prompt_version_id
+
     sm = StateMachine(session)
     session.call_started_at_monotonic = time.monotonic()
     started_wall = now_utc()
@@ -101,6 +118,7 @@ async def run_session(
             ),
         )
 
+    listen_ctx: _ListenContext | None = None
     try:
         connected = await _dial_and_wait_connected(
             session, telephony, phone, timeout_s=connect_timeout_s
@@ -115,9 +133,20 @@ async def run_session(
         sm.transition_to(CallStatus.GREETING, reason="connected")
         _publish_status(publisher, session, "connected")
 
+        # NOTE on greeting interruptibility: listen pumps start AFTER the
+        # greeting, so the greeting cannot be barged in on. (An earlier
+        # 2026-05-28 rationale attributing mid-greeting false-triggers to a
+        # DingRTC POSITION_PLAYBACK self-loopback / mixed-playback echo was
+        # retracted 2026-06-04 — call 138 evidence does not support it. If
+        # mid-greeting barge-in is revisited, diagnose against the real ASR
+        # connection lifecycle first; do not reintroduce the loopback/AEC
+        # theory without fresh evidence.)
+
         await _do_greeting(session, config, providers, telephony)
         sm.transition_to(CallStatus.LISTENING, reason="greeting_done")
         _publish_status(publisher, session, "greeting_done")
+
+        listen_ctx = _start_listen_pumps(session, config, telephony, providers)
 
         await _main_turn_loop(
             session,
@@ -127,6 +156,7 @@ async def run_session(
             providers=providers,
             publisher=publisher,
             pipeline_timeout_ms=pipeline_timeout_ms,
+            listen_ctx=listen_ctx,
         )
 
     except _ManualHangupRequested:
@@ -149,6 +179,8 @@ async def run_session(
             "hangup", reason=session.hangup_cause, initiated_by="ai"
         )
     finally:
+        if listen_ctx is not None:
+            await _stop_listen_pumps(session, listen_ctx)
         # Token-budget warning (impl-engine-providers PR #7). Default 50k
         # if not configured; runtime sets ``_token_budget_per_call`` on the
         # session at construction time.
@@ -222,17 +254,35 @@ async def _do_greeting(
     await _play_tts(session, telephony, providers.tts, text, voice_id=config.voice_id)
 
 
-async def _main_turn_loop(
+@dataclass
+class _ListenContext:
+    """Shared ASR / event / partial-monitor / VAD state owned by ``run_session``.
+
+    Created by :func:`_start_listen_pumps` BEFORE the greeting so user voice
+    during the greeting reaches ``_partial_monitor`` and ``_vad_monitor``
+    (both can cancel the in-flight greeting ``_play_tts``). Disposed of by
+    :func:`_stop_listen_pumps` in ``run_session``'s ``finally``.
+    """
+
+    asr_finals_q: asyncio.Queue[ASRResult]
+    asr_partials_q: asyncio.Queue[ASRResult]
+    hangup_event: asyncio.Event
+    asr_finished: asyncio.Event
+    pump_asr: asyncio.Task[None]
+    pump_ev: asyncio.Task[None]
+    pump_partial_monitor: asyncio.Task[None]
+    pump_vad_monitor: asyncio.Task[None]
+
+
+def _start_listen_pumps(
     session: CallSession,
-    sm: StateMachine,
-    *,
     config: RuntimeConfig,
     telephony: TelephonyClient,
     providers: Providers,
-    publisher: EventPublisher | None,
-    pipeline_timeout_ms: int,
-) -> None:
-    asr_iter = providers.asr.stream_recognize(telephony.audio_in(session.call_record_id))
+) -> _ListenContext:
+    asr_iter = providers.asr.stream_recognize(
+        telephony.audio_in(session.call_record_id)
+    )
     events_iter = telephony.events(session.call_record_id)
 
     asr_finals_q: asyncio.Queue[ASRResult] = asyncio.Queue()
@@ -277,9 +327,68 @@ async def _main_turn_loop(
         ),
         name="partial_monitor",
     )
+    pump_vad_monitor = asyncio.create_task(
+        _vad_monitor(
+            session,
+            audio_in_vad=telephony.audio_in_vad(session.call_record_id),
+            interruption_cfg=config.interruption,
+        ),
+        name="vad_monitor",
+    )
     session.tasks["asr_pump"] = pump_asr
     session.tasks["ev_pump"] = pump_ev
     session.tasks["partial_monitor"] = pump_partial_monitor
+    session.tasks["vad_monitor"] = pump_vad_monitor
+
+    return _ListenContext(
+        asr_finals_q=asr_finals_q,
+        asr_partials_q=asr_partials_q,
+        hangup_event=hangup_event,
+        asr_finished=asr_finished,
+        pump_asr=pump_asr,
+        pump_ev=pump_ev,
+        pump_partial_monitor=pump_partial_monitor,
+        pump_vad_monitor=pump_vad_monitor,
+    )
+
+
+async def _stop_listen_pumps(
+    session: CallSession, ctx: _ListenContext
+) -> None:
+    for t in (
+        ctx.pump_asr, ctx.pump_ev, ctx.pump_partial_monitor, ctx.pump_vad_monitor
+    ):
+        t.cancel()
+    await asyncio.gather(
+        ctx.pump_asr,
+        ctx.pump_ev,
+        ctx.pump_partial_monitor,
+        ctx.pump_vad_monitor,
+        return_exceptions=True,
+    )
+    session.tasks.pop("asr_pump", None)
+    session.tasks.pop("ev_pump", None)
+    session.tasks.pop("partial_monitor", None)
+    session.tasks.pop("vad_monitor", None)
+
+
+async def _main_turn_loop(
+    session: CallSession,
+    sm: StateMachine,
+    *,
+    config: RuntimeConfig,
+    telephony: TelephonyClient,
+    providers: Providers,
+    publisher: EventPublisher | None,
+    pipeline_timeout_ms: int,
+    listen_ctx: _ListenContext,
+) -> None:
+    asr_finals_q = listen_ctx.asr_finals_q
+    hangup_event = listen_ctx.hangup_event
+    asr_finished = listen_ctx.asr_finished
+    pump_asr = listen_ctx.pump_asr
+    pump_ev = listen_ctx.pump_ev
+    pump_partial_monitor = listen_ctx.pump_partial_monitor
 
     no_progress_started = time.monotonic()
     last_progress_ms = _to_ms(no_progress_started)
@@ -349,6 +458,7 @@ async def _main_turn_loop(
                 continue
 
             user_text = outcome.text
+            turn_recv_at = time.monotonic()  # timing: user final reached the loop
             session.append_event("user_speech", text=user_text)
             if publisher is not None:
                 publisher.publish(
@@ -363,63 +473,34 @@ async def _main_turn_loop(
                 )
             last_progress_ms = _to_ms(time.monotonic())
 
-            is_wrap_up = session.state is CallStatus.WRAPPING_UP
-
-            # Start the filler before evaluate_transfer so its audio overlaps
-            # the transfer-decision LLM latency (call-latency fix).
-            filler: FillerManager | None = None
-            if not is_wrap_up:
-                filler = FillerManager(
-                    session,
-                    config.fillers,
-                    telephony=telephony,
-                    tts=providers.tts,
-                    voice_id=config.voice_id,
-                )
-                await filler.start()
-
-            decision = await evaluate_transfer(
+            # Cheap (keyword / round) transfer triggers stay inline — zero LLM,
+            # deterministic (pipeline-latency-tail § D). The LLM-backed triggers
+            # are evaluated off the hot path: preferred via the referee's
+            # ``transfer`` decision, with a parallel detector spawned below for
+            # campaigns that explicitly configure transfer_intent / transfer_llm.
+            decision = evaluate_transfer_cheap(
                 user_text=user_text,
                 turn_count=len(session.dialog_history),
                 goal_achieved=False,
                 config=config.transfer,
-                llm=providers.llm,
             )
             if decision.triggered:
-                if filler is not None:
-                    await filler.stop()
-                sm.transition_to(
-                    CallStatus.TRANSFERRING, reason=decision.trigger_type or "transfer"
-                )
-                session.append_event(
-                    "transfer_initiated",
-                    trigger_type=decision.trigger_type or "",
+                await _perform_handoff(
+                    session, sm, telephony, providers.tts,
+                    trigger_type=decision.trigger_type or "transfer",
                     trigger_detail=decision.trigger_detail,
-                )
-                await _play_tts(
-                    session, telephony, providers.tts, decision.phrase,
+                    phrase=decision.phrase,
                     voice_id=config.voice_id,
                 )
-                session.transfer_status = TransferStatus.MARKED_FOR_HANDOFF.value
-                session.transfer_reason = decision.trigger_type
-                session.append_event("transfer_marked", handoff_task_id=0)
-                await _attempt_hangup(telephony, session.call_record_id)
-                sm.transition_to(
-                    CallStatus.END, reason="marked_for_handoff", force=True
-                )
-                session.hangup_cause = HangupCause.MARKED_FOR_HANDOFF.value
-                session.append_event(
-                    "hangup", reason="marked_for_handoff", initiated_by="ai"
-                )
                 return
+
+            is_wrap_up = session.state is CallStatus.WRAPPING_UP
 
             # Continuous-interruption protection (ai-pipeline spec delta).
             protection = _decide_protection(session, config)
             if protection == "listen_only":
                 # Skip PROCESSING this turn. Play a short cue + return to
                 # LISTENING; counter resets so we give the user a clean slate.
-                if filler is not None:
-                    await filler.stop()
                 sm.transition_to(CallStatus.SPEAKING, reason="listen_only_cue")
                 await _play_tts(
                     session, telephony, providers.tts,
@@ -438,52 +519,124 @@ async def _main_turn_loop(
 
             sm.transition_to(CallStatus.PROCESSING, reason="speech_end")
             _publish_status(publisher, session, "speech_end")
+            ts_start = now_utc()
+            processing_start = time.monotonic()
 
-            result = await run_pipeline(
+            # Transfer LLM detection (pipeline-latency-tail § D): for campaigns
+            # that explicitly configure transfer_intent / transfer_llm, spawn
+            # the LLM detector in parallel with main streaming so it never
+            # blocks the PROCESSING entry. Resolved before this SPEAKING turn
+            # finalizes (alongside the referee). Off → None, zero cost.
+            transfer_llm_task: asyncio.Task[TransferDecision] | None = None
+            if (
+                not is_wrap_up
+                and (config.transfer.intent_enabled or config.transfer.llm_enabled)
+            ):
+                transfer_llm_task = asyncio.create_task(
+                    evaluate_transfer_llm(
+                        user_text=user_text,
+                        config=config.transfer,
+                        llm=providers.llm,
+                    ),
+                    name="transfer_llm",
+                )
+
+            # prompt_versions snapshot: mark the wrap-up append flag for this
+            # call (role-prompt § prompt_versions 快照标记).
+            if is_wrap_up and isinstance(session.prompt_versions_snapshot, dict):
+                session.prompt_versions_snapshot["wrap_up_appended"] = True
+
+            # FILLER is off by default (streaming reaches first audio ~500ms).
+            # When a campaign opts in, filler overlaps the main stream and is
+            # preempted by the first main sentence — no blocking gate.
+            # Time-gated filler (tts-cache-and-gated-filler § B): build the
+            # manager but do NOT start it here — _play_streaming starts it only
+            # if the main reply's first audio hasn't begun within
+            # ``filler_delay_ms``. (Cached filler audio masks a slow LLM TTFT
+            # without polluting fast turns.)
+            filler: FillerManager | None = None
+            if config.filler_enabled and not is_wrap_up:
+                filler = FillerManager(
+                    session,
+                    config.fillers,
+                    telephony=telephony,
+                    tts=providers.tts,
+                    voice_id=config.voice_id,
+                )
+
+            # Spawn main streaming + referee (referee skipped during wrap-up).
+            stream = run_pipeline_stream(
                 session,
                 user_text,
                 config.pipeline,
-                providers.llm,
+                providers.llm,  # main_llm
+                providers.llm,  # referee_llm (same provider in v1 — see note)
                 is_wrap_up=is_wrap_up,
                 pipeline_timeout_ms=pipeline_timeout_ms,
             )
-            # Pipeline is done — cancel the filler immediately instead of
-            # waiting for its audio to finish, so the reply TTS starts sooner
-            # (call-latency fix).
-            if filler is not None:
-                await filler.stop()
 
-            # Token budget bookkeeping (PR #7 wires accumulation; PR #6 just
-            # ensures the trace records persist token fields).
-            for cand in session.pipeline_trace_records[-1]["role_candidates"]:
-                session.total_tokens_in += int(cand.get("prompt_tokens") or 0)
-                session.total_tokens_out += int(cand.get("completion_tokens") or 0)
-
-            sm.transition_to(CallStatus.SPEAKING, reason="pipeline_done")
-            played = await _play_tts(
-                session, telephony, providers.tts, result.reply,
+            sm.transition_to(CallStatus.SPEAKING, reason="main_stream_started")
+            first_audio_ms, played = await _play_streaming(
+                session,
+                telephony,
+                providers.tts,
+                stream,
                 voice_id=config.voice_id,
+                filler=filler,
+                filler_delay_s=config.filler_delay_ms / 1000.0,
+                processing_start=processing_start,
             )
-            session.append_event(
-                "ai_reply",
-                text=result.reply,
-                turn_id=session.current_turn_id,
-                selected_role_config_id=(
-                    config.pipeline.roles[
-                        result.selected_candidate_index
-                    ].role_config_id
-                    if 0 <= result.selected_candidate_index < len(config.pipeline.roles)
-                    else None
-                ),
-                goal_achieved=result.goal_achieved,
-                goal_type=result.goal_type,
-                extracted=result.extracted,
-                is_wrap_up=is_wrap_up,
-                interrupted=not played,
+
+            # Per-turn timing breakdown (ms), all relative to the user final
+            # reaching the loop (turn_recv_at):
+            #   recv→proc  : transfer/protection checks before PROCESSING
+            #   →llm_token : main LLM first token (TTFT)
+            #   →llm_sent  : main LLM first splittable sentence
+            #   →audio_out : first PCM chunk pushed toward DingRTC (first_audio_ms
+            #                is measured from processing_start, so add the
+            #                recv→proc offset for the recv-relative figure)
+            _recv_to_proc_ms = int((processing_start - turn_recv_at) * 1000)
+            logger.info(
+                "turn_timing user=%r reply=%r recv_to_proc_ms=%s "
+                "llm_first_token_ms=%s llm_first_sentence_ms=%s first_audio_ms=%s "
+                "recv_to_audio_ms=%s main_dur_ms=%s",
+                user_text[:24],
+                stream.result.reply_text[:60],
+                _recv_to_proc_ms,
+                stream.result.first_token_ms,
+                stream.result.first_sentence_ms,
+                first_audio_ms,
+                (_recv_to_proc_ms + first_audio_ms) if first_audio_ms is not None else None,
+                stream.result.duration_ms,
             )
+
+            # Token bookkeeping from the main streaming call.
+            session.total_tokens_in += stream.result.tokens_in
+            session.total_tokens_out += stream.result.tokens_out
 
             if not played:
-                # Real-time interruption fired: SPEAKING got cancelled.
+                # Real-time interruption fired mid main reply. The referees +
+                # transfer detector ran on the pre-interruption input and are
+                # now stale — cancel them. The not-yet-spoken sentence buffer was
+                # captured into session.interrupt_remaining_text by
+                # _play_streaming for a possible next-turn restructure.
+                _cancel_referees(stream)
+                if transfer_llm_task is not None:
+                    transfer_llm_task.cancel()
+                session.pipeline_trace_records.append(
+                    _base_trace(stream, ts_start, user_text, first_audio_ms)
+                )
+                session.append_event(
+                    "ai_reply",
+                    text=stream.result.reply_text,
+                    turn_id=stream.turn_id,
+                    selected_role_config_id=config.pipeline.main.role_config_id or None,
+                    goal_achieved=False,
+                    goal_type="",
+                    extracted={},
+                    is_wrap_up=is_wrap_up,
+                    interrupted=True,
+                )
                 session.consecutive_interruption_count += 1
                 session.interruption_signaled = False
                 sm.transition_to(
@@ -494,24 +647,159 @@ async def _main_turn_loop(
             # Successful SPEAKING — clear the counter per spec.
             session.consecutive_interruption_count = 0
 
-            if result.goal_achieved and not is_wrap_up:
-                sm.transition_to(CallStatus.WRAPPING_UP, reason="goal_achieved")
-                session.wrap_up_started_at_monotonic = time.monotonic()
-                session.wrap_up_started_at_wallclock = now_utc()
-                session.append_event(
-                    "wrap_up_started",
-                    rounds_remaining=config.wrap_up.max_rounds,
-                    seconds_remaining=config.wrap_up.max_seconds,
+            # Await all referees (main TTS already played; this is the only place
+            # the main link "waits" — each referee fail-opens), then route via the
+            # ordered routing-rule decider (first-match-wins).
+            referee_results = await _await_referees(stream)
+            restructure_enabled = config.pipeline.restructure is not None
+            action: DeciderAction = decide(
+                referee_results,
+                config.pipeline.routing_rules,
+                primary_referee_label=config.pipeline.primary_referee_label,
+                restructure_enabled=restructure_enabled,
+            )
+
+            # Resolve restructure InterruptText up front so the trace can record
+            # the source text and we know whether restructure actually fires.
+            restructure_text: str | None = None
+            restructure_capped = False
+            if action.kind == "restructure" and not is_wrap_up:
+                if (
+                    session.consecutive_restructure_count
+                    >= config.pipeline.max_continuous_restructure
+                ):
+                    restructure_capped = True  # D6: stop re-voicing, play default
+                else:
+                    restructure_text = _assemble_interrupt_text(session, action.source)
+
+            goal_achieved = (
+                action.kind == "transition"
+                and action.to == "goal_achieved"
+                and not is_wrap_up
+            )
+            goal_type = action.goal_type or "" if goal_achieved else ""
+
+            session.pipeline_trace_records.append(
+                {
+                    **_base_trace(stream, ts_start, user_text, first_audio_ms),
+                    "referee_results": [r.as_trace() for r in referee_results],
+                    "matched_rule": action.matched_rule,
+                    "restructure_active": restructure_text is not None,
+                    "restructure_trigger": (
+                        action.restructure_trigger if restructure_text is not None else None
+                    ),
+                    "restructure_source_text": restructure_text,
+                }
+            )
+
+            session.append_event(
+                "ai_reply",
+                text=stream.result.reply_text,
+                turn_id=stream.turn_id,
+                selected_role_config_id=config.pipeline.main.role_config_id or None,
+                goal_achieved=goal_achieved,
+                goal_type=goal_type or "",
+                # extracted is now produced post-call by the worker extractor.
+                extracted={},
+                is_wrap_up=is_wrap_up,
+                interrupted=False,
+            )
+
+            # Parallel transfer-LLM detector (pipeline-latency-tail § D): resolve
+            # before decider-driven transitions. The decider's transfer routing is
+            # the preferred path; only act on the dedicated detector when the
+            # decider did not already route a transfer.
+            transfer_llm_decision = await _resolve_transfer_llm(transfer_llm_task)
+            action_transfer = (
+                action.kind == "transition"
+                and action.to == "transfer"
+                and not is_wrap_up
+            )
+            if (
+                transfer_llm_decision is not None
+                and transfer_llm_decision.triggered
+                and not action_transfer
+            ):
+                await _perform_handoff(
+                    session, sm, telephony, providers.tts,
+                    trigger_type=transfer_llm_decision.trigger_type or "transfer",
+                    trigger_detail=transfer_llm_decision.trigger_detail,
+                    phrase=transfer_llm_decision.phrase,
+                    voice_id=config.voice_id,
                 )
-                session.append_event(
-                    "goal_achieved",
-                    goal_type=result.goal_type,
-                    extracted=result.extracted,
-                )
-                # Stay in WRAPPING_UP for subsequent turns — it serves as the
-                # umbrella "listen" state during wrap-up (per goal-achievement
-                # spec § 切换到简化管线 + § 当前轮回复正常播放).
-                continue
+                return
+
+            # ---- decider-driven outcome (skipped during wrap-up) ----
+            if not is_wrap_up:
+                if action.kind == "transition" and action.to == "goal_achieved":
+                    sm.transition_to(
+                        CallStatus.WRAPPING_UP, reason=goal_type or "goal_achieved"
+                    )
+                    session.wrap_up_started_at_monotonic = time.monotonic()
+                    session.wrap_up_started_at_wallclock = now_utc()
+                    session.append_event(
+                        "wrap_up_started",
+                        rounds_remaining=config.wrap_up.max_rounds,
+                        seconds_remaining=config.wrap_up.max_seconds,
+                    )
+                    session.append_event(
+                        "goal_achieved", goal_type=goal_type, extracted={}
+                    )
+                    continue
+                if action.kind == "transition" and action.to == "transfer":
+                    # Decider-driven transfer: no extra phrase (the main reply
+                    # already played) — just mark + hang up.
+                    await _perform_handoff(
+                        session, sm, telephony, providers.tts,
+                        trigger_type="referee",
+                        trigger_detail="referee_decision",
+                        phrase="",
+                        voice_id=config.voice_id,
+                    )
+                    return
+                if action.kind == "transition" and action.to == "customer_decline":
+                    sm.transition_to(
+                        CallStatus.ACTIVATING, reason="customer_decline_recovery"
+                    )
+                    sm.transition_to(
+                        CallStatus.LISTENING, reason="customer_decline_done"
+                    )
+                    continue
+                if action.kind == "restructure":
+                    if restructure_capped:
+                        # D6: consecutive cap reached — stop re-voicing; play a
+                        # default reply (if any) and reset the counter.
+                        if config.pipeline.default_replies:
+                            await _play_tts(
+                                session, telephony, providers.tts,
+                                random.choice(config.pipeline.default_replies),
+                                voice_id=config.voice_id,
+                            )
+                        session.consecutive_restructure_count = 0
+                        sm.transition_to(
+                            CallStatus.LISTENING, reason="restructure_capped"
+                        )
+                        continue
+                    if restructure_text is not None:
+                        played_rs = await _run_restructure(
+                            session, telephony, providers, config, restructure_text,
+                            pipeline_timeout_ms=pipeline_timeout_ms,
+                        )
+                        session.consecutive_restructure_count += 1
+                        if not played_rs:
+                            session.consecutive_interruption_count += 1
+                            session.interruption_signaled = False
+                            sm.transition_to(
+                                CallStatus.INTERRUPTED, reason="restructure_interrupted"
+                            )
+                            continue
+                        sm.transition_to(
+                            CallStatus.LISTENING, reason="restructure_done"
+                        )
+                        continue
+                    # restructure degraded (no InterruptText available) → continue.
+                # Normal main reply (continue / degraded): reset restructure cap.
+                session.consecutive_restructure_count = 0
 
             if is_wrap_up:
                 session.wrap_up_round_count += 1
@@ -542,15 +830,9 @@ async def _main_turn_loop(
 
             sm.transition_to(CallStatus.LISTENING, reason="tts_done")
     finally:
-        for t in (pump_asr, pump_ev, pump_partial_monitor):
-            t.cancel()
-        await asyncio.gather(
-            pump_asr, pump_ev, pump_partial_monitor, return_exceptions=True
-        )
-        session.tasks.pop("asr_pump", None)
-        session.tasks.pop("ev_pump", None)
-        session.tasks.pop("partial_monitor", None)
-        _ = asr_finished
+        # Pump lifecycle now belongs to run_session — these locals just keep
+        # type checkers happy that they were "used" in this scope.
+        _ = (pump_asr, pump_ev, pump_partial_monitor, asr_finished)
 
 
 
@@ -603,10 +885,26 @@ async def _await_user_or_silence(
         hangup_wait.cancel()
         with contextlib.suppress(asyncio.CancelledError, BaseException):
             await hangup_wait
-        if result.text.strip() in interruption_cfg.whitelist:
+        # Coalesce any finals that queued while the AI was busy speaking: when
+        # the user out-paces the AI (or talks through a long reply that didn't
+        # barge in), multiple finals pile up in asr_finals_q while the main
+        # loop is blocked in playback. Responding to each one turn-by-turn is
+        # the "憋住 then flood" symptom — drain the backlog and answer ONCE to
+        # the combined input (the user's most recent intent), instead of
+        # replaying the whole queue.
+        texts = [result.text.strip()]
+        while True:
+            try:
+                extra = asr_finals_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if extra.text.strip():
+                texts.append(extra.text.strip())
+        combined = " ".join(t for t in texts if t)
+        if not combined or combined in interruption_cfg.whitelist:
             return _UserAwait(kind="no_progress")
         session.last_user_speech_end_at = time.monotonic()
-        return _UserAwait(kind="user_final", text=result.text)
+        return _UserAwait(kind="user_final", text=combined)
 
     # Silence timeout — leave pumps running, just decide.
     asr_get.cancel()
@@ -629,16 +927,422 @@ async def _await_user_or_silence(
     return _UserAwait(kind="no_progress")
 
 
-async def _play_tts(
+class _SynthJob:
+    """A pre-synthesizing TTS job (pipeline-latency-tail § B).
+
+    Construction immediately spawns a background task that drains
+    ``tts.synthesize_stream(text)`` into an internal buffer — so the vendor
+    is already producing audio for sentence N+1 while the consumer plays
+    sentence N. ``stream()`` replays the buffered PCM (and re-raises any
+    synthesis error after draining). ``aclose()`` cancels the in-flight
+    synthesis (barge-in / teardown) so we don't leak a vendor connection.
+    """
+
+    def __init__(self, text: str, tts: TTSProvider, voice_id: str) -> None:
+        self.text = text
+        self._buffer: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self._error: BaseException | None = None
+        # Own the TTS iterator so aclose() can close it even when the drain
+        # task's own cleanup gets cut short by cancellation.
+        self._gen = tts.synthesize_stream(text, voice_id)
+        self._task = asyncio.create_task(self._drain(), name="tts_presynth")
+
+    async def _drain(self) -> None:
+        try:
+            async for chunk in self._gen:
+                await self._buffer.put(chunk)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — surfaced via stream()
+            self._error = exc
+        finally:
+            await self._buffer.put(None)  # sentinel: synthesis done
+
+    async def stream(self) -> AsyncIterator[bytes]:
+        while True:
+            chunk = await self._buffer.get()
+            if chunk is None:
+                break
+            yield chunk
+        if self._error is not None:
+            raise self._error
+
+    async def aclose(self) -> None:
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
+        # Explicitly close the TTS iterator so its vendor connection / SSE
+        # stream is released NOW (on barge-in / teardown). The drain task's
+        # own cleanup can be cut short by its cancellation, so we close the
+        # generator here — _play_streaming's finally runs uncancelled.
+        aclose = getattr(self._gen, "aclose", None)
+        if aclose is not None:
+            with contextlib.suppress(Exception):
+                await aclose()
+
+
+async def _play_streaming(
     session: CallSession,
     telephony: TelephonyClient,
     tts: TTSProvider,
-    text: str,
+    stream: PipelineStream,
     *,
     voice_id: str,
+    filler: FillerManager | None,
+    filler_delay_s: float = 0.6,
+    processing_start: float,
+) -> tuple[int | None, bool]:
+    """Play the main LLM streaming reply via a producer/consumer pipeline.
+
+    Producer consumes ``chat_stream → split_sentences`` and, for each
+    sentence, **immediately** kicks off TTS synthesis (``_SynthJob``),
+    pushing the ready job onto a bounded queue (``maxsize=2``). The consumer
+    pulls jobs and plays them — so while sentence N plays, sentence N+1 is
+    already synthesizing in the vendor. This kills the per-sentence TTS
+    first-byte silence gap and stops the main LLM from being suspended by
+    playback (pipeline-latency-tail § B).
+
+    Returns ``(first_audio_ms, fully_played)``. ``first_audio_ms`` is measured
+    from PROCESSING entry to the first PCM chunk the consumer actually plays.
+    On a real-time interruption (partial monitor cancels the audio_out task)
+    returns ``(first_audio_ms, False)``; the producer, the main stream
+    generator, and every queued/in-flight synthesis are cancelled in the
+    ``finally`` so ``chat_stream`` and the vendor TTS connections stop.
+    """
+    first_audio_ms: int | None = None
+    fully_played = True
+    sentences = stream.sentences()
+    # maxsize=2: producer leads the consumer by at most 2 sentences — enough
+    # to hide TTS first-byte latency, bounded so a fast LLM doesn't pre-pay
+    # synthesis for many sentences that a barge-in would discard.
+    job_q: asyncio.Queue[_SynthJob | None] = asyncio.Queue(maxsize=2)
+
+    async def _producer() -> None:
+        pending: _SynthJob | None = None
+        try:
+            async for sentence in sentences:
+                pending = _SynthJob(sentence, tts, voice_id)
+                await job_q.put(pending)
+                pending = None
+        except asyncio.CancelledError:
+            # Consumer's finally drains + closes queued jobs; just clean up
+            # the one job we created but never enqueued. No sentinel needed.
+            if pending is not None:
+                await pending.aclose()
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Sentence generator failed mid-stream (rare — sentences() catches
+            # its own LLM errors). Stop producing but still drop the sentinel
+            # below so the consumer drains what's queued instead of hanging.
+            logger.warning(
+                "tts_producer_stream_error turn=%s: %s", stream.turn_id, exc
+            )
+            if stream.result.error is None:
+                stream.result.error = f"main_stream_producer: {exc}"
+        await job_q.put(None)  # completion sentinel (normal or handled-error)
+
+    producer_task = asyncio.create_task(_producer(), name="tts_producer")
+
+    # Time-gated filler (tts-cache-and-gated-filler § B): only play a filler if
+    # the first real audio hasn't begun within ``filler_delay_s``. Fast turns
+    # never hear it; slow turns get a cached (zero-synth) filler masking the
+    # LLM TTFT. Cancelled + stopped the moment the first job plays.
+    filler_task: asyncio.Task[None] | None = None
+    if filler is not None:
+        async def _maybe_filler() -> None:
+            await asyncio.sleep(filler_delay_s)
+            if first_audio_ms is None:
+                await filler.start()
+        filler_task = asyncio.create_task(_maybe_filler(), name="filler_gate")
+
+    current_job: _SynthJob | None = None
+    filler_stopped = False
+    try:
+        while True:
+            next_job = await job_q.get()
+            if next_job is None:
+                break
+            job: _SynthJob = next_job  # narrowed non-Optional for the closure
+            current_job = job
+            if not filler_stopped and filler is not None:
+                # First real audio is ready: cancel the pending filler timer
+                # and preempt any filler already playing (same cancel path as
+                # 5/28 barge-in).
+                if filler_task is not None:
+                    filler_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await filler_task
+                await filler.stop()
+                filler_stopped = True
+
+            async def _marked(j: _SynthJob = job) -> AsyncIterator[bytes]:
+                nonlocal first_audio_ms
+                async for chunk in j.stream():
+                    if first_audio_ms is None:
+                        first_audio_ms = int(
+                            (time.monotonic() - processing_start) * 1000
+                        )
+                    yield chunk
+
+            try:
+                played = await _play_chunks(
+                    session, telephony, _marked(), interruptible=True
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # TTS synthesis / playback error for this sentence: log + stop
+                # this turn's playback without crashing the call (consumer 不
+                # 卡死 + 落 error). Remaining queued jobs are closed in finally.
+                logger.warning(
+                    "tts_playback_error turn=%s text=%r: %s",
+                    stream.turn_id, job.text, exc,
+                )
+                if stream.result.error is None:
+                    stream.result.error = f"tts_playback: {exc}"
+                break
+            if not played:
+                # Barge-in: keep current_job set so the finally closes its
+                # (possibly still-synthesizing) TTS iterator.
+                fully_played = False
+                break
+            current_job = None  # fully played — nothing to clean up
+    finally:
+        # Barge-in remainder capture (engine-multi-referee-and-restructure D5 b):
+        # on a real interruption of the *main* reply, the not-yet-spoken sentence
+        # buffer (the interrupted sentence + still-queued sentences) is preserved
+        # so a next-turn restructure rule (source=interrupt_remaining) can
+        # re-voice it. Restructure turns don't re-capture (would loop). This does
+        # not change the discard timing / cancellation semantics below.
+        capture = not fully_played and not stream.is_restructure
+        captured: list[str] = []
+        if capture and current_job is not None:
+            captured.append(current_job.text)
+        if filler_task is not None:
+            filler_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await filler_task
+        producer_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await producer_task
+        await sentences.aclose()
+        if current_job is not None:
+            await current_job.aclose()
+        # Drain + close any jobs still queued so their pre-synth TTS iterators
+        # are released (avoid leaking vendor connections on barge-in).
+        while not job_q.empty():
+            pending_job = job_q.get_nowait()
+            if pending_job is not None:
+                if capture:
+                    captured.append(pending_job.text)
+                await pending_job.aclose()
+        if filler is not None:
+            await filler.stop()
+        if capture:
+            remaining = "".join(captured).strip()
+            session.interrupt_remaining_text = remaining or None
+    return first_audio_ms, fully_played
+
+
+async def _perform_handoff(
+    session: CallSession,
+    sm: StateMachine,
+    telephony: TelephonyClient,
+    tts: TTSProvider,
+    *,
+    trigger_type: str,
+    trigger_detail: str,
+    phrase: str,
+    voice_id: str,
+) -> None:
+    """Run the TRANSFERRING → marked-for-handoff → hangup → END flow.
+
+    Shared by the inline cheap triggers, the parallel transfer-LLM detector,
+    and the referee transfer decision (pipeline-latency-tail § D). ``phrase``
+    is played only when non-empty (the referee path plays nothing — the main
+    reply already went out).
+    """
+    sm.transition_to(CallStatus.TRANSFERRING, reason=trigger_type or "transfer")
+    session.append_event(
+        "transfer_initiated",
+        trigger_type=trigger_type or "",
+        trigger_detail=trigger_detail,
+    )
+    if phrase:
+        await _play_tts(session, telephony, tts, phrase, voice_id=voice_id)
+    session.transfer_status = TransferStatus.MARKED_FOR_HANDOFF.value
+    session.transfer_reason = trigger_type
+    session.append_event("transfer_marked", handoff_task_id=0)
+    await _attempt_hangup(telephony, session.call_record_id)
+    sm.transition_to(CallStatus.END, reason="marked_for_handoff", force=True)
+    session.hangup_cause = HangupCause.MARKED_FOR_HANDOFF.value
+    session.append_event("hangup", reason="marked_for_handoff", initiated_by="ai")
+
+
+async def _resolve_transfer_llm(
+    task: asyncio.Task[TransferDecision] | None,
+) -> TransferDecision | None:
+    """Await the parallel transfer-LLM detector with a fail-open budget.
+
+    Mirrors ``_await_referees``: ``None`` when no detector was spawned; on
+    timeout / failure the task is cancelled and ``None`` returned (transfer
+    never blocks or crashes the turn).
+    """
+    if task is None:
+        return None
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+    except TimeoutError:
+        task.cancel()
+        return None
+    except Exception:  # noqa: BLE001 — transfer detection never blocks the call
+        return None
+
+
+async def _await_referees(stream: PipelineStream) -> list[RefereeResult]:
+    """Await all N referee tasks with a per-referee 2s fail-open budget.
+
+    Returns one :class:`RefereeResult` per referee (empty when none were
+    spawned — wrap-up / restructure). A timed-out / errored referee yields a
+    labelled fail-open result so it simply matches no routing rule; one slow
+    referee never blocks the others (they are awaited concurrently).
+    """
+    if not stream.referee_tasks:
+        return []
+
+    async def _await_one(task: asyncio.Task[RefereeResult], label: str) -> RefereeResult:
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        except TimeoutError:
+            task.cancel()
+            return RefereeResult.fail_open(label=label, reason="timeout")
+        except Exception:  # noqa: BLE001 — a referee failure never blocks the call
+            return RefereeResult.fail_open(label=label, reason="invalid")
+
+    return list(
+        await asyncio.gather(
+            *(
+                _await_one(t, label)
+                for t, label in zip(stream.referee_tasks, stream.referee_labels, strict=False)
+            )
+        )
+    )
+
+
+def _cancel_referees(stream: PipelineStream) -> None:
+    """Cancel any still-running referee tasks (e.g. when a barge-in makes their
+    pre-interruption input stale)."""
+    for task in stream.referee_tasks:
+        if not task.done():
+            task.cancel()
+
+
+def _assemble_interrupt_text(session: CallSession, source: str | None) -> str | None:
+    """Build the restructure InterruptText for the matched source (D5).
+
+    ``interrupt_remaining`` consumes (and clears) the captured barge-in
+    remainder, degrading to ``last_reply`` when empty. ``last_reply`` (also the
+    low-confidence trigger) takes the last assistant utterance in
+    dialog_history. Returns ``None`` when nothing is available (→ restructure
+    degrades to continue).
+    """
+    if source == "interrupt_remaining":
+        remaining = session.interrupt_remaining_text
+        session.interrupt_remaining_text = None  # take-and-clear
+        if remaining and remaining.strip():
+            return remaining
+        source = "last_reply"  # degrade
+    # last_reply (and low_confidence): last assistant utterance.
+    for turn in reversed(session.dialog_history):
+        if turn.role == "assistant" and turn.text.strip():
+            return turn.text
+    return None
+
+
+def _base_trace(
+    stream: PipelineStream,
+    ts_start: object,
+    user_text: str,
+    first_audio_ms: int | None,
+) -> dict[str, object]:
+    """The main-LLM portion of a pipeline_trace record (referee/restructure
+    fields are merged in by the caller)."""
+    return {
+        "turn_id": stream.turn_id,
+        "ts_start": ts_start,
+        "ts_end": now_utc(),
+        "user_input": user_text,
+        "main_reply_text": stream.result.reply_text,
+        "main_duration_ms": stream.result.duration_ms,
+        "main_tokens_in": stream.result.tokens_in,
+        "main_tokens_out": stream.result.tokens_out,
+        "main_fallback_used": stream.result.fallback_used,
+        "referee_results": [],
+        "matched_rule": None,
+        "restructure_active": False,
+        "restructure_trigger": None,
+        "restructure_source_text": None,
+        "first_audio_ms": first_audio_ms,
+        "error": stream.result.error,
+    }
+
+
+async def _run_restructure(
+    session: CallSession,
+    telephony: TelephonyClient,
+    providers: Providers,
+    config: RuntimeConfig,
+    interrupt_text: str,
+    *,
+    pipeline_timeout_ms: int,
+) -> bool:
+    """Run + play the restructure stream and record its ai_reply.
+
+    Re-voices ``interrupt_text`` via the restructure slot (no referees). Returns
+    whether it fully played (False on barge-in). The caller drives state.
+    """
+    rs = run_restructure_stream(
+        session,
+        interrupt_text,
+        config.pipeline,
+        providers.llm,
+        pipeline_timeout_ms=pipeline_timeout_ms,
+    )
+    _first_audio, played = await _play_streaming(
+        session,
+        telephony,
+        providers.tts,
+        rs,
+        voice_id=config.voice_id,
+        filler=None,
+        filler_delay_s=config.filler_delay_ms / 1000.0,
+        processing_start=time.monotonic(),
+    )
+    restructure_rc_id = (
+        config.pipeline.restructure.role_config_id if config.pipeline.restructure else 0
+    )
+    session.append_event(
+        "ai_reply",
+        text=rs.result.reply_text,
+        turn_id=rs.turn_id,
+        selected_role_config_id=restructure_rc_id or None,
+        goal_achieved=False,
+        goal_type="",
+        extracted={},
+        is_wrap_up=False,
+        interrupted=not played,
+    )
+    return played
+
+
+async def _play_chunks(
+    session: CallSession,
+    telephony: TelephonyClient,
+    chunk_iter: AsyncIterator[bytes],
+    *,
     interruptible: bool = True,
 ) -> bool:
-    """Stream TTS PCM out via the telephony client.
+    """Push a PCM chunk stream out via the telephony client.
 
     Returns ``True`` on full playback, ``False`` if cancelled mid-stream by
     the partial monitor (real-time interruption). The audio_out implementation
@@ -647,14 +1351,13 @@ async def _play_tts(
 
     When ``interruptible=False`` the partial monitor is bypassed for this
     playback (used for protection cues like "您请说" that MUST complete).
+
+    Shared by single-shot ``_play_tts`` (greeting / cues / silence phrases)
+    and the producer/consumer ``_play_streaming`` pipeline
+    (pipeline-latency-tail § B).
     """
-
-    async def chunks() -> AsyncIterator[bytes]:
-        async for chunk in tts.synthesize_stream(text, voice_id):
-            yield chunk
-
     play_task = asyncio.create_task(
-        telephony.audio_out(session.call_record_id, chunks()), name="audio_out"
+        telephony.audio_out(session.call_record_id, chunk_iter), name="audio_out"
     )
     if interruptible:
         session.current_speaking_task = play_task
@@ -671,6 +1374,26 @@ async def _play_tts(
 
     session.last_tts_end_at = time.monotonic()
     return True
+
+
+async def _play_tts(
+    session: CallSession,
+    telephony: TelephonyClient,
+    tts: TTSProvider,
+    text: str,
+    *,
+    voice_id: str,
+    interruptible: bool = True,
+) -> bool:
+    """Synthesize ``text`` and stream the PCM out (single-shot path)."""
+
+    async def chunks() -> AsyncIterator[bytes]:
+        async for chunk in tts.synthesize_stream(text, voice_id):
+            yield chunk
+
+    return await _play_chunks(
+        session, telephony, chunks(), interruptible=interruptible
+    )
 
 
 async def _partial_monitor(
@@ -702,17 +1425,36 @@ async def _partial_monitor(
         text = partial.text.strip()
         if not text:
             continue
+
+        # Use wall-clock for the duration condition rather than the ASR's
+        # ``partial.timestamp_ms``. The V3 SAUC ASR sets ``timestamp_ms`` to
+        # the utterance ``end_time`` (audio-domain), which stays constant
+        # across repeated confirmation partials of the same word — so
+        # ``elapsed = now - anchor`` was permanently 0 and the duration
+        # condition never fired (root cause of the "AI plays full sentence
+        # even when user speaks throughout" symptom).
+        now_ms = int(time.monotonic() * 1000)
         if session.current_user_speech_started_ms is None:
-            session.current_user_speech_started_ms = partial.timestamp_ms
+            session.current_user_speech_started_ms = now_ms
 
         verdict = evaluate_partial(
             text=text,
             speech_started_ts_ms=session.current_user_speech_started_ms,
-            now_ts_ms=partial.timestamp_ms,
+            now_ts_ms=now_ms,
             config=interruption_cfg,
         )
         if verdict.verdict != "triggered":
             continue
+
+        # The VAD-corroboration gate that used to sit here (require
+        # vad_voice_active_ms ≥ min_duration before trusting the partial) was
+        # removed 2026-06-04: its rationale was the retracted DingRTC
+        # self-loopback theory, and with the persistent ASR connection the
+        # ASR is reliably listening during SPEAKING, so a `triggered` partial
+        # (evaluate_partial already gates on text length ≥2 + duration +
+        # whitelist) is the barge-in signal. (call 143: the partial monitor
+        # got the user's "1234" during SPEAKING but this gate wrongly blocked
+        # the cancel.)
 
         # Lock in the interruption: signal first, then cancel. If cancellation
         # arrives while the play_task hasn't started awaiting yet, the signal
@@ -726,6 +1468,142 @@ async def _partial_monitor(
         speaking_task = session.current_speaking_task
         if speaking_task is not None and not speaking_task.done():
             speaking_task.cancel()
+
+
+async def _vad_monitor(
+    session: CallSession,
+    *,
+    audio_in_vad: AsyncIterator[bytes],
+    interruption_cfg: InterruptionConfig,
+) -> None:
+    """RMS-based barge-in detector independent of the ASR partial pipeline.
+
+    The partial-monitor path waits for the ASR vendor to emit a transcribed
+    partial (V3 SAUC: ~500–800 ms vendor latency) before the duration
+    condition can even start counting; that pushes the user-perceived
+    cancel latency to ~1.5–2 s. This monitor reads raw PCM directly from
+    ``telephony.audio_in_vad()`` and triggers cancel as soon as the rolling
+    voice-active span exceeds ``interruption_cfg.min_duration_ms``,
+    typically ~250–400 ms after the user actually starts speaking.
+
+    Coordination with ``_partial_monitor``:
+
+    * Both paths gate on ``session.current_speaking_task is not None`` and
+      ``not session.interruption_signaled``. Once either fires it sets the
+      flag and the other path becomes a no-op for this utterance.
+    * The ``interruption`` event emitted here carries ``source="vad"`` so
+      transcripts can distinguish the two paths.
+    """
+
+    try:
+        import audioop  # noqa: PLC0415
+    except ImportError:  # pragma: no cover  - Py 3.13+ replacement TBD
+        audioop = None  # type: ignore[assignment]
+
+    # 16 kHz int16 mono: a 20 ms frame is 640 bytes. Engine inbound stream is
+    # resampled to 16 kHz upstream of audio_in_vad. We tolerate any frame
+    # size (push_external_audio is 10 ms = 320 bytes; OnPlaybackAudioFrame
+    # is 20–60 ms depending on the SDK build) and infer the duration from
+    # the byte count.
+    bytes_per_ms = 16_000 * 2 // 1000  # = 32
+    # RMS threshold for "voice present" on the inbound mono PCM.
+    # NOTE (2026-06-04): the value 1200 was originally justified as riding
+    # "above the DingRTC self-loopback baseline ~600-800". That rationale is
+    # RETRACTED — call 138's inbound RMS does not show a sustained loopback
+    # floor, and the self-loopback causal theory is unsupported. 1200 is kept
+    # AS-IS for now (changing it without fresh measurement would repeat the
+    # guess-driven mistake); it is pending an evidence-based re-evaluation
+    # against a controlled call (user silent during greeting → measure the
+    # real inbound floor; user barge-in → measure real user-speech RMS). See
+    # the interruption-detection re-eval openspec change.
+    voice_rms_threshold = 1200
+    # Hangover window: Chinese / Mandarin speech has natural ~50-100 ms
+    # micro-pauses between syllables / words / breath. If we reset on
+    # every silent frame, voice_active_ms never accumulates past the
+    # threshold during natural speech. Allow up to 300 ms of contiguous
+    # silence inside a voice burst before resetting the active counter —
+    # well under the duration_ms threshold so an actually-silent gap of
+    # 400+ ms still resets cleanly.
+    silence_hangover_ms = 300
+    voice_active_ms = 0
+    silence_run_ms = 0
+    try:
+        async for pcm in audio_in_vad:
+            if not pcm:
+                continue
+            frame_ms = max(len(pcm) // bytes_per_ms, 1)
+            if audioop is not None:
+                try:
+                    rms = audioop.rms(pcm, 2)
+                except audioop.error:
+                    rms = 0
+            else:
+                rms = 0
+
+            if rms >= voice_rms_threshold:
+                voice_active_ms += frame_ms
+                silence_run_ms = 0
+            else:
+                # Tolerate short silence within an active burst — only
+                # reset the burst counter once contiguous silence exceeds
+                # the hangover window.
+                if voice_active_ms > 0:
+                    silence_run_ms += frame_ms
+                    if silence_run_ms >= silence_hangover_ms:
+                        voice_active_ms = 0
+                        silence_run_ms = 0
+                # Mirror onto the session so partial_monitor can corroborate.
+                session.vad_voice_active_ms = voice_active_ms
+                continue
+            # Mirror onto the session so partial_monitor can corroborate.
+            session.vad_voice_active_ms = voice_active_ms
+
+            if session.current_speaking_task is None or session.interruption_signaled:
+                # Not in SPEAKING / FILLER, or another path already fired —
+                # keep accumulating voice_active_ms so the surfaced count
+                # in the event reflects the user's actual span, but skip
+                # the cancel side-effect.
+                continue
+
+            if voice_active_ms < interruption_cfg.min_duration_ms:
+                continue
+
+            # PROTOTYPE 2026-06-03: VAD-source cancel DISABLED.
+            # VAD energy 信号容易被 ambient noise (椅子/风扇/呼吸/键盘)
+            # 误触发 — 2026-06-03 真 mic smoke #128 实证 rms=1705
+            # voice_active_ms=200 (接近 mac mic baseline) 误打断 AI
+            # 长回应. 改用 ASR partial text length gate (≥2 字)
+            # 作为唯一 barge-in 信号 (在 evaluate_partial 里),
+            # 噪音过不了 vendor model 不会识别成中文文字这道闸.
+            # VAD 仍 mirror voice_active_ms 给 partial_monitor 做 corroboration
+            # (550902d 加的防自环误触机制保留). 验证通过后 promote 到
+            # InterruptionConfig + openspec change interruption-detection-text-length-gate.
+            logger.info(
+                "vad_monitor_cancel_disabled_prototype "
+                "voice_active_ms=%s rms=%s "
+                "(barge-in 改靠 partial text length, 见 evaluate_partial)",
+                voice_active_ms, rms,
+            )
+            continue
+            # 下面原 cancel 路径暂时不走 (PROTOTYPE)
+            session.interruption_signaled = True
+            session.append_event(
+                "interruption",
+                interrupted_event_id=session.current_turn_id,
+                source="vad",
+                voice_active_ms=voice_active_ms,
+                rms=rms,
+            )
+            speaking_task = session.current_speaking_task
+            if speaking_task is not None and not speaking_task.done():
+                speaking_task.cancel()
+            # Reset so a new utterance after the interrupted reply starts
+            # fresh. ``interruption_signaled`` is cleared by the main loop
+            # after it processes the interruption.
+            voice_active_ms = 0
+            session.vad_voice_active_ms = 0
+    except asyncio.CancelledError:
+        return
 
 
 async def _attempt_hangup(telephony: TelephonyClient, call_id: int) -> None:

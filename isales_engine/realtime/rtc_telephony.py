@@ -128,6 +128,11 @@ class _CallState:
         self.device_id = device_id
         self.events_q: asyncio.Queue[TelephonyEvent | object] = asyncio.Queue()
         self.inbound_q: asyncio.Queue[bytes | object] = asyncio.Queue()
+        # Forked stream of the SAME inbound PCM frames, so a VAD monitor can
+        # run in parallel with ASR without competing for items in inbound_q.
+        # ``audio_in()`` consumes ``inbound_q``; ``audio_in_vad()`` consumes
+        # ``vad_q``. Both close on ``_SENTINEL``.
+        self.vad_q: asyncio.Queue[bytes | object] = asyncio.Queue()
         self.inbound_pump: asyncio.Task[None] | None = None
         self._outbound_ts: int = 0
         self._outbound_frame_ms = outbound_frame_ms
@@ -160,13 +165,191 @@ class _CallState:
         )
 
     async def _inbound_loop(self) -> None:
+        import time as _time  # noqa: PLC0415  # DIAG-REMOVE-AFTER-MIC-DEBUG
+        # DingRTC C++ SDK mixed-playback OnPlaybackAudioFrame defaults to
+        # 48 kHz output regardless of how peers join. ASR Provider (and
+        # 8 kHz GSM modem path) need 16 kHz / 8 kHz; resample inline here
+        # rather than burdening every consumer. ``audioop.ratecv`` is the
+        # stdlib stateful resampler (carries fractional sample state across
+        # chunks so a 20 ms 48 kHz chunk → exactly a 20 ms 16 kHz chunk).
+        # Python 3.14+ removes audioop; until then this is the lightweight
+        # path. ASR ``stream_recognize(audio_chunks)`` is the only consumer
+        # in v1.0, so 16 kHz target matches the V3 SAUC required rate.
+        try:
+            import audioop  # noqa: PLC0415
+        except ImportError:  # pragma: no cover  - Py 3.13+ replacement TBD
+            audioop = None
+        target_rate = 16000
+        ratecv_state: Any = None
+        # asr-noise-gate (experiment 2026-06-05) ----------------------------
+        # 与 asr_volcengine._push_audio 的 100ms 攒包配套使用。喂 ASR 那一路里,
+        # 低于阈值且已连续静音超过 hangover 的帧, 替换成数字静音 (全 0 PCM),
+        # 让 vendor 在规格正确的包下按 end_window_size(400ms) 及时切句。
+        # VAD 那一路 (self.vad_q) 保持原始音频, 不门控 (barge-in 检测要原信号)。
+        # 阈值/hangover 走 env; gate_rms=0 关闭。
+        # Removal/promote trigger: 真机验证空档塌到 <1s 且不碎句/不削轻声用户 →
+        # 固化为 campaign 配置 + 落 openspec change; 若碎句/削轻声, 回退本块。
+        import os as _os  # noqa: PLC0415
+        _gate_rms = int(_os.environ.get("ISALES_ASR_NOISE_GATE_RMS", "1500"))
+        _gate_hangover_ms = float(_os.environ.get("ISALES_ASR_NOISE_GATE_HANGOVER_MS", "300"))
+        _gate_silence_ms = 0.0
+        _gate_active = False
+        # asr-noise-gate end -------------------------------------------------
+        # DIAG-REMOVE-AFTER-MIC-DEBUG begin ----------------------------------
+        recv_count = 0
+        last_log_t = _time.monotonic()
+        last_log_count = 0
+        max_rms_window = 0
+        first_sender_uid: str | None = None
+        skipped_sender_count = 0
+        # DIAG: raw stereo 48k dump of the first 15 s of inbound, for
+        # measuring the real inbound signal (per-channel RMS over time).
+        # Controlled test: user stays SILENT during the greeting, then afplay /
+        # measure the dump — non-silent inbound while only the AI is talking
+        # would indicate the engine's own TTS reaching inbound; pure silence
+        # rules that out. (Use this to ground the VAD-threshold re-evaluation;
+        # the earlier "self-loopback" conclusion is retracted, pending this
+        # measurement.)
+        _raw_dump_path = "/tmp/inbound_raw_48k_stereo.pcm"
+        _raw_dump_fh: Any = None
+        _raw_dump_max_bytes = 15 * 48000 * 2 * 2  # 15s @ 48k stereo int16
+        _raw_dump_written = 0
+        try:
+            _raw_dump_fh = open(_raw_dump_path, "wb")
+        except Exception:  # noqa: BLE001
+            pass
+        # DIAG-REMOVE-AFTER-MIC-DEBUG end ------------------------------------
         try:
             async for frame in self.rtc_session.audio_frames():
-                if frame.sender_uid != self.edge_uid:
-                    # A 3rd uid joined our channel? Defence in depth —
-                    # spec says only edge + engine ever share a channel.
+                # DingRTC C++ SDK's `OnPlaybackAudioFrame` is **mixed** playback
+                # (no per-uid). Binding sets sender_uid = "" for mixed frames.
+                # `OnRemoteUserAudioFrame` (per-uid) is not exposed by the
+                # Linux 3.9.0 SDK (`expected_remote_uid_` filter exists in
+                # audio_observer.cpp but is never triggered on the playback
+                # path). In v1.0 a channel has exactly 2 peers (engine +
+                # edge), so a mixed frame ≡ edge's audio. Accept empty
+                # sender_uid as "from the only other peer = edge"; only
+                # skip frames bearing an unexpected non-empty uid (defence
+                # in depth against future multi-user channel changes).
+                if frame.sender_uid and frame.sender_uid != self.edge_uid:
+                    skipped_sender_count += 1  # DIAG-REMOVE-AFTER-MIC-DEBUG
                     continue
-                await self.inbound_q.put(frame.pcm)
+                # DIAG-REMOVE-AFTER-ECHO-TEST: dump raw stereo 48k frame.pcm
+                if _raw_dump_fh and _raw_dump_written < _raw_dump_max_bytes:
+                    _raw_dump_fh.write(frame.pcm)
+                    _raw_dump_written += len(frame.pcm)
+                    if _raw_dump_written >= _raw_dump_max_bytes:
+                        _raw_dump_fh.close()
+                        _raw_dump_fh = None
+                        logger.info(
+                            "inbound_raw_dump_complete path=%s bytes=%s "
+                            "(15s @ 48k stereo int16)",
+                            _raw_dump_path, _raw_dump_written,
+                        )
+                # DIAG-REMOVE-AFTER-MIC-DEBUG begin ---------------------------
+                if first_sender_uid is None:
+                    first_sender_uid = frame.sender_uid or "<empty>"
+                recv_count += 1
+                _p = frame.pcm
+                if _p and len(_p) >= 2:
+                    _sample_count = len(_p) // 2
+                    _stride = max(1, _sample_count // 32)
+                    _total = 0
+                    _seen = 0
+                    for _i in range(0, len(_p), _stride * 2):
+                        if _i + 2 > len(_p):
+                            break
+                        _s = int.from_bytes(_p[_i:_i + 2], "little", signed=True)
+                        _total += _s * _s
+                        _seen += 1
+                    if _seen:
+                        _rms = int((_total // _seen) ** 0.5)
+                        if _rms > max_rms_window:
+                            max_rms_window = _rms
+                # DIAG-REMOVE-AFTER-MIC-DEBUG end -----------------------------
+                pcm = frame.pcm
+                # DingRTC mixed playback frame on Linux 3.9 SDK is 48 kHz
+                # **stereo** int16 10 ms (1920 B = 480 samples × 2 ch × 2 B).
+                # ASR / VAD downstream consume 16 kHz **mono** int16. Two-step
+                # normalize: (1) stereo → mono (L+R)/2 with audioop.tomono,
+                # (2) 48 kHz → 16 kHz with audioop.ratecv using channels=1
+                # (post-downmix). Without (1) ratecv preserves stereo and the
+                # downstream ASR provider sees 16 kHz stereo bytes interpreted
+                # as 16 kHz mono → effective 2× tempo → vendor V3 SAUC returns
+                # `audio_info.duration=0 text=""` empty results (2026-06-01
+                # diagnostic on mac dev-no-modem fake-WAV upstream).
+                src_rate = int(frame.sample_rate or 0)
+                src_channels = int(getattr(frame, "channels", 1) or 1)
+                if src_channels > 1 and audioop is not None and pcm:
+                    pcm = audioop.tomono(pcm, 2, 0.5, 0.5)
+                # DIAG-REMOVE-AFTER-MIC-DEBUG: post-downmix RMS — verify
+                # stereo→mono didn't cancel L+R (phase-inverted channels).
+                _post_downmix_rms = 0
+                if audioop is not None and pcm:
+                    try:
+                        _post_downmix_rms = audioop.rms(pcm, 2)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if (
+                    src_rate > 0 and src_rate != target_rate
+                    and audioop is not None and pcm
+                ):
+                    pcm, ratecv_state = audioop.ratecv(
+                        pcm, 2, 1,
+                        src_rate, target_rate, ratecv_state,
+                    )
+                # DIAG-REMOVE-AFTER-MIC-DEBUG: post-resample RMS (final PCM going to ASR)
+                _final_rms = 0
+                if audioop is not None and pcm:
+                    try:
+                        _final_rms = audioop.rms(pcm, 2)
+                    except Exception:  # noqa: BLE001
+                        pass
+                # asr-noise-gate: 见 _inbound_loop 顶部说明。低于阈值且已连续
+                # 静音超过 hangover → 喂 vendor 数字静音, 触发 end_window 及时切句。
+                _asr_pcm = pcm
+                if _gate_rms > 0 and pcm:
+                    _frame_ms = (len(pcm) / 2.0) / (target_rate / 1000.0)
+                    if _final_rms >= _gate_rms:
+                        _gate_silence_ms = 0.0
+                    else:
+                        _gate_silence_ms += _frame_ms
+                        if _gate_silence_ms > _gate_hangover_ms:
+                            _asr_pcm = b"\x00" * len(pcm)
+                    _now_gating = _asr_pcm is not pcm
+                    if _now_gating != _gate_active:
+                        _gate_active = _now_gating
+                        logger.info(
+                            "asr_noise_gate sid=%s state=%s final_rms=%s "
+                            "silence_ms=%.0f gate_rms=%s",
+                            self.sid, "ENGAGED" if _now_gating else "RELEASED",
+                            _final_rms, _gate_silence_ms, _gate_rms,
+                        )
+                await self.inbound_q.put(_asr_pcm)
+                # Fork the same PCM to the VAD lane. Non-blocking put_nowait
+                # would risk dropping frames; await is safe because the VAD
+                # monitor drains as fast as ASR.
+                await self.vad_q.put(pcm)
+                # DIAG-REMOVE-AFTER-MIC-DEBUG begin ---------------------------
+                _now = _time.monotonic()
+                if _now - last_log_t >= 1.0:
+                    logger.info(
+                        "rtc_inbound_1s sid=%s recv=%s delta=%s raw_max_rms=%s "
+                        "post_downmix_rms=%s final_rms=%s "
+                        "sample_rate=%s channels=%s bytes=%s first_sender_uid=%s "
+                        "skipped_sender=%s edge_uid=%s after_resample_bytes=%s",
+                        self.sid, recv_count, recv_count - last_log_count,
+                        max_rms_window, _post_downmix_rms, _final_rms,
+                        frame.sample_rate,
+                        getattr(frame, "channels", "?"),
+                        len(_p),
+                        first_sender_uid, skipped_sender_count, self.edge_uid,
+                        len(pcm),
+                    )
+                    last_log_t = _now
+                    last_log_count = recv_count
+                    max_rms_window = 0
+                # DIAG-REMOVE-AFTER-MIC-DEBUG end -----------------------------
         except RtcNotJoined:
             # close_iterators() may race ahead of this task being
             # scheduled: leave() invalidates the session before the pump
@@ -174,8 +357,9 @@ class _CallState:
             # sentinel still goes out in `finally`.
             pass
         finally:
-            # Terminator for audio_in() consumers.
+            # Terminator for audio_in() / audio_in_vad() consumers.
             await self.inbound_q.put(_SENTINEL)
+            await self.vad_q.put(_SENTINEL)
 
     # ----- dispatcher-driven event handlers ------------------------------
 
@@ -381,6 +565,25 @@ class RtcTelephonyClient(TelephonyClient):
         async def _iter() -> AsyncIterator[bytes]:
             while True:
                 item = await state.inbound_q.get()
+                if item is _SENTINEL:
+                    return
+                assert isinstance(item, bytes)
+                yield item
+
+        return _iter()
+
+    def audio_in_vad(self, call_id: int) -> AsyncIterator[bytes]:
+        """Fork of the inbound PCM stream for a VAD monitor.
+
+        Same frames as ``audio_in()`` but on a parallel queue so VAD-based
+        barge-in detection can run alongside ASR without ASR-vendor partial
+        latency. Closes on the same ``_SENTINEL`` as ``audio_in``.
+        """
+        state = self._require_state(call_id)
+
+        async def _iter() -> AsyncIterator[bytes]:
+            while True:
+                item = await state.vad_q.get()
                 if item is _SENTINEL:
                     return
                 assert isinstance(item, bytes)

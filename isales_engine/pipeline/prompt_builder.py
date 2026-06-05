@@ -1,18 +1,34 @@
-"""Assemble system / user messages for role / judge / polish LLM calls.
+"""Assemble system / user messages for the main LLM call.
 
-Spec: role-prompt § Requirement: Prompt 三段式组装; § 收尾期间在 system prompt
-末尾追加指令; § 跟进通话的 prompt 增强.
+Spec: role-prompt § "System message 内容" / "User message 拼接结构" /
+"收尾期间在 system prompt 末尾追加指令" / "跟进通话的 prompt 增强".
+
+pipeline-stream-and-referee: the judge / polish builders and the
+ROLE/JUDGE/POLISH_OUTPUT_SCHEMA_SUFFIX constants are gone. The main LLM now
+emits **plain text** (no JSON Mode), so the engine MUST NOT inject any
+output-format suffix — the campaign-authored prompt owns its output rules
+(role-prompt § "输出格式约束必须保留" — engine MUST NOT 强制注入约束). The only
+engine-appended segment is the WRAPPING_UP closing instruction, which MUST be
+last.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from isales_common.providers._models import Message
+from isales_common.schemas.pipeline import (
+    ExtractorSpec,
+    MainSpec,
+    RefereeSpec,
+    RestructureSpec,
+)
 
 from isales_engine.call_session import CallSession
 
+# Appended to the main system prompt, last, during WRAPPING_UP only
+# (role-prompt § 收尾期间在 system prompt 末尾追加指令).
 WRAP_UP_APPEND = """
 
 ---
@@ -30,36 +46,6 @@ SHORT_REPLY_APPEND = "\n\n【打断保护】请用一句话回应。"
 
 
 @dataclass
-class RoleSpec:
-    role_config_id: int
-    prompt_version_id: int
-    system_prompt: str
-    model: str = "mock"
-    temperature: float = 1.0
-    top_p: float = 1.0
-
-
-@dataclass
-class JudgeSpec:
-    role_config_id: int
-    prompt_version_id: int
-    system_prompt: str
-    model: str = "mock"
-    temperature: float = 1.0
-    top_p: float = 1.0
-
-
-@dataclass
-class PolishSpec:
-    role_config_id: int
-    prompt_version_id: int
-    system_prompt: str
-    model: str = "mock"
-    temperature: float = 1.0
-    top_p: float = 1.0
-
-
-@dataclass
 class LeadInfo:
     name: str | None
     phone: str
@@ -68,55 +54,65 @@ class LeadInfo:
 
 @dataclass
 class PipelineConfig:
-    roles: list[RoleSpec]
-    judges: list[JudgeSpec]
-    polish: PolishSpec
+    """Engine-side runtime pipeline config.
+
+    Composes the three shared LLM slots (``isales_common.schemas.pipeline``)
+    with the per-call rendering inputs the prompt builder needs. The common
+    ``PipelineConfig`` is the minimal data contract; this is the richer runtime
+    object the engine actually threads through run_loop / orchestrator.
+    """
+
+    main: MainSpec
+    # engine-multi-referee-and-restructure: N parallel referees (was a single
+    # ``referee``) + an optional restructure (re-voice) slot + the campaign's
+    # ordered routing rules and restructure caps.
+    referees: list[RefereeSpec]
+    extractor: ExtractorSpec
     default_replies: list[str]
     lead: LeadInfo
+    restructure: RestructureSpec | None = None
+    # Raw routing rules (list of dicts) as stored in campaign.routing_rules.
+    routing_rules: list[dict[str, Any]] = field(default_factory=list)
+    max_continuous_restructure: int = 2
+    primary_referee_label: str | None = None
     last_call_summary: str | None = None
     follow_up_count: int = 0
     short_reply_active: bool = False
+    # Snapshot helper: True once a WRAPPING_UP turn appended the closing
+    # instruction (written to call_record.prompt_versions.wrap_up_appended).
+    wrap_up_appended: bool = field(default=False)
 
 
-def build_role_messages(
+def build_main_messages(
     session: CallSession,
-    role: RoleSpec,
     config: PipelineConfig,
     *,
     is_wrap_up: bool,
 ) -> list[Message]:
-    system = "[role] " + role.system_prompt
-    if is_wrap_up:
-        system += WRAP_UP_APPEND
+    """Assemble the [system, user] messages for one main LLM streaming call.
+
+    The whole conversation goes in a single user message (role-prompt § "不使用
+    标准 chat multi-turn"). No output-format suffix is injected.
+    """
+    system = config.main.system_prompt
     if config.follow_up_count > 0:
         system += FOLLOW_UP_APPEND_TEMPLATE.format(n=config.follow_up_count)
     if config.short_reply_active:
         system += SHORT_REPLY_APPEND
+    # WRAP_UP_APPEND MUST be last (role-prompt § WRAPPING_UP 进入即追加).
+    if is_wrap_up:
+        system += WRAP_UP_APPEND
 
     user = _build_user_message(session, config)
     return [Message(role="system", content=system), Message(role="user", content=user)]
 
 
-def build_judge_messages(judge: JudgeSpec, candidate_reply: str) -> list[Message]:
-    system = "[judge] " + judge.system_prompt
-    user = f"请审查以下候选回复：\n{candidate_reply}"
-    return [Message(role="system", content=system), Message(role="user", content=user)]
-
-
-def build_polish_messages(
-    polish: PolishSpec, candidates: list[str]
-) -> list[Message]:
-    system = "[polish] " + polish.system_prompt
-    body_lines = [f"candidate[{i}]: {reply}" for i, reply in enumerate(candidates)]
-    user = "请润色并选优：\n" + "\n".join(body_lines)
-    return [Message(role="system", content=system), Message(role="user", content=user)]
-
-
-def build_greeting_messages(role: RoleSpec, config: PipelineConfig) -> list[Message]:
-    system = "[role] " + role.system_prompt
+def build_greeting_messages(config: PipelineConfig) -> list[Message]:
+    """Assemble messages for the LLM-generated greeting (main slot, plain text)."""
+    system = config.main.system_prompt
     user = (
         f"【线索信息】name={config.lead.name or '—'}, phone={config.lead.phone}\n"
-        "【任务】请生成开场白。"
+        "【任务】请生成开场白，直接输出要对客户说的话。"
     )
     return [Message(role="system", content=system), Message(role="user", content=user)]
 

@@ -10,14 +10,17 @@ from typing import Any
 
 import pytest
 from isales_common.providers._models import ASRResult
+from isales_common.schemas.pipeline import (
+    ExtractorSpec,
+    MainSpec,
+    RefereeSpec,
+    RestructureSpec,
+)
 
-from isales_engine.call_session import CallSession
+from isales_engine.call_session import CallSession, DialogTurn
 from isales_engine.pipeline.prompt_builder import (
-    JudgeSpec,
     LeadInfo,
     PipelineConfig,
-    PolishSpec,
-    RoleSpec,
 )
 from isales_engine.providers.asr_mock import ScriptedMockASR
 from isales_engine.providers.llm_mock import KeywordDrivenMockLLM
@@ -26,7 +29,11 @@ from isales_engine.realtime.filler_manager import FillerPhraseSpec, FillerSetSpe
 from isales_engine.realtime.interruption_detector import InterruptionConfig
 from isales_engine.realtime.mock_telephony import MockTelephonyClient
 from isales_engine.realtime.silence_detector import SilenceConfig
-from isales_engine.run_loop import Providers, run_session
+from isales_engine.run_loop import (
+    Providers,
+    _assemble_interrupt_text,
+    run_session,
+)
 from isales_engine.runtime_config import RuntimeConfig
 from isales_engine.transfer.manager import TransferConfig
 from isales_engine.wrapup.manager import WrapUpConfig
@@ -45,31 +52,74 @@ def _make_session(call_id: int = 1) -> CallSession:
 def _make_config(
     *,
     transfer_keywords: tuple[str, ...] = (),
+    transfer_llm_enabled: bool = False,
     wrap_up_max_rounds: int = 1,
     wrap_up_max_seconds: int = 30,
     silence_threshold_ms: int = 500,
+    filler_enabled: bool = False,
+    enable_restructure: bool = False,
+    routing_rules: list | None = None,
+    max_continuous_restructure: int = 2,
+    # Legacy params kept for call-site compatibility; the dual-LLM pipeline has
+    # exactly one main / referee / extractor slot (no N-role / M-judge PK).
     n_roles: int = 1,
     n_judges: int = 0,
 ) -> RuntimeConfig:
+    restructure_spec = (
+        RestructureSpec(
+            role_config_id=700,
+            prompt_version_id=800,
+            system_prompt="用口语化方式重组这句话：",
+            label="rewrite",
+        )
+        if enable_restructure
+        else None
+    )
     pipeline = PipelineConfig(
-        roles=[
-            RoleSpec(
-                role_config_id=100 + i,
-                prompt_version_id=200 + i,
-                system_prompt=f"role-{i}",
+        main=MainSpec(
+            role_config_id=100, prompt_version_id=200, system_prompt="你是销售助手。"
+        ),
+        referees=[
+            RefereeSpec(
+                role_config_id=300,
+                prompt_version_id=400,
+                system_prompt=(
+                    "判定对话状态。用户最后一句话：{{user_last_utterance}}\n"
+                    "最近对话：\n{{recent_dialog_history}}"
+                ),
+                label="main_judge",
             )
-            for i in range(n_roles)
         ],
-        judges=[
-            JudgeSpec(
-                role_config_id=300 + i,
-                prompt_version_id=400 + i,
-                system_prompt=f"judge-{i}",
-            )
-            for i in range(n_judges)
+        # Equivalent default routing rules seeded by the migration: the mock
+        # referee emits goal_achieved / transfer / customer_decline categories.
+        routing_rules=routing_rules
+        if routing_rules is not None
+        else [
+            {
+                "referee": "main_judge",
+                "match": ["goal_achieved"],
+                "action": {
+                    "type": "transition",
+                    "to": "goal_achieved",
+                    "goal_type": "appointment",
+                },
+            },
+            {
+                "referee": "main_judge",
+                "match": ["transfer"],
+                "action": {"type": "transition", "to": "transfer"},
+            },
+            {
+                "referee": "main_judge",
+                "match": ["customer_decline"],
+                "action": {"type": "transition", "to": "customer_decline"},
+            },
         ],
-        polish=PolishSpec(
-            role_config_id=999, prompt_version_id=1999, system_prompt="polish"
+        max_continuous_restructure=max_continuous_restructure,
+        primary_referee_label="main_judge",
+        restructure=restructure_spec,
+        extractor=ExtractorSpec(
+            role_config_id=500, prompt_version_id=600, system_prompt="抽取字段。"
         ),
         default_replies=["好的，请稍等。"],
         lead=LeadInfo(name="李四", phone="+8613800000000", custom_data={}),
@@ -98,8 +148,8 @@ def _make_config(
             intent_system_prompt="",
             round_enabled=False,
             round_threshold=None,
-            llm_enabled=False,
-            llm_system_prompt="",
+            llm_enabled=transfer_llm_enabled,
+            llm_system_prompt="独立判定是否转人工。",
             phrases=("您稍等，专员稍后联系您。",),
         ),
         wrap_up=WrapUpConfig(
@@ -119,6 +169,7 @@ def _make_config(
         voice_id="default",
         fixed_greeting="您好我是 AI 助手。",
         max_no_progress_seconds=None,
+        filler_enabled=filler_enabled,
     )
 
 
@@ -202,6 +253,41 @@ async def test_run_session_transfer_keyword_marks_handoff() -> None:
     assert "transfer_marked" in types
     # The pipeline should NOT have run for a transfer turn.
     assert session.pipeline_trace_records == []
+
+
+async def test_run_session_transfer_llm_parallel_marks_handoff() -> None:
+    """pipeline-latency-tail § D: transfer_llm runs in parallel with main
+    streaming (not before PROCESSING). The main pipeline still runs that turn,
+    and the parallel detector drives the handoff when the referee did not."""
+    session = _make_session()
+    # "投诉" trips the mock independent transfer_llm (transfer=true) but NOT the
+    # mock referee (its 转人工/人工 regex misses 投诉 → decision=continue), so the
+    # parallel detector is what marks the handoff.
+    config = _make_config(transfer_llm_enabled=True, silence_threshold_ms=3000)
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    async def driver() -> None:
+        await asyncio.sleep(0.05)
+        await asr.feed_turn("我要投诉你们的服务")
+        await asyncio.sleep(0.15)
+
+    driver_task = asyncio.create_task(driver())
+    await run_session(
+        session,
+        phone="+8613800000000",
+        config=config,
+        telephony=tel,
+        providers=providers,
+    )
+    await driver_task
+
+    assert session.state.value == "end"
+    assert session.transfer_status == "marked_for_handoff"
+    assert session.transfer_reason == "llm"
+    # The main pipeline DID run this turn — transfer_llm did not gate PROCESSING.
+    assert session.pipeline_trace_records != []
 
 
 # ---- goal_achieved → wrap-up → exhausted → END ----------------------------
@@ -297,6 +383,127 @@ async def test_run_session_dial_no_connect_returns_no_answer() -> None:
 
     assert session.state.value == "end"
     assert session.hangup_cause == "no_answer"
+
+
+# ---- restructure: InterruptText assembly (§4.4 / §4.5) --------------------
+
+
+async def test_assemble_interrupt_text_last_reply():
+    """source=last_reply takes the last assistant utterance (no history blob)."""
+    sess = _make_session()
+    sess.dialog_history.append(DialogTurn(role="assistant", text="第一句", ts_ms=0))
+    sess.dialog_history.append(DialogTurn(role="user", text="嗯", ts_ms=1))
+    sess.dialog_history.append(DialogTurn(role="assistant", text="最后一句要点", ts_ms=2))
+    assert _assemble_interrupt_text(sess, "last_reply") == "最后一句要点"
+
+
+async def test_assemble_interrupt_text_interrupt_remaining_consumes_and_clears():
+    sess = _make_session()
+    sess.dialog_history.append(DialogTurn(role="assistant", text="上一句", ts_ms=0))
+    sess.interrupt_remaining_text = "被打断的残留内容"
+    assert _assemble_interrupt_text(sess, "interrupt_remaining") == "被打断的残留内容"
+    # consumed — cleared after taking it.
+    assert sess.interrupt_remaining_text is None
+
+
+async def test_assemble_interrupt_text_interrupt_remaining_degrades_when_empty():
+    """Empty remainder degrades to last_reply (§4.5)."""
+    sess = _make_session()
+    sess.dialog_history.append(DialogTurn(role="assistant", text="退化到这句", ts_ms=0))
+    sess.interrupt_remaining_text = None
+    assert _assemble_interrupt_text(sess, "interrupt_remaining") == "退化到这句"
+
+
+async def test_assemble_interrupt_text_none_when_no_assistant():
+    sess = _make_session()
+    sess.dialog_history.append(DialogTurn(role="user", text="只有用户", ts_ms=0))
+    assert _assemble_interrupt_text(sess, "last_reply") is None
+
+
+# ---- restructure: end-to-end fires, no referee, caps (§4.4/4.6/4.7) --------
+
+_RESTRUCTURE_RULE = [
+    {
+        "referee": "main_judge",
+        "match": ["continue"],
+        "action": {"type": "restructure", "source": "last_reply"},
+    }
+]
+
+
+async def test_run_session_restructure_fires_and_records_trace() -> None:
+    """A continue→restructure rule re-voices the last reply: the turn yields a
+    second ai_reply and a restructure-active trace, with no referee on the
+    restructure turn (§4.4 / §4.7)."""
+    session = _make_session()
+    config = _make_config(
+        enable_restructure=True,
+        routing_rules=_RESTRUCTURE_RULE,
+        silence_threshold_ms=3000,
+    )
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    async def driver() -> None:
+        await asyncio.sleep(0.05)
+        await asr.feed_turn("随便聊聊")  # mock referee → category "continue"
+        await asyncio.sleep(0.2)
+        await tel.simulate_remote_hangup(1)
+
+    driver_task = asyncio.create_task(driver())
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await driver_task
+
+    traces = session.pipeline_trace_records
+    assert traces, "expected at least one PROCESSING trace"
+    first = traces[0]
+    assert first["restructure_active"] is True
+    assert first["restructure_trigger"] == "last_reply"
+    assert first["restructure_source_text"]
+    # restructure turn does not spawn referees (its own trace not added; it
+    # reuses the main turn). At least two ai_reply events: main + restructure.
+    ai_replies = [e for e in session.full_transcript if e["type"] == "ai_reply"]
+    assert len(ai_replies) >= 2
+    assert session.consecutive_restructure_count >= 1
+
+
+async def test_run_session_restructure_caps_then_plays_default() -> None:
+    """After max_continuous_restructure consecutive restructures, the engine
+    stops re-voicing and plays a default reply, resetting the counter (§4.6)."""
+    session = _make_session()
+    config = _make_config(
+        enable_restructure=True,
+        routing_rules=_RESTRUCTURE_RULE,
+        max_continuous_restructure=1,
+        silence_threshold_ms=3000,
+    )
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    async def driver() -> None:
+        await asyncio.sleep(0.05)
+        await asr.feed_turn("第一轮随便说")
+        await asyncio.sleep(0.2)
+        await asr.feed_turn("第二轮还是随便")
+        await asyncio.sleep(0.2)
+        await tel.simulate_remote_hangup(1)
+
+    driver_task = asyncio.create_task(driver())
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await driver_task
+
+    # First turn restructures (count→1); second turn is capped (count reset 0).
+    assert session.consecutive_restructure_count == 0
+    # Exactly one restructure actually fired (turn 1). The capped turn's trace
+    # has restructure_active=False even though the rule matched restructure.
+    active = [t for t in session.pipeline_trace_records if t["restructure_active"]]
+    assert len(active) == 1, "only the first (uncapped) turn should re-voice"
 
 
 # Silence the unused-import linter for ASRResult (used in type hints in the

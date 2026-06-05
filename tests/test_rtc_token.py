@@ -24,6 +24,7 @@ import pytest
 from isales_engine.transport.rtc_token import (
     RtcCredentials,
     RtcTokenIssuer,
+    _pack_options,
 )
 
 
@@ -96,7 +97,12 @@ def _reference_token(
     ub = user_id.encode()
     body.write(struct.pack(">I", len(ub))); body.write(ub)
     body.write(struct.pack(">?", False))  # no privilege
-    body.write(struct.pack(">?", False))  # no engine_options
+    # Vendor sample's AppTokenOptions initialises engine_options={} (empty
+    # dict), not None — so the options block always emits a 5-byte
+    # ``True + uint32(0)`` header, NOT the 1-byte ``False`` shortcut.
+    # DingRTC 3.x's GSLB requires this exact byte layout for HMAC validation
+    # (caught 2026-05-26 via vendor console token byte-diff).
+    body.write(struct.pack(">?I", True, 0))  # engine_options={} → True+count=0
 
     def pad256(b: bytes) -> bytes:
         n = len(b)
@@ -140,6 +146,49 @@ def test_token_matches_official_sample_byte_for_byte() -> None:
     assert creds.user_id == "engine-call-001"
     assert creds.issue_ts == 1_700_000_000
     assert creds.salt == 42
+
+
+def test_pack_options_distinguishes_none_from_empty_dict() -> None:
+    """REGRESSION 2026-05-26: ``_pack_options`` MUST emit different bytes
+    for ``None`` (1-byte ``False``, no block) vs ``{}`` (5-byte
+    ``True+uint32(0)``, empty block).
+
+    The previous impl used ``if not engine_options:`` which treated ``{}``
+    as falsy and emitted only 1 byte, making our self-signed tokens 4 bytes
+    shorter than vendor console / GSLB-issued tokens of the same shape,
+    breaking HMAC validation with HTTP 401 ``CLIENT_ERROR_INVALID_AUTHORIZATION``.
+
+    See ground-truth notes in
+    ``openspec/changes/engine-rtc-dingrtc-migration/notes/sdk_api_ground_truth.md``.
+    """
+    assert _pack_options(None) == b"\x00"
+    assert _pack_options({}) == b"\x01\x00\x00\x00\x00"
+
+
+def test_sign_default_emits_empty_options_block() -> None:
+    """REGRESSION 2026-05-26: ``RtcTokenIssuer.sign()`` called without
+    ``engine_options`` MUST default to ``{}`` (vendor parity), not ``None``.
+
+    Otherwise GSLB returns 401 on every self-signed token. The signed body
+    bytes after the timestamp+expire fields MUST begin with privilege byte
+    (1 byte ``False``) + options-block-header (5 bytes ``True+uint32(0)``).
+    """
+    issuer = RtcTokenIssuer(app_id="a", app_key="k")
+    creds = issuer.sign(channel="c", user_id="u", now=100, ttl_seconds=10, issue_ts=99, salt=7)
+
+    # Decompress and locate options block to check it's the 5-byte form.
+    raw = zlib.decompress(base64.b64decode(creds.token[3:]))
+    # Layout: sig_len(4) + sig(32) + body_padded
+    body = raw[4 + 32:]
+    # Body fields: app_id_len(4)+app_id(1) + issue_ts(4) + salt(4) + expire(4)
+    #            + ch_len(4)+ch(1) + uid_len(4)+uid(1) + privilege(1) + options
+    options_offset = 4 + 1 + 4 + 4 + 4 + 4 + 1 + 4 + 1 + 1
+    options = body[options_offset:options_offset + 5]
+    assert options == b"\x01\x00\x00\x00\x00", (
+        f"sign() emitted {options.hex()} for default options; expected 5-byte "
+        f"'True+count=0' block (vendor sample's empty-dict default). If this "
+        f"fails, GSLB will reject tokens with 401 invalid_authorization."
+    )
 
 
 def test_pinned_inputs_produce_pinned_token() -> None:

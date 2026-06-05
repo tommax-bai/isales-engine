@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from isales_common.enums import CallStatus
 
@@ -16,7 +18,7 @@ def make_session(call_record_id: int = 1) -> CallSession:
         campaign_id=42,
         lead_id=7,
         caller_id="+8613800000000",
-        prompt_versions_snapshot={"role_llms": [], "judge_llm": None, "polish_llm": None},
+        prompt_versions_snapshot={"main_llm": None, "referee_llm": None, "extractor_llm": None},
     )
 
 
@@ -49,47 +51,109 @@ def test_full_normal_path() -> None:
     assert s.state == CallStatus.END
 
 
-def test_illegal_transition_raises_and_logs_state_error() -> None:
+def test_unusual_transition_writes_warning_and_continues(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Spec call-state-machine § 非法 transition 改 advisory 警告 / Scenario 非常规 transition 不抛异常."""
+
     s = make_session()
     sm = StateMachine(s)
-    # INIT -> SPEAKING is not in LEGAL_TRANSITIONS.
-    with pytest.raises(IllegalTransition):
+
+    with caplog.at_level(logging.WARNING, logger="isales_engine.state_machine"):
+        # INIT -> SPEAKING is not in LEGAL_TRANSITIONS — should NOT raise.
         sm.transition_to(CallStatus.SPEAKING, reason="bug")
 
-    assert s.state == CallStatus.INIT  # state unchanged
-    assert any(e["type"] == "state_error" for e in s.full_transcript)
-    err = next(e for e in s.full_transcript if e["type"] == "state_error")
-    assert err["from_state"] == "init"
-    assert err["to_state"] == "speaking"
+    # State actually advanced.
+    assert s.state == CallStatus.SPEAKING
+    assert s.previous_state == CallStatus.INIT
+    assert s.state_history[-1] == (CallStatus.INIT, CallStatus.SPEAKING, "bug")
+
+    # Transcript got a state_warning event (NOT state_error).
+    assert any(e["type"] == "state_warning" for e in s.full_transcript)
+    assert not any(e["type"] == "state_error" for e in s.full_transcript)
+
+    # logger.warning was emitted with a greppable signature.
+    assert any(
+        "state_transition_unusual" in record.message
+        and record.levelno == logging.WARNING
+        for record in caplog.records
+    )
 
 
-def test_force_skips_legality_check() -> None:
+def test_state_warning_event_payload() -> None:
+    """Spec call-state-machine § 非法 transition 改 advisory 警告 — transcript payload shape."""
+
     s = make_session()
     sm = StateMachine(s)
-    # WRAPPING_UP -> END is legal; INIT -> END is also legal — pick a really
-    # illegal one: END -> GREETING.
+    sm.transition_to(CallStatus.SPEAKING, reason="bug")
+
+    warn = next(e for e in s.full_transcript if e["type"] == "state_warning")
+    assert warn["attempted"] == "bug"
+    assert warn["from_state"] == "init"
+    assert warn["to_state"] == "speaking"
+
+
+def test_force_true_backward_compat() -> None:
+    """Spec call-state-machine § force=True 参数 backward-compat.
+
+    force=True remains accepted (no signature change) but the behavior is
+    equivalent to not passing force — both paths complete the transition.
+    """
+
+    s = make_session()
+    sm = StateMachine(s)
+
+    # First reach END (legal from INIT).
     sm.transition_to(CallStatus.END, reason="dial_fail")
+    assert s.state == CallStatus.END
+
+    # END -> GREETING is unusual (END has no outgoing transitions). With
+    # force=True, transition still completes via the advisory path — same as
+    # if force had been omitted.
     sm.transition_to(CallStatus.GREETING, reason="forced", force=True)
     assert s.state == CallStatus.GREETING
 
+    # The advisory event was still written even with force=True.
+    assert any(
+        e["type"] == "state_warning" and e["from_state"] == "end" and e["to_state"] == "greeting"
+        for e in s.full_transcript
+    )
 
-def test_terminal_end_has_no_outgoing_transitions() -> None:
+
+def test_unusual_transition_from_terminal_end_does_not_raise() -> None:
+    """Spec call-state-machine § IllegalTransition 类保留但不再抛出."""
+
     s = make_session()
     sm = StateMachine(s)
     sm.transition_to(CallStatus.END, reason="dial_fail")
-    with pytest.raises(IllegalTransition):
-        sm.transition_to(CallStatus.LISTENING, reason="bug")
+    # END has no outgoing transitions — pre-soften this raised. Now advisory.
+    sm.transition_to(CallStatus.LISTENING, reason="bug")
+    assert s.state == CallStatus.LISTENING
 
 
-def test_transferring_only_to_end() -> None:
+def test_unusual_transition_from_transferring_does_not_raise() -> None:
+    """TRANSFERRING -> PROCESSING is not in LEGAL_TRANSITIONS but no longer raises."""
+
     s = make_session()
     sm = StateMachine(s)
     sm.transition_to(CallStatus.GREETING, reason="connected")
     sm.transition_to(CallStatus.LISTENING, reason="greeting_done")
     sm.transition_to(CallStatus.TRANSFERRING, reason="keyword_hit")
-    with pytest.raises(IllegalTransition):
-        sm.transition_to(CallStatus.PROCESSING, reason="bug")
+    sm.transition_to(CallStatus.PROCESSING, reason="bug")
+    assert s.state == CallStatus.PROCESSING
     sm.transition_to(CallStatus.END, reason="marked_for_handoff")
+    assert s.state == CallStatus.END
+
+
+def test_illegal_transition_class_still_importable() -> None:
+    """Spec call-state-machine § IllegalTransition 类可被 import 但不会被抛出."""
+
+    # Class definition retained.
+    assert issubclass(IllegalTransition, RuntimeError)
+    # Can still be constructed (in case any caller code still does so).
+    exc = IllegalTransition(CallStatus.INIT, CallStatus.SPEAKING, reason="bug")
+    assert "init -> speaking" in str(exc)
+    assert exc.reason == "bug"
 
 
 def test_meta_dict_emits_state_changed_event() -> None:

@@ -33,6 +33,7 @@ from isales_engine.dial_consumer import dial_loop
 from isales_engine.event_consumer import subscribe_loop
 from isales_engine.event_publisher import EventPublisher
 from isales_engine.providers.factory import build_asr, build_llm, build_tts
+from isales_engine.providers.tts_cache import CachingTTSProvider, TtsCacheStore
 from isales_engine.realtime.mock_telephony import MockTelephonyClient
 from isales_engine.realtime.real_telephony import RealTelephonyClient
 from isales_engine.realtime.rtc_telephony import RtcTelephonyClient
@@ -46,7 +47,10 @@ from isales_engine.run_loop import (
 from isales_engine.runtime_config import load_runtime_config
 from isales_engine.session_manager import SessionManager
 from isales_engine.settings import Settings, load_settings
-from isales_engine.transport.aliyun_rtc import AliyunRtcSession, InMemorySdkChannel
+from isales_engine.transport.dingrtc import (
+    DingRtcSession,
+    InMemoryDingRtcChannel,
+)
 from isales_engine.transport.grpc_server import CloudEdgeGrpcServer
 from isales_engine.transport.hardware_alert_handler import log_hardware_alert
 from isales_engine.transport.heartbeat_handler import make_heartbeat_handler
@@ -88,13 +92,16 @@ def _build_telephony(
         )
         sdk_kind = settings.engine_rtc_sdk_kind
         if sdk_kind == "vendor":
-            def rtc_factory() -> AliyunRtcSession:
-                return AliyunRtcSession.production(
+            def rtc_factory() -> DingRtcSession:
+                return DingRtcSession.production(
                     app_id=settings.engine_rtc_app_id,
                 )
         elif sdk_kind == "in_memory":
-            def rtc_factory() -> AliyunRtcSession:
-                return AliyunRtcSession(channel=InMemorySdkChannel())
+            def rtc_factory() -> DingRtcSession:
+                return DingRtcSession(
+                    channel=InMemoryDingRtcChannel(),
+                    app_id=settings.engine_rtc_app_id,
+                )
         else:
             raise RuntimeError(
                 f"unknown engine_rtc_sdk_kind: {sdk_kind!r}",
@@ -160,6 +167,7 @@ def _make_runner(
     publisher: EventPublisher,
     settings: Settings,
     credentials: CredentialStore,
+    tts_cache: TtsCacheStore,
 ) -> Callable[[CallSession], Awaitable[None]]:
     """Return the ``runner`` callable consumed by ``dial_consumer.dial_loop``."""
 
@@ -200,8 +208,15 @@ def _make_runner(
 
         providers = Providers(
             llm=build_llm(settings.engine_llm_provider, store=credentials),
-            asr=build_asr(settings.engine_asr_provider, store=credentials),
-            tts=build_tts(settings.engine_tts_provider, store=credentials),
+            asr=build_asr(
+                settings.engine_asr_provider,
+                store=credentials,
+                partial_stable_s=runtime.asr_partial_stable_s,
+            ),
+            tts=CachingTTSProvider(
+                build_tts(settings.engine_tts_provider, store=credentials),
+                tts_cache,
+            ),
         )
 
         # The DialCommand on the edge carries the scheduler-selected
@@ -212,16 +227,26 @@ def _make_runner(
         if callable(hint):
             hint(session.call_record_id, session.device_id)
 
-        await run_session(
-            session,
-            phone=phone,
-            config=runtime,
-            telephony=telephony,
-            providers=providers,
-            publisher=publisher,
-            pipeline_timeout_ms=settings.engine_pipeline_default_timeout_ms,
-            token_budget_per_call=settings.engine_token_budget_per_call,
-        )
+        try:
+            await run_session(
+                session,
+                phone=phone,
+                config=runtime,
+                telephony=telephony,
+                providers=providers,
+                publisher=publisher,
+                pipeline_timeout_ms=settings.engine_pipeline_default_timeout_ms,
+                token_budget_per_call=settings.engine_token_budget_per_call,
+            )
+        finally:
+            # Providers are per-call; release the TTS + LLM providers'
+            # persistent HTTP clients so their keep-alive connections aren't
+            # leaked (pipeline-latency-tail § C — TTS + LLM connection reuse).
+            for provider in (providers.tts, providers.llm):
+                aclose = getattr(provider, "aclose", None)
+                if callable(aclose):
+                    with contextlib.suppress(Exception):
+                        await aclose()
 
     return _run
 
@@ -273,12 +298,18 @@ async def _main() -> None:
 
     credentials = await _load_credentials(sessionmaker, settings)
 
+    # Process-level fixed-phrase TTS cache shared across all calls
+    # (tts-cache-and-gated-filler § A): greeting / silence / transfer / filler
+    # phrases synthesize once per process, then replay zero-synth.
+    tts_cache = TtsCacheStore()
+
     runner = _make_runner(
         sessionmaker=sessionmaker,
         telephony=telephony,
         publisher=publisher,
         settings=settings,
         credentials=credentials,
+        tts_cache=tts_cache,
     )
 
     async def _on_manual_hangup(call_record_id: int, _operator: str | None) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 from isales_common.providers._models import ASRResult
 
@@ -15,8 +16,15 @@ from isales_engine.run_loop import (
     Providers,
     _decide_protection,
     _partial_monitor,
+    _play_streaming,
     _play_tts,
     run_session,
+)
+from tests.test_play_streaming import (
+    _connected,
+    _FakeStream,
+    _GatedTelephony,
+    _RecordingTTS,
 )
 from tests.test_run_loop import _make_config, _make_session
 
@@ -75,8 +83,21 @@ async def test_partial_monitor_triggers_cancel_on_long_non_whitelist_partial() -
     speaking_task = asyncio.create_task(fake_speaking())
     session.current_speaking_task = speaking_task
 
-    # Push partials: one early (below threshold) then one late (above threshold).
+    # Push partials: one early (anchors the wall-clock start) then one
+    # late (above the 400ms duration threshold). The monitor uses
+    # time.monotonic() rather than partial.timestamp_ms (V3 SAUC's
+    # audio-domain end_time stays constant across confirmation partials),
+    # so the synthetic delay needs to be wall-clock real, not just an
+    # asserted field on the ASRResult.
     await asr_partials_q.put(ASRResult(text="您看", is_final=False, timestamp_ms=100))
+    # Sleep slightly more than min_duration_ms so the second partial's
+    # wall-clock anchor delta clears the threshold.
+    await asyncio.sleep(0.45)
+    # Pretend the VAD monitor has registered above-baseline voice energy
+    # for the same span — without this, partial_monitor's VAD-corroboration
+    # check skips the trigger (defensive guard against DingRTC mixed-playback
+    # self-loopback being mis-transcribed as user speech).
+    session.vad_voice_active_ms = 450
     await asr_partials_q.put(
         ASRResult(text="您看这个内容不太对", is_final=False, timestamp_ms=600)
     )
@@ -277,5 +298,72 @@ async def test_listen_only_protection_path() -> None:
     assert sum(len(c) for c in out) > 0
     # Counter was reset by the listen_only path.
     assert session.consecutive_interruption_count == 0
+
+
+# ---- producer/consumer barge-in: partial_monitor cancels mid-play ----------
+
+
+async def test_partial_monitor_cancels_play_streaming_midflight() -> None:
+    """End-to-end: the real _partial_monitor cancels current_speaking_task
+    while _play_streaming is mid-playback. The producer/consumer pipeline
+    (pipeline-latency-tail § B) must return fully_played=False and tear down
+    every in-flight pre-synthesis — barge-in landing while sentence 0 plays
+    and sentences 1+ are pre-synthesizing / queued."""
+    import time
+
+    session = _make_session()
+    tel = _GatedTelephony()
+    tel.release.clear()  # hold sentence 0 mid-play so barge-in lands in-flight
+    await _connected(tel, session.call_record_id)
+    tts = _RecordingTTS(synth_delay_s=0.01, chunks_per_sentence=3)
+    stream = _FakeStream(["第一句话。", "第二句话。", "第三句话。"])
+
+    interruption_cfg = InterruptionConfig(whitelist=("嗯",), min_duration_ms=400)
+    asr_partials_q: asyncio.Queue[ASRResult] = asyncio.Queue()
+    monitor = asyncio.create_task(
+        _partial_monitor(
+            session,
+            asr_partials_q=asr_partials_q,
+            interruption_cfg=interruption_cfg,
+        )
+    )
+
+    play_task = asyncio.create_task(
+        _play_streaming(
+            session, tel, tts, stream,  # type: ignore[arg-type]
+            voice_id="v", filler=None, processing_start=time.monotonic(),
+        )
+    )
+
+    # Wait until sentence 0 is genuinely mid-play (held by the gate) — by now
+    # the producer has pre-synthesized sentences 1+.
+    await asyncio.wait_for(tel.first_chunk_played.wait(), timeout=1.0)
+    await asyncio.sleep(0.05)
+
+    # User barges in: anchor + a long non-whitelist partial with VAD corroboration.
+    await asr_partials_q.put(ASRResult(text="等", is_final=False, timestamp_ms=100))
+    await asyncio.sleep(0.45)
+    session.vad_voice_active_ms = 450
+    await asr_partials_q.put(
+        ASRResult(text="等一下我有问题", is_final=False, timestamp_ms=600)
+    )
+
+    # Monitor cancels current_speaking_task; release the gate so the cancelled
+    # playback unwinds.
+    for _ in range(50):
+        if session.interruption_signaled:
+            break
+        await asyncio.sleep(0.01)
+    tel.release.set()
+
+    first_audio_ms, played = await asyncio.wait_for(play_task, timeout=2.0)
+    monitor.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await monitor
+
+    assert session.interruption_signaled is True
+    assert played is False
+    assert first_audio_ms is not None
+    assert tts.active == 0  # no pre-synthesis left running after barge-in
 
 

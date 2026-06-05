@@ -21,15 +21,18 @@ from isales_common.models import (
     RoleConfig,
 )
 from isales_common.schemas.messages.dial import DialRequest
+from isales_common.schemas.pipeline import (
+    ExtractorSpec,
+    MainSpec,
+    RefereeSpec,
+    RestructureSpec,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from isales_engine.pipeline.prompt_builder import (
-    JudgeSpec,
     LeadInfo,
     PipelineConfig,
-    PolishSpec,
-    RoleSpec,
 )
 from isales_engine.realtime.filler_manager import FillerPhraseSpec, FillerSetSpec
 from isales_engine.realtime.interruption_detector import InterruptionConfig
@@ -51,6 +54,18 @@ class RuntimeConfig:
     voice_id: str
     fixed_greeting: str | None
     max_no_progress_seconds: int | None
+    # ASR EOS endpoint in seconds (pipeline-latency-tail § A). Derived from
+    # campaign.asr_eos_silence_ms (ms); NULL → default 0.4s. main.py passes
+    # this into build_asr so the per-campaign threshold replaces the
+    # hardwired ASR-provider constant.
+    asr_partial_stable_s: float = 0.4
+    # filler opt-in (pipeline-stream-and-referee). Default off — the streaming
+    # main link reaches first audio in ~500ms so filler usually just adds delay.
+    filler_enabled: bool = False
+    # filler time-gate in ms (tts-cache-and-gated-filler § B). Derived from
+    # campaign.filler_delay_ms; NULL → 600. Only play a filler when the main
+    # reply's first audio hasn't started within this window.
+    filler_delay_ms: int = 600
     # Continuous-interruption protection (ai-pipeline spec delta). Read by
     # run_loop._decide_protection. Stored at RuntimeConfig level (not on
     # InterruptionConfig) because the strategy is a campaign-level policy,
@@ -103,51 +118,80 @@ async def load_runtime_config(
             pv_id or 0,
         )
 
-    roles = [
-        RoleSpec(
+    def _first(kind: RoleKind) -> RoleConfig | None:
+        for rc in role_configs:
+            if rc.kind == kind.value:
+                return rc
+        return None
+
+    def _all_enabled(kind: RoleKind) -> list[RoleConfig]:
+        return [rc for rc in role_configs if rc.kind == kind.value and rc.enabled]
+
+    def _main_spec(rc: RoleConfig | None) -> MainSpec:
+        if rc is None:
+            # No main slot configured → empty prompt; main stream produces a
+            # default_reply, greeting falls back to "您好。".
+            return MainSpec(role_config_id=0, prompt_version_id=0, system_prompt="")
+        model, prompt, pv_id = _spec_for(rc)
+        return MainSpec(
             role_config_id=rc.id,
-            prompt_version_id=_spec_for(rc)[2],
-            system_prompt=_spec_for(rc)[1],
-            model=_spec_for(rc)[0],
+            prompt_version_id=pv_id,
+            system_prompt=prompt,
+            model=model,
             temperature=rc.temperature or 1.0,
             top_p=rc.top_p or 1.0,
         )
-        for rc in role_configs
-        if rc.kind == RoleKind.ROLE.value
-    ]
-    judges = [
-        JudgeSpec(
+
+    def _referee_spec(rc: RoleConfig) -> RefereeSpec:
+        model, prompt, pv_id = _spec_for(rc)
+        return RefereeSpec(
             role_config_id=rc.id,
-            prompt_version_id=_spec_for(rc)[2],
-            system_prompt=_spec_for(rc)[1],
-            model=_spec_for(rc)[0],
+            prompt_version_id=pv_id,
+            system_prompt=prompt,
+            model=model,
+            temperature=rc.temperature or 1.0,
+            top_p=rc.top_p or 1.0,
+            # label binds routing rules; api enforces non-empty for referees.
+            label=rc.label or f"referee_{rc.id}",
+        )
+
+    def _restructure_spec(rc: RoleConfig | None) -> RestructureSpec | None:
+        if rc is None:
+            return None
+        model, prompt, pv_id = _spec_for(rc)
+        return RestructureSpec(
+            role_config_id=rc.id,
+            prompt_version_id=pv_id,
+            system_prompt=prompt,
+            model=model,
+            temperature=rc.temperature or 1.0,
+            top_p=rc.top_p or 1.0,
+            label=rc.label or f"restructure_{rc.id}",
+        )
+
+    def _extractor_spec(rc: RoleConfig | None) -> ExtractorSpec:
+        if rc is None:
+            return ExtractorSpec(
+                role_config_id=0, prompt_version_id=0, system_prompt=""
+            )
+        model, prompt, pv_id = _spec_for(rc)
+        return ExtractorSpec(
+            role_config_id=rc.id,
+            prompt_version_id=pv_id,
+            system_prompt=prompt,
+            model=model,
             temperature=rc.temperature or 1.0,
             top_p=rc.top_p or 1.0,
         )
-        for rc in role_configs
-        if rc.kind == RoleKind.JUDGE.value
-    ]
-    polish_rows = [rc for rc in role_configs if rc.kind == RoleKind.POLISH.value]
-    polish_rc = polish_rows[0] if polish_rows else None
-    polish = (
-        PolishSpec(
-            role_config_id=polish_rc.id,
-            prompt_version_id=_spec_for(polish_rc)[2],
-            system_prompt=_spec_for(polish_rc)[1],
-            model=_spec_for(polish_rc)[0],
-            temperature=polish_rc.temperature or 1.0,
-            top_p=polish_rc.top_p or 1.0,
-        )
-        if polish_rc is not None
-        else PolishSpec(
-            role_config_id=0, prompt_version_id=0, system_prompt="polish"
-        )
-    )
 
     pipeline = PipelineConfig(
-        roles=roles,
-        judges=judges,
-        polish=polish,
+        main=_main_spec(_first(RoleKind.MAIN)),
+        referees=[_referee_spec(rc) for rc in _all_enabled(RoleKind.REFEREE)],
+        restructure=_restructure_spec(_first(RoleKind.RESTRUCTURE)),
+        routing_rules=[dict(r) for r in (campaign.routing_rules or [])],
+        max_continuous_restructure=campaign.max_continuous_restructure,
+        primary_referee_label=campaign.primary_referee_label,
+        extractor=_extractor_spec(_first(RoleKind.EXTRACTOR)),
         default_replies=[str(r) for r in (campaign.default_replies or [])],
         lead=LeadInfo(
             name=lead.name if lead else request.lead.name,
@@ -242,9 +286,27 @@ async def load_runtime_config(
 
     _ = pipeline_default_timeout_ms  # carried in CallSession.run() args
 
-    # Pre-generated filler-only path; no fixed greeting in DB yet (campaign
-    # has no greeting columns at v0.1.2).
-    fixed_greeting: str | None = None
+    # Fixed-template greeting (ai-pipeline § "开场白不走管线"). Campaign-level
+    # PG column; NULL falls back to the LLM-generated greeting path (the
+    # ``generate_greeting(fixed_template=None)`` branch).
+    fixed_greeting: str | None = campaign.greeting
+
+    # ``campaign.voice_id`` now holds the vendor speaker string directly
+    # (campaign-greeting-tts-preview § 4C — admin types it in the form), so the
+    # engine passes it straight to the TTS provider. NULL / empty → "default",
+    # which the provider maps to its own default speaker. Matches the web 试听.
+    voice_speaker = campaign.voice_id or "default"
+
+    # ASR EOS endpoint (pipeline-latency-tail § A). campaign.asr_eos_silence_ms
+    # is ms; NULL → engine default 400ms. Convert to seconds for the ASR
+    # provider's partial_stable_s.
+    asr_eos_ms = campaign.asr_eos_silence_ms
+    asr_partial_stable_s = (asr_eos_ms if asr_eos_ms is not None else 400) / 1000.0
+
+    # filler time-gate (tts-cache-and-gated-filler § B); NULL → 600ms.
+    filler_delay_ms = (
+        campaign.filler_delay_ms if campaign.filler_delay_ms is not None else 600
+    )
 
     strategy_value = (
         campaign.continuous_interruption_strategy
@@ -259,9 +321,12 @@ async def load_runtime_config(
         wrap_up=wrap_up,
         interruption=interruption,
         silence=silence,
-        voice_id="default",
+        voice_id=voice_speaker,
         fixed_greeting=fixed_greeting,
         max_no_progress_seconds=campaign.max_no_progress_seconds,
+        asr_partial_stable_s=asr_partial_stable_s,
+        filler_enabled=campaign.filler_enabled,
+        filler_delay_ms=filler_delay_ms,
         _max_continuous_interruptions=campaign.max_continuous_interruptions,
         _continuous_interruption_strategy=strategy_value,
     )

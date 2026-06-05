@@ -55,18 +55,26 @@ class TransferDecision:
     phrase: str  # selected hand-off phrase (random pick, empty if not triggered)
 
 
-async def evaluate_transfer(
+def _no_transfer() -> TransferDecision:
+    return TransferDecision(
+        triggered=False, trigger_type=None, trigger_detail="", phrase=""
+    )
+
+
+def evaluate_transfer_cheap(
     *,
     user_text: str,
     turn_count: int,
     goal_achieved: bool,
     config: TransferConfig,
-    llm: LLMProvider,
-    intent_timeout_s: float = 5.0,
-    llm_timeout_s: float = 5.0,
 ) -> TransferDecision:
-    """OR-relation evaluation of all four triggers; first hit wins."""
+    """Zero-LLM transfer triggers (keyword / round); first hit wins.
 
+    Cheap + deterministic, so this stays inline on the main path before
+    PROCESSING (pipeline-latency-tail § D). The LLM-backed triggers
+    (intent / independent-llm) are evaluated off the hot path via
+    :func:`evaluate_transfer_llm`.
+    """
     # 1) keyword (cheap, sync)
     if config.keyword_enabled and config.keywords:
         for kw in config.keywords:
@@ -82,6 +90,25 @@ async def evaluate_transfer(
     ):
         return _hit("round", f"turn_count={turn_count}", config)
 
+    return _no_transfer()
+
+
+async def evaluate_transfer_llm(
+    *,
+    user_text: str,
+    config: TransferConfig,
+    llm: LLMProvider,
+    intent_timeout_s: float = 5.0,
+    llm_timeout_s: float = 5.0,
+) -> TransferDecision:
+    """LLM-backed transfer triggers (intent / independent-llm); first hit wins.
+
+    Spawned in parallel with main streaming (pipeline-latency-tail § D) so the
+    LLM round-trip never blocks the PROCESSING entry. The preferred path is
+    reusing the referee's ``transfer`` decision; this remains for campaigns
+    that explicitly configure ``transfer_intent`` / ``transfer_llm`` and want
+    the dedicated detector.
+    """
     # 3) intent (LLM call)
     if config.intent_enabled and config.intent_threshold is not None:
         prob = await _call_intent(
@@ -98,8 +125,41 @@ async def evaluate_transfer(
         if flag:
             return _hit("llm", "transfer=true", config)
 
-    return TransferDecision(
-        triggered=False, trigger_type=None, trigger_detail="", phrase=""
+    return _no_transfer()
+
+
+async def evaluate_transfer(
+    *,
+    user_text: str,
+    turn_count: int,
+    goal_achieved: bool,
+    config: TransferConfig,
+    llm: LLMProvider,
+    intent_timeout_s: float = 5.0,
+    llm_timeout_s: float = 5.0,
+) -> TransferDecision:
+    """OR-relation evaluation of all four triggers; first hit wins.
+
+    Convenience composition of :func:`evaluate_transfer_cheap` +
+    :func:`evaluate_transfer_llm`. The run loop no longer calls this on the
+    hot path (it runs the cheap triggers inline and the LLM triggers in
+    parallel — pipeline-latency-tail § D); kept for callers/tests that want
+    the full synchronous evaluation.
+    """
+    cheap = evaluate_transfer_cheap(
+        user_text=user_text,
+        turn_count=turn_count,
+        goal_achieved=goal_achieved,
+        config=config,
+    )
+    if cheap.triggered:
+        return cheap
+    return await evaluate_transfer_llm(
+        user_text=user_text,
+        config=config,
+        llm=llm,
+        intent_timeout_s=intent_timeout_s,
+        llm_timeout_s=llm_timeout_s,
     )
 
 
