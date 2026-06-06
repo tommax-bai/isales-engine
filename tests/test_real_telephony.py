@@ -15,6 +15,7 @@ import asyncio
 import base64
 import json
 import os
+import sys
 import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -22,6 +23,17 @@ from pathlib import Path
 import pytest
 
 from isales_engine.realtime.real_telephony import RealTelephonyClient
+
+# RealTelephonyClient is the single-host (Linux/macOS) transport: engine ↔
+# modem-controller over a Unix domain socket. The fake server below relies on
+# asyncio.start_unix_server, which does not exist on Windows. These tests run
+# on the Linux/macOS single-host path; skip on win32 dev machines.
+# Removal trigger: drop when the single-host Unix-socket transport is retired
+# in favour of the cloud-edge gRPC/DingRTC path (real_telephony.py deleted).
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Unix domain sockets (asyncio.start_unix_server) unavailable on Windows",
+)
 
 
 class _FakeServer:
