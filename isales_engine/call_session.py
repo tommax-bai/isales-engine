@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 from isales_common.enums import CallStatus
 
 if TYPE_CHECKING:
+    from isales_engine.eventbus import EventBus
     from isales_engine.state_machine import StateMachine
 
 
@@ -121,6 +122,13 @@ class CallSession:
 
     # Active asyncio tasks owned by the session (filler / pipeline / TTS).
     tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
+
+    # Per-call in-process EventBus (engine-eventbus-foundation). Created +
+    # started at run_session entry so control-plane signals (Redis →
+    # _on_manual_hangup → bus.post) work from dial onward; the ASR/event pumps
+    # wire their producers + bridge subscribers onto it in _start_listen_pumps.
+    # None until run_session sets it; torn down (aclose) in run_session.finally.
+    bus: EventBus | None = None
 
     # The currently-running SPEAKING / FILLER playback task. The partial
     # monitor cancels this on real-time interruption (impl-engine-providers

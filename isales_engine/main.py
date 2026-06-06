@@ -32,6 +32,7 @@ from isales_engine.db import get_engine, get_sessionmaker
 from isales_engine.dial_consumer import dial_loop
 from isales_engine.event_consumer import subscribe_loop
 from isales_engine.event_publisher import EventPublisher
+from isales_engine.events import ManualHangupRequested, TransferRequested
 from isales_engine.providers.factory import build_asr, build_llm, build_tts
 from isales_engine.providers.tts_cache import CachingTTSProvider, TtsCacheStore
 from isales_engine.realtime.mock_telephony import MockTelephonyClient
@@ -41,7 +42,6 @@ from isales_engine.realtime.telephony_client import TelephonyClient
 from isales_engine.redis_client import get_redis
 from isales_engine.run_loop import (
     Providers,
-    request_manual_hangup,
     run_session,
 )
 from isales_engine.runtime_config import load_runtime_config
@@ -312,18 +312,23 @@ async def _main() -> None:
         tts_cache=tts_cache,
     )
 
-    async def _on_manual_hangup(call_record_id: int, _operator: str | None) -> None:
+    async def _on_manual_hangup(call_record_id: int, operator: str | None) -> None:
         sess = session_manager.get(call_record_id)
-        if sess is None:
+        if sess is None or sess.bus is None:
             return
-        request_manual_hangup(sess)
+        # run_session's control bridge cancels the run-loop 'main' task with
+        # MANUAL_HANGUP (engine-eventbus-foundation). sess.bus is None only in
+        # the brief window before run_session starts the bus — graceful skip.
+        sess.bus.post(ManualHangupRequested(operator=operator))
 
-    async def _on_transfer(call_record_id: int, _agent_id: int) -> None:
-        # Stage 4: route via manual hangup; richer routing arrives in stage 6.
+    async def _on_transfer(call_record_id: int, agent_id: int) -> None:
+        # Stage 4: transfer routes through the same hangup path (richer routing
+        # arrives in a later change). The control bridge in run_session handles
+        # the TransferRequested event byte-identically to manual hangup.
         sess = session_manager.get(call_record_id)
-        if sess is None:
+        if sess is None or sess.bus is None:
             return
-        request_manual_hangup(sess)
+        sess.bus.post(TransferRequested(agent_id=str(agent_id)))
 
     stop_event = asyncio.Event()
 

@@ -53,6 +53,8 @@ from isales_engine.events import (
     AsrPartial,
     AsrStreamEnded,
     HangupDetected,
+    ManualHangupRequested,
+    TransferRequested,
 )
 from isales_engine.pipeline.decider import DeciderAction, decide
 from isales_engine.pipeline.greeting import generate_greeting
@@ -126,7 +128,19 @@ async def run_session(
         )
 
     listen_ctx: _ListenContext | None = None
+    bus: EventBus | None = None
     try:
+        # The per-call EventBus spans the WHOLE session (not just the listen
+        # pumps), so control-plane hangup/transfer (Redis → main._on_manual_hangup
+        # → bus.post) can terminate the call from dial onward — matching the old
+        # request_manual_hangup() main.cancel() reach, which worked the instant
+        # dial_consumer set session.tasks["main"]. _start_listen_pumps wires the
+        # ASR producers + bridges onto this same bus after the greeting.
+        bus = EventBus()
+        session.bus = bus
+        _subscribe_control_bridges(session, bus)
+        await bus.start()
+
         connected = await _dial_and_wait_connected(
             session, telephony, phone, timeout_s=connect_timeout_s
         )
@@ -166,12 +180,6 @@ async def run_session(
             listen_ctx=listen_ctx,
         )
 
-    except _ManualHangupRequested:
-        await _attempt_hangup(telephony, session.call_record_id)
-        if session.state is not CallStatus.END:
-            sm.transition_to(CallStatus.END, reason="manual_hangup", force=True)
-        session.hangup_cause = HangupCause.MANUAL_HANGUP.value
-        session.append_event("hangup", reason="manual_hangup", initiated_by="ai")
     except Exception:
         logger.exception(
             "run_session_unexpected_error call_record_id=%s", session.call_record_id
@@ -188,6 +196,21 @@ async def run_session(
     finally:
         if listen_ctx is not None:
             await _stop_listen_pumps(session, listen_ctx)
+        if bus is not None:
+            # Pumps are cancelled (their _asr_pump finally already posted the
+            # final AsrStreamEnded onto the still-open bus); aclose() drains the
+            # lossless lane then stops both dispatchers. Surface the one
+            # intentionally-lossy deviation: AsrPartial rides the bounded(256)
+            # drop-oldest lane, so a dropped partial is otherwise silent.
+            await bus.aclose()
+            if bus.dropped:
+                logger.warning(
+                    "eventbus_lossy_dropped call_record_id=%s dropped=%s — "
+                    "AsrPartial lane overflowed (maxsize=256); unexpected at "
+                    "human ASR cadence",
+                    session.call_record_id,
+                    bus.dropped,
+                )
         # Token-budget warning (impl-engine-providers PR #7). Default 50k
         # if not configured; runtime sets ``_token_budget_per_call`` on the
         # session at construction time.
@@ -203,23 +226,42 @@ async def run_session(
             )
 
 
-# ---- Manual-hangup signal -------------------------------------------------
+# ---- Control-plane bridges (manual hangup / transfer) ---------------------
 
 
-class _ManualHangupRequested(Exception):
-    """Raised inside the run loop when EngineControl requests a hangup."""
+def _subscribe_control_bridges(session: CallSession, bus: EventBus) -> None:
+    """Wire the Redis control-plane signals onto the per-call bus.
 
+    main.py's ``_on_manual_hangup`` / ``_on_transfer`` (driven by the
+    EngineControl pub/sub consumer) ``bus.post`` a ``ManualHangupRequested`` /
+    ``TransferRequested``; this terminates the call by cancelling the run-loop
+    ``main`` task — byte-identical to the deleted ``request_manual_hangup()``
+    ``main.cancel()`` sentinel, minus the never-raised ``_ManualHangupRequested``
+    exception (the old ``except`` clause was dead code: ``main.cancel()`` only
+    ever raised a bare ``CancelledError``). ``hangup_cause`` is set before the
+    cancel so the run_session ``finally`` / finalize records it; the cancel
+    unwinds run_session (stop pumps + aclose bus).
 
-def request_manual_hangup(session: CallSession) -> None:
-    """API → run-loop bridge: schedule a manual-hangup raise on next await."""
+    Transfer currently routes through the same hangup path — the stage-4 stub
+    where ``_on_transfer`` always set MANUAL_HANGUP. Real transfer routing is a
+    later change; kept byte-identical here.
+    """
 
-    main = session.tasks.get("main")
-    if main is None or main.done():
-        return
-    # Use a custom marker on the session so the loop can convert the next
-    # awaited cancellation into a clean ManualHangupRequested.
-    session.hangup_cause = HangupCause.MANUAL_HANGUP.value
-    main.cancel()
+    def _terminate(cause: str) -> None:
+        main = session.tasks.get("main")
+        if main is None or main.done():
+            return
+        session.hangup_cause = cause
+        main.cancel()
+
+    bus.subscribe(
+        ManualHangupRequested,
+        lambda _ev: _terminate(HangupCause.MANUAL_HANGUP.value),
+    )
+    bus.subscribe(
+        TransferRequested,
+        lambda _ev: _terminate(HangupCause.MANUAL_HANGUP.value),
+    )
 
 
 # ---- Steps ----------------------------------------------------------------
@@ -304,14 +346,17 @@ async def _start_listen_pumps(
     hangup_event = asyncio.Event()
     asr_finished = asyncio.Event()
 
-    # change-1 Phase 1 (engine-eventbus-foundation §2): the ASR / event pumps
-    # become bus PRODUCERS; the bridge subscribers below feed the existing
-    # queues / events so the _main_turn_loop consumer is byte-identical (D4).
-    # AsrPartial is the only droppable signal here (registered LOSSY); finals /
-    # hangup / stream-end default LOSSLESS — a user turn must never be dropped.
-    # (VadFrame's LOSSY registration arrives with the _vad_monitor producer in
-    # the later barge-in inversion; nothing posts VadFrame yet.)
-    bus = EventBus()
+    # change-1 (engine-eventbus-foundation §2): the ASR / event pumps become bus
+    # PRODUCERS; the bridge subscribers below feed the existing queues / events
+    # so the _main_turn_loop consumer is byte-identical (D4). The bus itself is
+    # created + started + owned by run_session (so the control-plane hangup
+    # bridge is live from dial onward); here we only add the ASR producers /
+    # bridges to it. AsrPartial is the only droppable signal (registered LOSSY);
+    # finals / hangup / stream-end default LOSSLESS — a user turn must never be
+    # dropped. (VadFrame's LOSSY registration arrives with the _vad_monitor
+    # producer in the later barge-in inversion; nothing posts VadFrame yet.)
+    bus = session.bus
+    assert bus is not None  # run_session creates + starts it before the greeting
     bus.register_lane(AsrPartial, Lane.LOSSY)
 
     def _bridge_final(ev: AsrFinal) -> None:
@@ -337,16 +382,12 @@ async def _start_listen_pumps(
     bus.subscribe(AsrPartial, _bridge_partial)
     bus.subscribe(HangupDetected, _bridge_hangup)
     bus.subscribe(AsrStreamEnded, _bridge_stream_ended)
-    # Subscribers registered before start() / before the pumps are spawned, so
-    # no posted event can be dispatched before its bridge handler exists.
-    await bus.start()
-    # HAZARD (change-2): nothing between here and `return _ListenContext` can
-    # raise today (create_task only fails on a closed loop; the rest is dict /
-    # dataclass construction), so run_session's finally — which runs
-    # _stop_listen_pumps only when a context was returned — safely owns bus
-    # teardown. The moment change-2 adds a fallible `await` in this window,
-    # wrap the tail in try/except BaseException → cancel the spawned tasks +
-    # `await bus.aclose()` + re-raise, else these dispatcher coroutines leak.
+    # Subscribers added before the pumps are spawned, so no posted event can be
+    # dispatched before its bridge handler exists. The bus was already started
+    # by run_session, which also owns bus.aclose() in its finally — so even if
+    # this function raises before returning a context, the bus is still torn
+    # down (the earlier change-2 dispatcher-leak hazard is resolved by that
+    # ownership move).
 
     async def _asr_pump() -> None:
         try:
@@ -425,21 +466,10 @@ async def _stop_listen_pumps(
         ctx.pump_vad_monitor,
         return_exceptions=True,
     )
-    # Producers are cancelled (the _asr_pump finally has already posted its
-    # final AsrStreamEnded onto the still-open bus), so aclose()'s lossless
-    # drain can't race a late post against a closed bus.
-    await ctx.bus.aclose()
-    # Surface the one intentionally-lossy deviation: AsrPartial rides the
-    # bounded(256) drop-oldest lane, so a dropped partial is silent. At human
-    # ASR cadence the lane depth stays ~0 and this never fires; a future
-    # word-level streaming ASR could approach the bound — log makes it visible.
-    if ctx.bus.dropped:
-        logger.warning(
-            "eventbus_lossy_dropped call_record_id=%s dropped=%s — AsrPartial "
-            "lane overflowed (maxsize=256); unexpected at human ASR cadence",
-            session.call_record_id,
-            ctx.bus.dropped,
-        )
+    # The bus is NOT closed here — it outlives the listen pumps (run_session
+    # owns it and aclose()s it in its finally). The producers are now cancelled,
+    # so the _asr_pump finally's AsrStreamEnded post lands on the still-open bus
+    # and is drained by run_session's aclose().
     session.tasks.pop("asr_pump", None)
     session.tasks.pop("ev_pump", None)
     session.tasks.pop("partial_monitor", None)
