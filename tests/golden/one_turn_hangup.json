@@ -1,0 +1,59 @@
+{
+  "pipeline_trace": [
+    {
+      "error": null,
+      "first_audio_ms": "<volatile>",
+      "main_duration_ms": "<volatile>",
+      "main_fallback_used": false,
+      "main_reply_text": "好的，我明白了。请问您还有什么需要？",
+      "main_tokens_in": 16,
+      "main_tokens_out": 9,
+      "matched_rule": null,
+      "referee_results": [
+        {
+          "category": "continue",
+          "confidence": 0.9,
+          "duration_ms": "<volatile>",
+          "label": "main_judge"
+        }
+      ],
+      "restructure_active": false,
+      "restructure_source_text": null,
+      "restructure_trigger": null,
+      "ts_end": "<volatile>",
+      "ts_start": "<volatile>",
+      "turn_id": 1,
+      "user_input": "你好这是用户的回复内容"
+    }
+  ],
+  "transcript": [
+    {
+      "text": "您好我是 AI 助手。",
+      "ts": "<volatile>",
+      "type": "greeting"
+    },
+    {
+      "text": "你好这是用户的回复内容",
+      "ts": "<volatile>",
+      "type": "user_speech"
+    },
+    {
+      "extracted": {},
+      "goal_achieved": false,
+      "goal_type": "",
+      "interrupted": false,
+      "is_wrap_up": false,
+      "selected_role_config_id": 100,
+      "text": "好的，我明白了。请问您还有什么需要？",
+      "ts": "<volatile>",
+      "turn_id": 1,
+      "type": "ai_reply"
+    },
+    {
+      "initiated_by": "user",
+      "reason": "user_hangup",
+      "ts": "<volatile>",
+      "type": "hangup"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "pipeline_trace": [],
+  "transcript": [
+    {
+      "text": "您好我是 AI 助手。",
+      "ts": "<volatile>",
+      "type": "greeting"
+    },
+    {
+      "activation_index": 0,
+      "text": "您还在吗？",
+      "ts": "<volatile>",
+      "type": "silence_activation"
+    },
+    {
+      "initiated_by": "ai",
+      "reason": "silence_max_reached",
+      "ts": "<volatile>",
+      "type": "hangup"
+    }
+  ]
+}
