@@ -47,6 +47,13 @@ from isales_common.schemas.messages.engine_event import (
 
 from isales_engine.call_session import CallSession
 from isales_engine.event_publisher import EventPublisher
+from isales_engine.eventbus import EventBus, Lane
+from isales_engine.events import (
+    AsrFinal,
+    AsrPartial,
+    AsrStreamEnded,
+    HangupDetected,
+)
 from isales_engine.pipeline.decider import DeciderAction, decide
 from isales_engine.pipeline.greeting import generate_greeting
 from isales_engine.pipeline.orchestrator import (
@@ -146,7 +153,7 @@ async def run_session(
         sm.transition_to(CallStatus.LISTENING, reason="greeting_done")
         _publish_status(publisher, session, "greeting_done")
 
-        listen_ctx = _start_listen_pumps(session, config, telephony, providers)
+        listen_ctx = await _start_listen_pumps(session, config, telephony, providers)
 
         await _main_turn_loop(
             session,
@@ -262,19 +269,26 @@ class _ListenContext:
     during the greeting reaches ``_partial_monitor`` and ``_vad_monitor``
     (both can cancel the in-flight greeting ``_play_tts``). Disposed of by
     :func:`_stop_listen_pumps` in ``run_session``'s ``finally``.
+
+    change-1 Phase 1 (engine-eventbus-foundation): the ASR / event pumps now
+    PRODUCE typed signals onto ``bus`` and a thin bridge subscriber feeds the
+    queues / events below, so the ``_main_turn_loop`` consumer (and the two
+    monitors, which still read ``asr_partials_q`` directly) stay byte-identical
+    (design.md D4). The queues/events ARE the bridge's downstream sink.
     """
 
     asr_finals_q: asyncio.Queue[ASRResult]
     asr_partials_q: asyncio.Queue[ASRResult]
     hangup_event: asyncio.Event
     asr_finished: asyncio.Event
+    bus: EventBus
     pump_asr: asyncio.Task[None]
     pump_ev: asyncio.Task[None]
     pump_partial_monitor: asyncio.Task[None]
     pump_vad_monitor: asyncio.Task[None]
 
 
-def _start_listen_pumps(
+async def _start_listen_pumps(
     session: CallSession,
     config: RuntimeConfig,
     telephony: TelephonyClient,
@@ -290,29 +304,73 @@ def _start_listen_pumps(
     hangup_event = asyncio.Event()
     asr_finished = asyncio.Event()
 
+    # change-1 Phase 1 (engine-eventbus-foundation §2): the ASR / event pumps
+    # become bus PRODUCERS; the bridge subscribers below feed the existing
+    # queues / events so the _main_turn_loop consumer is byte-identical (D4).
+    # AsrPartial is the only droppable signal here (registered LOSSY); finals /
+    # hangup / stream-end default LOSSLESS — a user turn must never be dropped.
+    # (VadFrame's LOSSY registration arrives with the _vad_monitor producer in
+    # the later barge-in inversion; nothing posts VadFrame yet.)
+    bus = EventBus()
+    bus.register_lane(AsrPartial, Lane.LOSSY)
+
+    def _bridge_final(ev: AsrFinal) -> None:
+        # Both finals consumers (_await_user_or_silence, _partial_monitor) read
+        # only ``.text``; timestamp_ms is never read off a queued final, so a
+        # minimal reconstruction is byte-identical for the consumer.
+        asr_finals_q.put_nowait(
+            ASRResult(text=ev.text, is_final=True, timestamp_ms=0)
+        )
+
+    def _bridge_partial(ev: AsrPartial) -> None:
+        asr_partials_q.put_nowait(
+            ASRResult(text=ev.text, is_final=False, timestamp_ms=0)
+        )
+
+    def _bridge_hangup(_ev: HangupDetected) -> None:
+        hangup_event.set()
+
+    def _bridge_stream_ended(_ev: AsrStreamEnded) -> None:
+        asr_finished.set()
+
+    bus.subscribe(AsrFinal, _bridge_final)
+    bus.subscribe(AsrPartial, _bridge_partial)
+    bus.subscribe(HangupDetected, _bridge_hangup)
+    bus.subscribe(AsrStreamEnded, _bridge_stream_ended)
+    # Subscribers registered before start() / before the pumps are spawned, so
+    # no posted event can be dispatched before its bridge handler exists.
+    await bus.start()
+    # HAZARD (change-2): nothing between here and `return _ListenContext` can
+    # raise today (create_task only fails on a closed loop; the rest is dict /
+    # dataclass construction), so run_session's finally — which runs
+    # _stop_listen_pumps only when a context was returned — safely owns bus
+    # teardown. The moment change-2 adds a fallible `await` in this window,
+    # wrap the tail in try/except BaseException → cancel the spawned tasks +
+    # `await bus.aclose()` + re-raise, else these dispatcher coroutines leak.
+
     async def _asr_pump() -> None:
         try:
             async for r in asr_iter:
                 if not r.text:
                     continue
                 if r.is_final:
-                    await asr_finals_q.put(r)
+                    bus.post(AsrFinal(text=r.text))
                     # A final closes the current utterance — clear the
                     # partial-monitor's speech-start anchor.
                     session.current_user_speech_started_ms = None
                 else:
-                    await asr_partials_q.put(r)
+                    bus.post(AsrPartial(text=r.text))
         except asyncio.CancelledError:
             pass
         finally:
-            asr_finished.set()
+            bus.post(AsrStreamEnded())
 
     async def _ev_pump() -> None:
         try:
             async for ev in events_iter:
                 ev_type = getattr(ev, "type", None)
                 if ev_type in ("remote_hangup", "local_hangup", "device_error"):
-                    hangup_event.set()
+                    bus.post(HangupDetected(cause=ev_type))
                     return
         except asyncio.CancelledError:
             pass
@@ -345,6 +403,7 @@ def _start_listen_pumps(
         asr_partials_q=asr_partials_q,
         hangup_event=hangup_event,
         asr_finished=asr_finished,
+        bus=bus,
         pump_asr=pump_asr,
         pump_ev=pump_ev,
         pump_partial_monitor=pump_partial_monitor,
@@ -366,6 +425,21 @@ async def _stop_listen_pumps(
         ctx.pump_vad_monitor,
         return_exceptions=True,
     )
+    # Producers are cancelled (the _asr_pump finally has already posted its
+    # final AsrStreamEnded onto the still-open bus), so aclose()'s lossless
+    # drain can't race a late post against a closed bus.
+    await ctx.bus.aclose()
+    # Surface the one intentionally-lossy deviation: AsrPartial rides the
+    # bounded(256) drop-oldest lane, so a dropped partial is silent. At human
+    # ASR cadence the lane depth stays ~0 and this never fires; a future
+    # word-level streaming ASR could approach the bound — log makes it visible.
+    if ctx.bus.dropped:
+        logger.warning(
+            "eventbus_lossy_dropped call_record_id=%s dropped=%s — AsrPartial "
+            "lane overflowed (maxsize=256); unexpected at human ASR cadence",
+            session.call_record_id,
+            ctx.bus.dropped,
+        )
     session.tasks.pop("asr_pump", None)
     session.tasks.pop("ev_pump", None)
     session.tasks.pop("partial_monitor", None)
