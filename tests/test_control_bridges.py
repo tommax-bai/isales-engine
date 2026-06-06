@@ -19,15 +19,16 @@ import asyncio
 
 from isales_common.enums import HangupCause
 
-from isales_engine.eventbus import EventBus
 from isales_engine.events import ManualHangupRequested, TransferRequested
 from isales_engine.run_loop import _subscribe_control_bridges
 from tests.test_run_loop import _make_session
 
 
 async def _bus_with_bridges():
-    bus = EventBus()
+    # The session is constructed WITH an (unstarted) bus; mirror run_session:
+    # subscribe the control bridge onto session.bus, then start it.
     session = _make_session()
+    bus = session.bus
     _subscribe_control_bridges(session, bus)
     await bus.start()
     return bus, session

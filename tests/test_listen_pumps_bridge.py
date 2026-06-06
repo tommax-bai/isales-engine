@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 
 from isales_engine.call_session import CallSession
-from isales_engine.eventbus import EventBus, Lane
+from isales_engine.eventbus import Lane
 from isales_engine.events import AsrFinal, AsrPartial
 from isales_engine.providers.asr_mock import ScriptedMockASR
 from isales_engine.realtime.mock_telephony import MockTelephonyClient
@@ -35,10 +35,10 @@ from tests.test_run_loop import _make_config, _make_providers, _make_session
 
 
 async def _setup() -> tuple[MockTelephonyClient, CallSession]:
-    """Mirror run_session's bus setup: create + start the per-call bus on the
-    session, then dial-connect the mock telephony."""
+    """Mirror run_session's bus setup: the session is constructed WITH an
+    (unstarted) bus (CallSession.bus factory); run_session start()s it. Here we
+    just start it, then dial-connect the mock telephony."""
     session = _make_session()
-    session.bus = EventBus()
     await session.bus.start()
     tel = MockTelephonyClient(connect_delay_ms=0)
     await tel.dial(session.call_record_id, "+x")  # emits "connected"

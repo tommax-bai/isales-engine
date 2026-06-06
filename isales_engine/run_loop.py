@@ -128,16 +128,19 @@ async def run_session(
         )
 
     listen_ctx: _ListenContext | None = None
-    bus: EventBus | None = None
+    bus = session.bus  # constructed WITH the session (CallSession.bus factory)
     try:
-        # The per-call EventBus spans the WHOLE session (not just the listen
-        # pumps), so control-plane hangup/transfer (Redis → main._on_manual_hangup
-        # → bus.post) can terminate the call from dial onward — matching the old
-        # request_manual_hangup() main.cancel() reach, which worked the instant
-        # dial_consumer set session.tasks["main"]. _start_listen_pumps wires the
-        # ASR producers + bridges onto this same bus after the greeting.
-        bus = EventBus()
-        session.bus = bus
+        # The per-call EventBus is created with the session, BEFORE dial_consumer
+        # registers it / sets tasks["main"]. So a control-plane hangup/transfer
+        # (Redis → _on_manual_hangup → bus.post) is never dropped: an event that
+        # lands in the pre-dial runner preamble — the DB load that runs before
+        # run_session even starts — is buffered on the lossless lane and handled
+        # once we start() the dispatchers below. This is byte-identical to the
+        # old request_manual_hangup() reach, which fired the instant
+        # dial_consumer set tasks["main"]. (Earlier the bus was created HERE,
+        # which left that preamble window uncovered — a real, now-closed gap.)
+        # Here we subscribe the control bridge + start the dispatchers;
+        # _start_listen_pumps adds the ASR producers/bridges after the greeting.
         _subscribe_control_bridges(session, bus)
         await bus.start()
 
@@ -196,21 +199,21 @@ async def run_session(
     finally:
         if listen_ctx is not None:
             await _stop_listen_pumps(session, listen_ctx)
-        if bus is not None:
-            # Pumps are cancelled (their _asr_pump finally already posted the
-            # final AsrStreamEnded onto the still-open bus); aclose() drains the
-            # lossless lane then stops both dispatchers. Surface the one
-            # intentionally-lossy deviation: AsrPartial rides the bounded(256)
-            # drop-oldest lane, so a dropped partial is otherwise silent.
-            await bus.aclose()
-            if bus.dropped:
-                logger.warning(
-                    "eventbus_lossy_dropped call_record_id=%s dropped=%s — "
-                    "AsrPartial lane overflowed (maxsize=256); unexpected at "
-                    "human ASR cadence",
-                    session.call_record_id,
-                    bus.dropped,
-                )
+        # bus is always present (constructed with the session); pumps are now
+        # cancelled (their _asr_pump finally already posted the final
+        # AsrStreamEnded onto the still-open bus), so aclose() drains the
+        # lossless lane then stops both dispatchers. Surface the one
+        # intentionally-lossy deviation: AsrPartial rides the bounded(256)
+        # drop-oldest lane, so a dropped partial is otherwise silent.
+        await bus.aclose()
+        if bus.dropped:
+            logger.warning(
+                "eventbus_lossy_dropped call_record_id=%s dropped=%s — "
+                "AsrPartial lane overflowed (maxsize=256); unexpected at "
+                "human ASR cadence",
+                session.call_record_id,
+                bus.dropped,
+            )
         # Token-budget warning (impl-engine-providers PR #7). Default 50k
         # if not configured; runtime sets ``_token_budget_per_call`` on the
         # session at construction time.
@@ -355,8 +358,7 @@ async def _start_listen_pumps(
     # finals / hangup / stream-end default LOSSLESS — a user turn must never be
     # dropped. (VadFrame's LOSSY registration arrives with the _vad_monitor
     # producer in the later barge-in inversion; nothing posts VadFrame yet.)
-    bus = session.bus
-    assert bus is not None  # run_session creates + starts it before the greeting
+    bus = session.bus  # constructed with the session; run_session already start()ed it
     bus.register_lane(AsrPartial, Lane.LOSSY)
 
     def _bridge_final(ev: AsrFinal) -> None:

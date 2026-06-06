@@ -19,8 +19,9 @@ from typing import TYPE_CHECKING, Any
 
 from isales_common.enums import CallStatus
 
+from isales_engine.eventbus import EventBus
+
 if TYPE_CHECKING:
-    from isales_engine.eventbus import EventBus
     from isales_engine.state_machine import StateMachine
 
 
@@ -123,12 +124,16 @@ class CallSession:
     # Active asyncio tasks owned by the session (filler / pipeline / TTS).
     tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
 
-    # Per-call in-process EventBus (engine-eventbus-foundation). Created +
-    # started at run_session entry so control-plane signals (Redis →
-    # _on_manual_hangup → bus.post) work from dial onward; the ASR/event pumps
-    # wire their producers + bridge subscribers onto it in _start_listen_pumps.
-    # None until run_session sets it; torn down (aclose) in run_session.finally.
-    bus: EventBus | None = None
+    # Per-call in-process EventBus (engine-eventbus-foundation). Constructed
+    # WITH the session (default_factory) — i.e. before dial_consumer registers
+    # the session and sets tasks["main"] — so a control-plane hangup (Redis →
+    # _on_manual_hangup → bus.post) landing in the pre-dial runner preamble (the
+    # DB load before run_session even starts) is BUFFERED on the lossless lane
+    # (post-before-start) instead of dropped, then processed once run_session
+    # start()s the dispatchers. run_session subscribes the control bridge + ASR
+    # producers and aclose()s it in its finally. (Created unstarted: start()
+    # needs the running loop, so it can't happen in this sync constructor.)
+    bus: EventBus = field(default_factory=EventBus)
 
     # The currently-running SPEAKING / FILLER playback task. The partial
     # monitor cancels this on real-time interruption (impl-engine-providers
