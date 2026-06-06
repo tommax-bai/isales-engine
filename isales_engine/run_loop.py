@@ -71,7 +71,10 @@ from isales_engine.realtime.interruption_detector import (
 from isales_engine.realtime.no_progress_timer import is_no_progress_exceeded
 from isales_engine.realtime.silence_detector import SilenceConfig, evaluate_silence
 from isales_engine.realtime.telephony_client import TelephonyClient
+from isales_engine.routes.builder import build_effect_router
+from isales_engine.routes.effects import EffectContext
 from isales_engine.runtime_config import RuntimeConfig
+from isales_engine.select_router import Directive
 from isales_engine.state_machine import StateMachine
 from isales_engine.streaming.types import RefereeResult
 from isales_engine.transcript_recorder import now_utc
@@ -499,6 +502,14 @@ async def _main_turn_loop(
     no_progress_started = time.monotonic()
     last_progress_ms = _to_ms(no_progress_started)
 
+    # change-2 (engine-multi-route-dispatch): kill-switch carried on
+    # RuntimeConfig (load_runtime_config copies it from Settings/env). ON → the
+    # post-decide effect dispatch routes through the SelectRouter table; OFF
+    # (default) → the legacy inline branches (byte-identical, golden net
+    # guarded). Removal trigger: change-3 Phase-4.
+    use_router = config.engine_use_router
+    effect_router = build_effect_router() if use_router else None
+
     try:
         while session.state is not CallStatus.END:
             outcome = await _await_user_or_silence(
@@ -837,7 +848,40 @@ async def _main_turn_loop(
 
             # ---- decider-driven outcome (skipped during wrap-up) ----
             if not is_wrap_up:
-                if action.kind == "transition" and action.to == "goal_achieved":
+                if use_router:
+                    # change-2 (engine-multi-route-dispatch): route the
+                    # post-decide effect through the SelectRouter table. The
+                    # effect routes reproduce the legacy branches below
+                    # byte-for-byte (same transitions / events / helpers, same
+                    # continue / return / fall-through control flow).
+                    # ENGINE_USE_ROUTER OFF (default) runs the legacy branches.
+                    assert effect_router is not None
+                    directive = await effect_router.dispatch(
+                        action,
+                        EffectContext(
+                            session=session,
+                            sm=sm,
+                            telephony=telephony,
+                            providers=providers,
+                            config=config,
+                            action=action,
+                            restructure_text=restructure_text,
+                            restructure_capped=restructure_capped,
+                            goal_type=goal_type,
+                            pipeline_timeout_ms=pipeline_timeout_ms,
+                            perform_handoff=_perform_handoff,
+                            run_restructure=_run_restructure,
+                            play_tts=_play_tts,
+                            now_utc=now_utc,
+                        ),
+                    )
+                    if directive is Directive.RETURN:
+                        return
+                    if directive is Directive.CONTINUE:
+                        continue
+                    # Directive.FALL_THROUGH → fall past the elif chain to the
+                    # restructure-cap-reset below (legacy continue / degraded).
+                elif action.kind == "transition" and action.to == "goal_achieved":
                     sm.transition_to(
                         CallStatus.WRAPPING_UP, reason=goal_type or "goal_achieved"
                     )
@@ -852,7 +896,7 @@ async def _main_turn_loop(
                         "goal_achieved", goal_type=goal_type, extracted={}
                     )
                     continue
-                if action.kind == "transition" and action.to == "transfer":
+                elif action.kind == "transition" and action.to == "transfer":
                     # Decider-driven transfer: no extra phrase (the main reply
                     # already played) — just mark + hang up.
                     await _perform_handoff(
@@ -863,7 +907,7 @@ async def _main_turn_loop(
                         voice_id=config.voice_id,
                     )
                     return
-                if action.kind == "transition" and action.to == "customer_decline":
+                elif action.kind == "transition" and action.to == "customer_decline":
                     sm.transition_to(
                         CallStatus.ACTIVATING, reason="customer_decline_recovery"
                     )
@@ -871,7 +915,7 @@ async def _main_turn_loop(
                         CallStatus.LISTENING, reason="customer_decline_done"
                     )
                     continue
-                if action.kind == "restructure":
+                elif action.kind == "restructure":
                     if restructure_capped:
                         # D6: consecutive cap reached — stop re-voicing; play a
                         # default reply (if any) and reset the counter.

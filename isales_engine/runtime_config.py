@@ -37,6 +37,7 @@ from isales_engine.pipeline.prompt_builder import (
 from isales_engine.realtime.filler_manager import FillerPhraseSpec, FillerSetSpec
 from isales_engine.realtime.interruption_detector import InterruptionConfig
 from isales_engine.realtime.silence_detector import SilenceConfig
+from isales_engine.settings import load_settings
 from isales_engine.transfer.manager import TransferConfig
 from isales_engine.wrapup.manager import WrapUpConfig
 
@@ -72,6 +73,11 @@ class RuntimeConfig:
     # not a detector parameter.
     _max_continuous_interruptions: int = 3
     _continuous_interruption_strategy: str = "short_reply"
+    # change-2 (engine-multi-route-dispatch) kill-switch. Process-level flag
+    # copied from Settings/env by load_runtime_config; the run loop reads it to
+    # pick the SelectRouter effect-dispatch path vs the legacy inline branches.
+    # Default OFF (byte-identical). Removal trigger: change-3 Phase-4.
+    engine_use_router: bool = False
 
 
 async def load_runtime_config(
@@ -329,4 +335,5 @@ async def load_runtime_config(
         filler_delay_ms=filler_delay_ms,
         _max_continuous_interruptions=campaign.max_continuous_interruptions,
         _continuous_interruption_strategy=strategy_value,
+        engine_use_router=load_settings().engine_use_router,
     )

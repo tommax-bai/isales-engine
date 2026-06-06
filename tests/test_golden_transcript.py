@@ -84,10 +84,10 @@ def _snapshot(session: Any) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
-async def _scenario_one_turn_hangup() -> Any:
+async def _scenario_one_turn_hangup(use_router: bool = False) -> Any:
     """Greeting → 1 user turn → AI reply → remote hangup."""
     session = _make_session()
-    config = _make_config()
+    config = _make_config(engine_use_router=use_router)
     asr = ScriptedMockASR(partial_step_ms=5)
     providers = _make_providers(asr=asr)
     tel = MockTelephonyClient(connect_delay_ms=0)
@@ -110,7 +110,7 @@ async def _scenario_one_turn_hangup() -> Any:
     return session
 
 
-async def _scenario_goal_achieved_wrapup() -> Any:
+async def _scenario_goal_achieved_wrapup(use_router: bool = False) -> Any:
     """Goal achieved (预约) → WRAPPING_UP → wrap-up round exhausts → hangup.
 
     Exercises the sales soft-outcome path (goal_achieved → wrap-up) that the
@@ -118,7 +118,9 @@ async def _scenario_goal_achieved_wrapup() -> Any:
     behavior to pin before the refactor.
     """
     session = _make_session()
-    config = _make_config(wrap_up_max_rounds=1, silence_threshold_ms=3000)
+    config = _make_config(
+        wrap_up_max_rounds=1, silence_threshold_ms=3000, engine_use_router=use_router
+    )
     asr = ScriptedMockASR(partial_step_ms=5)
     providers = _make_providers(asr=asr)
     tel = MockTelephonyClient(connect_delay_ms=0)
@@ -142,10 +144,10 @@ async def _scenario_goal_achieved_wrapup() -> Any:
     return session
 
 
-async def _scenario_silence_activation_hangup() -> Any:
+async def _scenario_silence_activation_hangup(use_router: bool = False) -> Any:
     """No user speech → silence activation → still silent → silence hangup."""
     session = _make_session()
-    config = _make_config(silence_threshold_ms=100)
+    config = _make_config(silence_threshold_ms=100, engine_use_router=use_router)
     providers = _make_providers(asr=ScriptedMockASR(partial_step_ms=5))
     tel = MockTelephonyClient(connect_delay_ms=0)
 
@@ -166,9 +168,10 @@ _SCENARIOS = {
 }
 
 
+@pytest.mark.parametrize("use_router", [False, True], ids=["router_off", "router_on"])
 @pytest.mark.parametrize("name", sorted(_SCENARIOS))
-async def test_golden_transcript(name: str) -> None:
-    session = await _SCENARIOS[name]()
+async def test_golden_transcript(name: str, use_router: bool) -> None:
+    session = await _SCENARIOS[name](use_router=use_router)
     snap = _snapshot(session)
     golden = GOLDEN_DIR / f"{name}.json"
 

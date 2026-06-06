@@ -64,6 +64,7 @@ def _make_config(
     # exactly one main / referee / extractor slot (no N-role / M-judge PK).
     n_roles: int = 1,
     n_judges: int = 0,
+    engine_use_router: bool = False,
 ) -> RuntimeConfig:
     restructure_spec = (
         RestructureSpec(
@@ -170,6 +171,7 @@ def _make_config(
         fixed_greeting="您好我是 AI 助手。",
         max_no_progress_seconds=None,
         filler_enabled=filler_enabled,
+        engine_use_router=engine_use_router,
     )
 
 

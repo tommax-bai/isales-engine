@@ -108,6 +108,19 @@ class Settings(BaseSettings):
         default=False, alias="ISALES_LIVE_PROVIDER_TESTS"
     )
 
+    # ---- engine-flat-refactor change-2 (engine-multi-route-dispatch) -----
+
+    # Kill-switch for the SelectRouter decision-dispatch path. OFF (default) →
+    # the legacy ``_main_turn_loop`` inline decision runs (byte-identical, the
+    # golden-transcript net guards it). ON → the per-user-turn decision routes
+    # through SelectRouter + turn_controller (the driver loop, effect functions,
+    # state machine, and finalize all stay verbatim — only the decision compute
+    # moves). Removal trigger: change-3 (engine-tools-multidialogue-gating)
+    # Phase-4 deletes the legacy inline decision block + this flag in one commit.
+    engine_use_router: bool = Field(
+        default=False, alias="ISALES_ENGINE_USE_ROUTER"
+    )
+
 
 def load_settings() -> Settings:
     return Settings()
