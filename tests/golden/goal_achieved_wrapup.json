@@ -5,9 +5,9 @@
       "first_audio_ms": "<volatile>",
       "main_duration_ms": "<volatile>",
       "main_fallback_used": false,
-      "main_reply_text": "好的，我明白了。请问您还有什么需要？",
+      "main_reply_text": "好的，期待和您再次联系，再见。",
       "main_tokens_in": 16,
-      "main_tokens_out": 9,
+      "main_tokens_out": 7,
       "matched_rule": {
         "action": {
           "goal_type": "appointment",
@@ -70,9 +70,9 @@
       "goal_achieved": true,
       "goal_type": "appointment",
       "interrupted": false,
-      "is_wrap_up": false,
+      "is_wrap_up": true,
       "selected_role_config_id": 100,
-      "text": "好的，我明白了。请问您还有什么需要？",
+      "text": "好的，期待和您再次联系，再见。",
       "ts": "<volatile>",
       "turn_id": 1,
       "type": "ai_reply"

@@ -49,21 +49,14 @@ _VOLATILE_KEYS = frozenset(
     {"ts", "ts_start", "ts_end", "first_audio_ms"}
 )
 _VOLATILE_SUFFIXES = ("_ms", "_at", "_at_monotonic", "_at_wallclock")
-# engine-tools-multidialogue-gating: new pipeline_trace gating columns that exist
-# ONLY on the flag-ON gate-first path. Blanked in the CROSS-FLAG golden net (the
-# net pins byte-stable *conversation* behavior, and these are flag-ON-only debug
-# columns); their values are asserted in the dedicated gating / persona / tool
-# tests, not here.
+# engine-tools-multidialogue-gating: pipeline_trace gating columns are dropped
+# from the golden net — their values are asserted in the dedicated gating /
+# persona / tool tests (tests/test_gating.py); the golden net pins the observable
+# *conversation* (transcript + main-reply trace), not the routing internals.
 _GATING_KEYS = frozenset(
     {"selected_route_id", "selected_route_kind", "persona_candidates"}
 )
 _SENTINEL = "<volatile>"
-
-# Scenarios whose observable conversation DELIBERATELY changes under the gate-first
-# path (flag ON) — they get a dedicated ``<name>.router_on.json`` fixture instead
-# of sharing the legacy one. (goal_achieved: gate selects the closing route, so
-# the reply played IS the closing reply, not the legacy main-reply-then-wrap-up.)
-_ROUTER_ON_DIVERGENT = frozenset({"goal_achieved_wrapup"})
 
 
 def _canon(obj: Any) -> Any:
@@ -103,10 +96,10 @@ def _snapshot(session: Any) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
-async def _scenario_one_turn_hangup(use_router: bool = False) -> Any:
+async def _scenario_one_turn_hangup() -> Any:
     """Greeting → 1 user turn → AI reply → remote hangup."""
     session = _make_session()
-    config = _make_config(engine_use_router=use_router)
+    config = _make_config()
     asr = ScriptedMockASR(partial_step_ms=5)
     providers = _make_providers(asr=asr)
     tel = MockTelephonyClient(connect_delay_ms=0)
@@ -129,7 +122,7 @@ async def _scenario_one_turn_hangup(use_router: bool = False) -> Any:
     return session
 
 
-async def _scenario_goal_achieved_wrapup(use_router: bool = False) -> Any:
+async def _scenario_goal_achieved_wrapup() -> Any:
     """Goal achieved (预约) → WRAPPING_UP → wrap-up round exhausts → hangup.
 
     Exercises the sales soft-outcome path (goal_achieved → wrap-up) that the
@@ -137,9 +130,7 @@ async def _scenario_goal_achieved_wrapup(use_router: bool = False) -> Any:
     behavior to pin before the refactor.
     """
     session = _make_session()
-    config = _make_config(
-        wrap_up_max_rounds=1, silence_threshold_ms=3000, engine_use_router=use_router
-    )
+    config = _make_config(wrap_up_max_rounds=1, silence_threshold_ms=3000)
     asr = ScriptedMockASR(partial_step_ms=5)
     providers = _make_providers(asr=asr)
     tel = MockTelephonyClient(connect_delay_ms=0)
@@ -163,10 +154,10 @@ async def _scenario_goal_achieved_wrapup(use_router: bool = False) -> Any:
     return session
 
 
-async def _scenario_silence_activation_hangup(use_router: bool = False) -> Any:
+async def _scenario_silence_activation_hangup() -> Any:
     """No user speech → silence activation → still silent → silence hangup."""
     session = _make_session()
-    config = _make_config(silence_threshold_ms=100, engine_use_router=use_router)
+    config = _make_config(silence_threshold_ms=100)
     providers = _make_providers(asr=ScriptedMockASR(partial_step_ms=5))
     tel = MockTelephonyClient(connect_delay_ms=0)
 
@@ -187,18 +178,11 @@ _SCENARIOS = {
 }
 
 
-@pytest.mark.parametrize("use_router", [False, True], ids=["router_off", "router_on"])
 @pytest.mark.parametrize("name", sorted(_SCENARIOS))
-async def test_golden_transcript(name: str, use_router: bool) -> None:
-    session = await _SCENARIOS[name](use_router=use_router)
+async def test_golden_transcript(name: str) -> None:
+    session = await _SCENARIOS[name]()
     snap = _snapshot(session)
-    # Byte-stable scenarios share one fixture across both flags (the net's job:
-    # prove ON didn't regress OFF). Deliberately-divergent scenarios get a
-    # flag-ON fixture (engine-tools-multidialogue-gating).
-    if use_router and name in _ROUTER_ON_DIVERGENT:
-        golden = GOLDEN_DIR / f"{name}.router_on.json"
-    else:
-        golden = GOLDEN_DIR / f"{name}.json"
+    golden = GOLDEN_DIR / f"{name}.json"
 
     if os.environ.get("ISALES_UPDATE_GOLDEN"):
         GOLDEN_DIR.mkdir(exist_ok=True)

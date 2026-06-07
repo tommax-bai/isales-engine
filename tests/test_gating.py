@@ -60,7 +60,6 @@ async def _run(config, *, turns: tuple[str, ...], hangup_after: bool = False):
 
 async def test_tool_hangup_suppresses_reply_and_ends_with_referee_hangup() -> None:
     config = _make_config(
-        engine_use_router=True,
         routing_rules=[
             {
                 "referee": "main_judge",
@@ -90,7 +89,6 @@ async def test_tool_hangup_suppresses_reply_and_ends_with_referee_hangup() -> No
 
 async def test_tool_transfer_routes_through_perform_handoff() -> None:
     config = _make_config(
-        engine_use_router=True,
         routing_rules=[
             {
                 "referee": "main_judge",
@@ -117,7 +115,6 @@ async def test_tool_transfer_routes_through_perform_handoff() -> None:
 
 async def test_unknown_tool_alias_fails_open_to_main() -> None:
     config = _make_config(
-        engine_use_router=True,
         routing_rules=[
             {
                 "referee": "main_judge",
@@ -143,7 +140,6 @@ async def test_unknown_tool_alias_fails_open_to_main() -> None:
 
 async def test_eager_persona_selected_one_cancel_rest() -> None:
     config = _make_config(
-        engine_use_router=True,
         routing_rules=[
             {
                 "referee": "main_judge",
@@ -165,7 +161,7 @@ async def test_eager_persona_selected_one_cancel_rest() -> None:
 
 
 async def test_persona_fanout_cap_clamped_to_three() -> None:
-    config = _make_config(engine_use_router=True)  # no rule → continue → main
+    config = _make_config()  # no rule → continue → main
     config.pipeline.personas = [_persona(f"p{i}", 900 + i * 2) for i in range(4)]
     config.pipeline.persona_fanout_cap = 5  # clamp to 3 (main + 2 personas)
     session = await _run(config, turns=("随便聊聊",), hangup_after=True)
@@ -191,7 +187,6 @@ async def test_gate_fails_open_to_main_on_referee_timeout() -> None:
             return await super().chat(messages, json_mode=json_mode, **kw)
 
     config = _make_config(
-        engine_use_router=True,
         routing_rules=[
             {
                 "referee": "main_judge",

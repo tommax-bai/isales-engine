@@ -27,6 +27,7 @@ import random
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Any
 
 from isales_common.enums import (
@@ -73,10 +74,7 @@ from isales_engine.realtime.interruption_detector import (
 from isales_engine.realtime.no_progress_timer import is_no_progress_exceeded
 from isales_engine.realtime.silence_detector import SilenceConfig, evaluate_silence
 from isales_engine.realtime.telephony_client import TelephonyClient
-from isales_engine.routes.builder import build_effect_router
-from isales_engine.routes.effects import EffectContext
 from isales_engine.runtime_config import RuntimeConfig
-from isales_engine.select_router import Directive
 from isales_engine.state_machine import StateMachine
 from isales_engine.streaming.types import RefereeResult
 from isales_engine.transcript_recorder import now_utc
@@ -88,6 +86,17 @@ from isales_engine.transfer.manager import (
 from isales_engine.wrapup.manager import evaluate_wrap_up
 
 logger = logging.getLogger(__name__)
+
+
+class Directive(Enum):
+    """What the turn loop does after a gate-first turn runs.
+
+    * ``CONTINUE`` — next loop iteration (await the next user final / silence).
+    * ``RETURN``   — end the call (terminal route / hangup / transfer).
+    """
+
+    CONTINUE = "continue"
+    RETURN = "return"
 
 
 @dataclass
@@ -504,14 +513,6 @@ async def _main_turn_loop(
     no_progress_started = time.monotonic()
     last_progress_ms = _to_ms(no_progress_started)
 
-    # change-2 (engine-multi-route-dispatch): kill-switch carried on
-    # RuntimeConfig (load_runtime_config copies it from Settings/env). ON → the
-    # post-decide effect dispatch routes through the SelectRouter table; OFF
-    # (default) → the legacy inline branches (byte-identical, golden net
-    # guarded). Removal trigger: change-3 Phase-4.
-    use_router = config.engine_use_router
-    effect_router = build_effect_router() if use_router else None
-
     try:
         while session.state is not CallStatus.END:
             outcome = await _await_user_or_silence(
@@ -577,7 +578,6 @@ async def _main_turn_loop(
                 continue
 
             user_text = outcome.text
-            turn_recv_at = time.monotonic()  # timing: user final reached the loop
             session.append_event("user_speech", text=user_text)
             if publisher is not None:
                 publisher.publish(
@@ -683,330 +683,30 @@ async def _main_turn_loop(
                     voice_id=config.voice_id,
                 )
 
-            # change-3 (engine-tools-multidialogue-gating): gate-first turn behind
-            # ENGINE_USE_ROUTER. Spawns referees + eager dialogue candidates,
-            # awaits the pre-reply gate, then releases ONE route (or a lazy tool).
-            # The legacy speak-then-judge body below runs only when the flag is
-            # OFF (default) — byte-identical, golden double-flag guarded.
-            if use_router:
-                directive = await _run_gated_turn(
-                    session,
-                    sm,
-                    config=config,
-                    telephony=telephony,
-                    providers=providers,
-                    publisher=publisher,
-                    user_text=user_text,
-                    ts_start=ts_start,
-                    processing_start=processing_start,
-                    is_wrap_up=is_wrap_up,
-                    filler=filler,
-                    transfer_llm_task=transfer_llm_task,
-                    pipeline_timeout_ms=pipeline_timeout_ms,
-                )
-                if directive is Directive.RETURN:
-                    return
-                continue
-
-            # Spawn main streaming + referee (referee skipped during wrap-up).
-            stream = run_pipeline_stream(
+            # engine-tools-multidialogue-gating: gate-first turn — spawn
+            # referees + eager dialogue candidates (main + opt-in personas),
+            # await the pre-reply gate, then release ONE route (or a lazy tool).
+            # Phase-4 deleted the legacy speak-then-judge body + the
+            # ENGINE_USE_ROUTER kill-switch + the change-2 effect-route adapter;
+            # this is the sole turn path now.
+            directive = await _run_gated_turn(
                 session,
-                user_text,
-                config.pipeline,
-                providers.llm,  # main_llm
-                providers.llm,  # referee_llm (same provider in v1 — see note)
+                sm,
+                config=config,
+                telephony=telephony,
+                providers=providers,
+                publisher=publisher,
+                user_text=user_text,
+                ts_start=ts_start,
+                processing_start=processing_start,
                 is_wrap_up=is_wrap_up,
+                filler=filler,
+                transfer_llm_task=transfer_llm_task,
                 pipeline_timeout_ms=pipeline_timeout_ms,
             )
-
-            sm.transition_to(CallStatus.IN_CALL, reason="main_stream_started")
-            first_audio_ms, played = await _play_streaming(
-                session,
-                telephony,
-                providers.tts,
-                stream,
-                voice_id=config.voice_id,
-                filler=filler,
-                filler_delay_s=config.filler_delay_ms / 1000.0,
-                processing_start=processing_start,
-            )
-
-            # Per-turn timing breakdown (ms), all relative to the user final
-            # reaching the loop (turn_recv_at):
-            #   recv→proc  : transfer/protection checks before PROCESSING
-            #   →llm_token : main LLM first token (TTFT)
-            #   →llm_sent  : main LLM first splittable sentence
-            #   →audio_out : first PCM chunk pushed toward DingRTC (first_audio_ms
-            #                is measured from processing_start, so add the
-            #                recv→proc offset for the recv-relative figure)
-            _recv_to_proc_ms = int((processing_start - turn_recv_at) * 1000)
-            logger.info(
-                "turn_timing user=%r reply=%r recv_to_proc_ms=%s "
-                "llm_first_token_ms=%s llm_first_sentence_ms=%s first_audio_ms=%s "
-                "recv_to_audio_ms=%s main_dur_ms=%s",
-                user_text[:24],
-                stream.result.reply_text[:60],
-                _recv_to_proc_ms,
-                stream.result.first_token_ms,
-                stream.result.first_sentence_ms,
-                first_audio_ms,
-                (_recv_to_proc_ms + first_audio_ms) if first_audio_ms is not None else None,
-                stream.result.duration_ms,
-            )
-
-            # Token bookkeeping from the main streaming call.
-            session.total_tokens_in += stream.result.tokens_in
-            session.total_tokens_out += stream.result.tokens_out
-
-            if not played:
-                # Real-time interruption fired mid main reply. The referees +
-                # transfer detector ran on the pre-interruption input and are
-                # now stale — cancel them. The not-yet-spoken sentence buffer was
-                # captured into session.interrupt_remaining_text by
-                # _play_streaming for a possible next-turn restructure.
-                _cancel_referees(stream)
-                if transfer_llm_task is not None:
-                    transfer_llm_task.cancel()
-                session.pipeline_trace_records.append(
-                    _base_trace(stream, ts_start, user_text, first_audio_ms)
-                )
-                session.append_event(
-                    "ai_reply",
-                    text=stream.result.reply_text,
-                    turn_id=stream.turn_id,
-                    selected_role_config_id=config.pipeline.main.role_config_id or None,
-                    goal_achieved=False,
-                    goal_type="",
-                    extracted={},
-                    is_wrap_up=is_wrap_up,
-                    interrupted=True,
-                )
-                session.consecutive_interruption_count += 1
-                session.interruption_signaled = False
-                sm.transition_to(
-                    CallStatus.IN_CALL, reason="speaking_interrupted"
-                )
-                # Next loop iteration will await the user's interrupting final.
-                continue
-            # Successful SPEAKING — clear the counter per spec.
-            session.consecutive_interruption_count = 0
-
-            # Await all referees (main TTS already played; this is the only place
-            # the main link "waits" — each referee fail-opens), then route via the
-            # ordered routing-rule decider (first-match-wins).
-            referee_results = await _await_referees(stream)
-            restructure_enabled = config.pipeline.restructure is not None
-            action: DeciderAction = decide(
-                referee_results,
-                config.pipeline.routing_rules,
-                primary_referee_label=config.pipeline.primary_referee_label,
-                restructure_enabled=restructure_enabled,
-            )
-
-            # Resolve restructure InterruptText up front so the trace can record
-            # the source text and we know whether restructure actually fires.
-            restructure_text: str | None = None
-            restructure_capped = False
-            if action.kind == "restructure" and not is_wrap_up:
-                if (
-                    session.consecutive_restructure_count
-                    >= config.pipeline.max_continuous_restructure
-                ):
-                    restructure_capped = True  # D6: stop re-voicing, play default
-                else:
-                    restructure_text = _assemble_interrupt_text(session, action.source)
-
-            goal_achieved = (
-                action.kind == "transition"
-                and action.to == "goal_achieved"
-                and not is_wrap_up
-            )
-            goal_type = action.goal_type or "" if goal_achieved else ""
-
-            session.pipeline_trace_records.append(
-                {
-                    **_base_trace(stream, ts_start, user_text, first_audio_ms),
-                    "referee_results": [r.as_trace() for r in referee_results],
-                    "matched_rule": action.matched_rule,
-                    "restructure_active": restructure_text is not None,
-                    "restructure_trigger": (
-                        action.restructure_trigger if restructure_text is not None else None
-                    ),
-                    "restructure_source_text": restructure_text,
-                }
-            )
-
-            session.append_event(
-                "ai_reply",
-                text=stream.result.reply_text,
-                turn_id=stream.turn_id,
-                selected_role_config_id=config.pipeline.main.role_config_id or None,
-                goal_achieved=goal_achieved,
-                goal_type=goal_type or "",
-                # extracted is now produced post-call by the worker extractor.
-                extracted={},
-                is_wrap_up=is_wrap_up,
-                interrupted=False,
-            )
-
-            # Parallel transfer-LLM detector (pipeline-latency-tail § D): resolve
-            # before decider-driven transitions. The decider's transfer routing is
-            # the preferred path; only act on the dedicated detector when the
-            # decider did not already route a transfer.
-            transfer_llm_decision = await _resolve_transfer_llm(transfer_llm_task)
-            action_transfer = (
-                action.kind == "transition"
-                and action.to == "transfer"
-                and not is_wrap_up
-            )
-            if (
-                transfer_llm_decision is not None
-                and transfer_llm_decision.triggered
-                and not action_transfer
-            ):
-                await _perform_handoff(
-                    session, sm, telephony, providers.tts,
-                    trigger_type=transfer_llm_decision.trigger_type or "transfer",
-                    trigger_detail=transfer_llm_decision.trigger_detail,
-                    phrase=transfer_llm_decision.phrase,
-                    voice_id=config.voice_id,
-                )
+            if directive is Directive.RETURN:
                 return
-
-            # ---- decider-driven outcome (skipped during wrap-up) ----
-            if not is_wrap_up:
-                if use_router:
-                    # change-2 (engine-multi-route-dispatch): route the
-                    # post-decide effect through the SelectRouter table. The
-                    # effect routes reproduce the legacy branches below
-                    # byte-for-byte (same transitions / events / helpers, same
-                    # continue / return / fall-through control flow).
-                    # ENGINE_USE_ROUTER OFF (default) runs the legacy branches.
-                    assert effect_router is not None
-                    directive = await effect_router.dispatch(
-                        action,
-                        EffectContext(
-                            session=session,
-                            sm=sm,
-                            telephony=telephony,
-                            providers=providers,
-                            config=config,
-                            action=action,
-                            restructure_text=restructure_text,
-                            restructure_capped=restructure_capped,
-                            goal_type=goal_type,
-                            pipeline_timeout_ms=pipeline_timeout_ms,
-                            perform_handoff=_perform_handoff,
-                            run_restructure=_run_restructure,
-                            play_tts=_play_tts,
-                            now_utc=now_utc,
-                        ),
-                    )
-                    if directive is Directive.RETURN:
-                        return
-                    if directive is Directive.CONTINUE:
-                        continue
-                    # Directive.FALL_THROUGH → fall past the elif chain to the
-                    # restructure-cap-reset below (legacy continue / degraded).
-                elif action.kind == "transition" and action.to == "goal_achieved":
-                    sm.transition_to(
-                        CallStatus.IN_CALL, reason=goal_type or "goal_achieved"
-                    )
-                    session.in_wrap_up = True  # 4-state collapse: wrap-up is an internal flag
-                    session.wrap_up_started_at_monotonic = time.monotonic()
-                    session.wrap_up_started_at_wallclock = now_utc()
-                    session.append_event(
-                        "wrap_up_started",
-                        rounds_remaining=config.wrap_up.max_rounds,
-                        seconds_remaining=config.wrap_up.max_seconds,
-                    )
-                    session.append_event(
-                        "goal_achieved", goal_type=goal_type, extracted={}
-                    )
-                    continue
-                elif action.kind == "transition" and action.to == "transfer":
-                    # Decider-driven transfer: no extra phrase (the main reply
-                    # already played) — just mark + hang up.
-                    await _perform_handoff(
-                        session, sm, telephony, providers.tts,
-                        trigger_type="referee",
-                        trigger_detail="referee_decision",
-                        phrase="",
-                        voice_id=config.voice_id,
-                    )
-                    return
-                elif action.kind == "transition" and action.to == "customer_decline":
-                    sm.transition_to(
-                        CallStatus.IN_CALL, reason="customer_decline_recovery"
-                    )
-                    sm.transition_to(
-                        CallStatus.IN_CALL, reason="customer_decline_done"
-                    )
-                    continue
-                elif action.kind == "restructure":
-                    if restructure_capped:
-                        # D6: consecutive cap reached — stop re-voicing; play a
-                        # default reply (if any) and reset the counter.
-                        if config.pipeline.default_replies:
-                            await _play_tts(
-                                session, telephony, providers.tts,
-                                random.choice(config.pipeline.default_replies),
-                                voice_id=config.voice_id,
-                            )
-                        session.consecutive_restructure_count = 0
-                        sm.transition_to(
-                            CallStatus.IN_CALL, reason="restructure_capped"
-                        )
-                        continue
-                    if restructure_text is not None:
-                        played_rs = await _run_restructure(
-                            session, telephony, providers, config, restructure_text,
-                            pipeline_timeout_ms=pipeline_timeout_ms,
-                        )
-                        session.consecutive_restructure_count += 1
-                        if not played_rs:
-                            session.consecutive_interruption_count += 1
-                            session.interruption_signaled = False
-                            sm.transition_to(
-                                CallStatus.IN_CALL, reason="restructure_interrupted"
-                            )
-                            continue
-                        sm.transition_to(
-                            CallStatus.IN_CALL, reason="restructure_done"
-                        )
-                        continue
-                    # restructure degraded (no InterruptText available) → continue.
-                # Normal main reply (continue / degraded): reset restructure cap.
-                session.consecutive_restructure_count = 0
-
-            if is_wrap_up:
-                session.wrap_up_round_count += 1
-                wrap_decision = evaluate_wrap_up(
-                    rounds_so_far=session.wrap_up_round_count,
-                    started_at_monotonic=session.wrap_up_started_at_monotonic,
-                    config=config.wrap_up,
-                )
-                if not wrap_decision.proceed:
-                    await _play_tts(
-                        session, telephony, providers.tts, wrap_decision.closing_phrase,
-                        voice_id=config.voice_id,
-                    )
-                    session.append_event(
-                        "wrap_up_completed", reason=wrap_decision.reason
-                    )
-                    sm.transition_to(
-                        CallStatus.END, reason="wrap_up_completed", force=True
-                    )
-                    session.hangup_cause = HangupCause.WRAP_UP_COMPLETED.value
-                    session.append_event(
-                        "hangup", reason="wrap_up_completed", initiated_by="ai"
-                    )
-                    return
-                # Continue another wrap-up turn. SPEAKING → WRAPPING_UP transition.
-                sm.transition_to(CallStatus.IN_CALL, reason="wrap_up_continue")
-                continue
-
-            sm.transition_to(CallStatus.IN_CALL, reason="tts_done")
+            continue
     finally:
         # Pump lifecycle now belongs to run_session — these locals just keep
         # type checkers happy that they were "used" in this scope.
@@ -1421,15 +1121,7 @@ async def _await_referees(
     )
 
 
-def _cancel_referees(stream: PipelineStream) -> None:
-    """Cancel any still-running referee tasks (e.g. when a barge-in makes their
-    pre-interruption input stale)."""
-    for task in stream.referee_tasks:
-        if not task.done():
-            task.cancel()
-
-
-# ---- Gate-first turn (engine-tools-multidialogue-gating, behind ENGINE_USE_ROUTER)
+# ---- Gate-first turn (engine-tools-multidialogue-gating)
 #
 # Inverts the legacy speak-then-judge into judge-then-speak: spawn referees +
 # eager-buffer the candidate dialogue routes (main + opt-in personas) so

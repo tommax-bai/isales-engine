@@ -64,7 +64,6 @@ def _make_config(
     # exactly one main / referee / extractor slot (no N-role / M-judge PK).
     n_roles: int = 1,
     n_judges: int = 0,
-    engine_use_router: bool = False,
 ) -> RuntimeConfig:
     restructure_spec = (
         RestructureSpec(
@@ -171,7 +170,6 @@ def _make_config(
         fixed_greeting="您好我是 AI 助手。",
         max_no_progress_seconds=None,
         filler_enabled=filler_enabled,
-        engine_use_router=engine_use_router,
     )
 
 
@@ -434,9 +432,10 @@ _RESTRUCTURE_RULE = [
 
 
 async def test_run_session_restructure_fires_and_records_trace() -> None:
-    """A continue→restructure rule re-voices the last reply: the turn yields a
-    second ai_reply and a restructure-active trace, with no referee on the
-    restructure turn (§4.4 / §4.7)."""
+    """A continue→restructure rule re-voices the last reply with a
+    restructure-active trace. Under gate-first the gate SELECTS the restructure
+    route up front (no main-reply-first like the old speak-then-judge), so the
+    turn yields exactly one (restructure) ai_reply (§4.4 / §4.7)."""
     session = _make_session()
     config = _make_config(
         enable_restructure=True,
@@ -465,10 +464,10 @@ async def test_run_session_restructure_fires_and_records_trace() -> None:
     assert first["restructure_active"] is True
     assert first["restructure_trigger"] == "last_reply"
     assert first["restructure_source_text"]
-    # restructure turn does not spawn referees (its own trace not added; it
-    # reuses the main turn). At least two ai_reply events: main + restructure.
+    # gate-first: the gate selects restructure directly, so the only reply is the
+    # re-voiced restructure (legacy played main first → 2 replies; now → 1).
     ai_replies = [e for e in session.full_transcript if e["type"] == "ai_reply"]
-    assert len(ai_replies) >= 2
+    assert len(ai_replies) >= 1
     assert session.consecutive_restructure_count >= 1
 
 
