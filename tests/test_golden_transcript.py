@@ -49,7 +49,21 @@ _VOLATILE_KEYS = frozenset(
     {"ts", "ts_start", "ts_end", "first_audio_ms"}
 )
 _VOLATILE_SUFFIXES = ("_ms", "_at", "_at_monotonic", "_at_wallclock")
+# engine-tools-multidialogue-gating: new pipeline_trace gating columns that exist
+# ONLY on the flag-ON gate-first path. Blanked in the CROSS-FLAG golden net (the
+# net pins byte-stable *conversation* behavior, and these are flag-ON-only debug
+# columns); their values are asserted in the dedicated gating / persona / tool
+# tests, not here.
+_GATING_KEYS = frozenset(
+    {"selected_route_id", "selected_route_kind", "persona_candidates"}
+)
 _SENTINEL = "<volatile>"
+
+# Scenarios whose observable conversation DELIBERATELY changes under the gate-first
+# path (flag ON) — they get a dedicated ``<name>.router_on.json`` fixture instead
+# of sharing the legacy one. (goal_achieved: gate selects the closing route, so
+# the reply played IS the closing reply, not the legacy main-reply-then-wrap-up.)
+_ROUTER_ON_DIVERGENT = frozenset({"goal_achieved_wrapup"})
 
 
 def _canon(obj: Any) -> Any:
@@ -57,6 +71,11 @@ def _canon(obj: Any) -> Any:
     if isinstance(obj, dict):
         out: dict[str, Any] = {}
         for k, v in obj.items():
+            if k in _GATING_KEYS:
+                # DROP (not blank) flag-ON-only gating columns so the OFF fixture
+                # (which lacks the keys) and the ON snapshot have identical key
+                # sets for the cross-flag comparison.
+                continue
             if k in _VOLATILE_KEYS or k.endswith(_VOLATILE_SUFFIXES):
                 out[k] = _SENTINEL
             else:
@@ -173,7 +192,13 @@ _SCENARIOS = {
 async def test_golden_transcript(name: str, use_router: bool) -> None:
     session = await _SCENARIOS[name](use_router=use_router)
     snap = _snapshot(session)
-    golden = GOLDEN_DIR / f"{name}.json"
+    # Byte-stable scenarios share one fixture across both flags (the net's job:
+    # prove ON didn't regress OFF). Deliberately-divergent scenarios get a
+    # flag-ON fixture (engine-tools-multidialogue-gating).
+    if use_router and name in _ROUTER_ON_DIVERGENT:
+        golden = GOLDEN_DIR / f"{name}.router_on.json"
+    else:
+        golden = GOLDEN_DIR / f"{name}.json"
 
     if os.environ.get("ISALES_UPDATE_GOLDEN"):
         GOLDEN_DIR.mkdir(exist_ok=True)

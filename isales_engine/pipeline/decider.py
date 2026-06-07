@@ -25,12 +25,17 @@ from isales_engine.streaming.types import CONFIDENCE_THRESHOLD, RefereeResult
 class DeciderAction:
     """What run_loop should do this turn."""
 
-    kind: str  # "transition" | "restructure" | "continue"
-    to: str | None = None  # transition target (goal_achieved / transfer / customer_decline)
+    kind: str  # "transition" | "restructure" | "continue" | "route" | "tool"
+    to: str | None = None  # transition target / route target (persona|closing|recovery|restructure)
     goal_type: str | None = None  # carried by goal_achieved transitions
     source: str | None = None  # restructure InterruptText source
     # "last_reply" / "interrupt_remaining" / "low_confidence" — for trace.
     restructure_trigger: str | None = None
+    # engine-tools-multidialogue-gating: tool alias (RouteToolAction) + the
+    # route's declared then_state side-effect (RoutePersonaAction/RouteToolAction)
+    # the StatusProjector reads. Legacy transition/restructure leave these None.
+    tool: str | None = None
+    then_state: str | None = None
     # The matched routing rule (dict), for pipeline_trace; None when none matched.
     matched_rule: dict[str, Any] | None = None
 
@@ -72,6 +77,22 @@ def decide(
                 kind="restructure",
                 source=source,
                 restructure_trigger=source,
+                matched_rule=rule,
+            )
+        # engine-tools-multidialogue-gating: new action types. The action→route
+        # mapping widens (this is the only widening; decide()'s walk is unchanged).
+        if atype == "route":
+            return DeciderAction(
+                kind="route",
+                to=action.get("to"),
+                then_state=action.get("then_state"),
+                matched_rule=rule,
+            )
+        if atype == "tool":
+            return DeciderAction(
+                kind="tool",
+                tool=action.get("tool"),
+                then_state=action.get("then_state"),
                 matched_rule=rule,
             )
         # Unknown action type → continue (defensive; api validates on write).

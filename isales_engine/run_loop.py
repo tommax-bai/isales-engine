@@ -26,7 +26,8 @@ import logging
 import random
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Any
 
 from isales_common.enums import (
     CallStatus,
@@ -44,6 +45,7 @@ from isales_common.schemas.messages.engine_event import (
     StatusChanged,
     TranscriptAppended,
 )
+from isales_common.schemas.pipeline import MainSpec
 
 from isales_engine.call_session import CallSession
 from isales_engine.event_publisher import EventPublisher
@@ -680,6 +682,31 @@ async def _main_turn_loop(
                     tts=providers.tts,
                     voice_id=config.voice_id,
                 )
+
+            # change-3 (engine-tools-multidialogue-gating): gate-first turn behind
+            # ENGINE_USE_ROUTER. Spawns referees + eager dialogue candidates,
+            # awaits the pre-reply gate, then releases ONE route (or a lazy tool).
+            # The legacy speak-then-judge body below runs only when the flag is
+            # OFF (default) — byte-identical, golden double-flag guarded.
+            if use_router:
+                directive = await _run_gated_turn(
+                    session,
+                    sm,
+                    config=config,
+                    telephony=telephony,
+                    providers=providers,
+                    publisher=publisher,
+                    user_text=user_text,
+                    ts_start=ts_start,
+                    processing_start=processing_start,
+                    is_wrap_up=is_wrap_up,
+                    filler=filler,
+                    transfer_llm_task=transfer_llm_task,
+                    pipeline_timeout_ms=pipeline_timeout_ms,
+                )
+                if directive is Directive.RETURN:
+                    return
+                continue
 
             # Spawn main streaming + referee (referee skipped during wrap-up).
             stream = run_pipeline_stream(
@@ -1358,20 +1385,26 @@ async def _resolve_transfer_llm(
         return None
 
 
-async def _await_referees(stream: PipelineStream) -> list[RefereeResult]:
-    """Await all N referee tasks with a per-referee 2s fail-open budget.
+async def _await_referees(
+    stream: PipelineStream, *, timeout_s: float = 2.0
+) -> list[RefereeResult]:
+    """Await all N referee tasks with a per-referee fail-open budget.
 
     Returns one :class:`RefereeResult` per referee (empty when none were
     spawned — wrap-up / restructure). A timed-out / errored referee yields a
     labelled fail-open result so it simply matches no routing rule; one slow
     referee never blocks the others (they are awaited concurrently).
+
+    ``timeout_s`` defaults to 2.0 (legacy post-reply await, byte-identical). The
+    gate-first path passes ``campaign.referee_timeout_ms`` (~600ms) so the
+    pre-reply gate fails open fast (engine-tools-multidialogue-gating).
     """
     if not stream.referee_tasks:
         return []
 
     async def _await_one(task: asyncio.Task[RefereeResult], label: str) -> RefereeResult:
         try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout_s)
         except TimeoutError:
             task.cancel()
             return RefereeResult.fail_open(label=label, reason="timeout")
@@ -1394,6 +1427,448 @@ def _cancel_referees(stream: PipelineStream) -> None:
     for task in stream.referee_tasks:
         if not task.done():
             task.cancel()
+
+
+# ---- Gate-first turn (engine-tools-multidialogue-gating, behind ENGINE_USE_ROUTER)
+#
+# Inverts the legacy speak-then-judge into judge-then-speak: spawn referees +
+# eager-buffer the candidate dialogue routes (main + opt-in personas) so
+# generation overlaps the gate, AWAIT the referee gate (referee_timeout_ms,
+# fail-open to referee_fail_open_route), then decide() -> select ONE route ->
+# release the winning buffered dialogue reply (cancel the losers) or execute a
+# lazy tool. The selected route's then_state is projected via the StateMachine
+# (sole state writer); routes never transition directly. The legacy flag-OFF
+# path is byte-identical and untouched.
+
+
+@dataclass
+class _GatedSelection:
+    route_id: str
+    kind: str  # "dialogue" | "tool"
+    then_state: str | None = None
+    goal_type: str = ""
+    source: str | None = None
+    restructure_trigger: str | None = None
+    tool_type: str | None = None  # "hangup" | "transfer"
+    tool_config: dict[str, Any] | None = None
+
+
+def _select_gated_route(action: DeciderAction, config: RuntimeConfig) -> _GatedSelection:
+    """Map a decider verdict to ONE route for the pre-reply gate.
+
+    ``decide()`` is reused verbatim (first-match-wins); only the action→route
+    mapping widens here. Legacy transition/restructure actions are shimmed to
+    route + then_state so they flow through the same projection. Unknown personas
+    / tool aliases fail open to ``referee_fail_open_route`` (default ``main``) —
+    a misconfig never crashes the call.
+    """
+    fail_open = config.pipeline.referee_fail_open_route or "main"
+    tools = config.pipeline.tools
+
+    def _tool(alias: str, then_state: str | None) -> _GatedSelection:
+        tc = tools.get(alias)
+        if not isinstance(tc, dict) or tc.get("type") not in ("hangup", "transfer"):
+            return _GatedSelection(route_id=fail_open, kind="dialogue")
+        ttype = tc["type"]
+        return _GatedSelection(
+            route_id=f"tool:{alias}",
+            kind="tool",
+            then_state=then_state or ("END" if ttype == "hangup" else "TRANSFERRING"),
+            tool_type=ttype,
+            tool_config=tc,
+        )
+
+    _BUILTIN_THEN = {"closing": "WRAPPING_UP", "recovery": "ACTIVATING", "restructure": "LISTENING"}
+
+    if action.kind == "transition":
+        if action.to == "goal_achieved":
+            return _GatedSelection(
+                route_id="closing", kind="dialogue",
+                then_state="WRAPPING_UP", goal_type=action.goal_type or "",
+            )
+        if action.to == "transfer":
+            return _GatedSelection(
+                route_id="tool:transfer", kind="tool",
+                then_state="TRANSFERRING", tool_type="transfer",
+            )
+        if action.to == "customer_decline":
+            return _GatedSelection(route_id="recovery", kind="dialogue", then_state="ACTIVATING")
+    elif action.kind == "restructure":
+        return _GatedSelection(
+            route_id="restructure", kind="dialogue", then_state="LISTENING",
+            source=action.source, restructure_trigger=action.restructure_trigger,
+        )
+    elif action.kind == "route":
+        to = action.to or ""
+        if to in _BUILTIN_THEN:
+            return _GatedSelection(
+                route_id=to, kind="dialogue",
+                then_state=action.then_state or _BUILTIN_THEN[to],
+                goal_type=action.goal_type or "",
+            )
+        if to in {p.label for p in config.pipeline.personas}:
+            return _GatedSelection(
+                route_id=f"persona:{to}", kind="dialogue", then_state=action.then_state
+            )
+        return _GatedSelection(route_id=fail_open, kind="dialogue")
+    elif action.kind == "tool":
+        return _tool(action.tool or "", action.then_state)
+
+    # continue / no rule matched → fail open to the main dialogue route
+    return _GatedSelection(route_id=fail_open, kind="dialogue")
+
+
+def _persona_main_spec(persona: Any) -> MainSpec:
+    """Re-cast a persona slot as a main slot so the existing prompt builder /
+    PipelineStream drive it (the persona's prompt replaces the main prompt)."""
+    return MainSpec(
+        role_config_id=persona.role_config_id,
+        prompt_version_id=persona.prompt_version_id,
+        system_prompt=persona.system_prompt,
+        model=persona.model,
+        temperature=persona.temperature,
+        top_p=persona.top_p,
+    )
+
+
+async def _run_gated_turn(
+    session: CallSession,
+    sm: StateMachine,
+    *,
+    config: RuntimeConfig,
+    telephony: TelephonyClient,
+    providers: Providers,
+    publisher: EventPublisher | None,
+    user_text: str,
+    ts_start: object,
+    processing_start: float,
+    is_wrap_up: bool,
+    filler: FillerManager | None,
+    transfer_llm_task: asyncio.Task[TransferDecision] | None,
+    pipeline_timeout_ms: int,
+) -> Directive:
+    """Drive ONE gate-first PROCESSING turn. Returns a Directive (RETURN ends
+    the call; CONTINUE loops to the next user-await)."""
+    voice_id = config.voice_id
+
+    if is_wrap_up:
+        return await _gated_wrap_up_turn(
+            session, sm, config=config, telephony=telephony, providers=providers,
+            user_text=user_text, ts_start=ts_start, processing_start=processing_start,
+            pipeline_timeout_ms=pipeline_timeout_ms,
+        )
+
+    # ---- eager candidates: main (carries the referees) + opt-in personas ----
+    cap = max(1, min(3, config.pipeline.persona_fanout_cap))
+    enabled_personas = config.pipeline.personas[: max(0, cap - 1)]
+    main_stream = run_pipeline_stream(
+        session, user_text, config.pipeline, providers.llm, providers.llm,
+        is_wrap_up=False, pipeline_timeout_ms=pipeline_timeout_ms,
+    )
+    main_stream.start_eager()
+    candidates: dict[str, PipelineStream] = {"main": main_stream}
+    persona_specs: dict[str, Any] = {}
+    for persona in enabled_personas:
+        persona_cfg = replace(
+            config.pipeline, main=_persona_main_spec(persona), referees=[]
+        )
+        ps = PipelineStream(
+            session, user_text, persona_cfg, providers.llm, providers.llm,
+            is_wrap_up=False, pipeline_timeout_ms=pipeline_timeout_ms,
+        )
+        ps.turn_id = main_stream.turn_id  # one turn id; no extra referees/increment
+        ps.start_eager()
+        rid = f"persona:{persona.label}"
+        candidates[rid] = ps
+        persona_specs[rid] = persona
+    persona_candidates = list(candidates)
+
+    # ---- GATE: await the referees before releasing any audio ----
+    referee_results = await _await_referees(
+        main_stream, timeout_s=config.pipeline.referee_timeout_ms / 1000.0
+    )
+    action: DeciderAction = decide(
+        referee_results,
+        config.pipeline.routing_rules,
+        primary_referee_label=config.pipeline.primary_referee_label,
+        restructure_enabled=config.pipeline.restructure is not None,
+    )
+    sel = _select_gated_route(action, config)
+
+    async def _cancel_candidates(except_id: str | None = None) -> None:
+        for rid, st in candidates.items():
+            if rid != except_id:
+                await st.cancel_eager()
+
+    # ---- parallel transfer-LLM detector (campaigns with transfer_intent /
+    # transfer_llm): the referee→tool:transfer route is the preferred path; only
+    # act on the dedicated detector when the gate did not already select transfer.
+    transfer_llm_decision = await _resolve_transfer_llm(transfer_llm_task)
+    if (
+        transfer_llm_decision is not None
+        and transfer_llm_decision.triggered
+        and not (sel.kind == "tool" and sel.tool_type == "transfer")
+    ):
+        await _cancel_candidates()
+        session.pipeline_trace_records.append(
+            _gated_trace(
+                main_stream, ts_start, user_text, None, referee_results, action,
+                sel, persona_candidates, reply_suppressed=True,
+            )
+        )
+        await _perform_handoff(
+            session, sm, telephony, providers.tts,
+            trigger_type=transfer_llm_decision.trigger_type or "transfer",
+            trigger_detail=transfer_llm_decision.trigger_detail,
+            phrase=transfer_llm_decision.phrase, voice_id=voice_id,
+        )
+        return Directive.RETURN
+
+    # ---- tool routes: lazy, suppress the buffered reply ----
+    if sel.kind == "tool":
+        await _cancel_candidates()
+        if sel.tool_type == "hangup":
+            session.hangup_cause = HangupCause.REFEREE_HANGUP.value
+            phrase = (sel.tool_config or {}).get("closing_phrase") or ""
+            if phrase:
+                await _play_tts(session, telephony, providers.tts, phrase, voice_id=voice_id)
+            session.pipeline_trace_records.append(
+                _gated_trace(
+                    main_stream, ts_start, user_text, None, referee_results, action,
+                    sel, persona_candidates, reply_suppressed=True,
+                )
+            )
+            sm.transition_to(CallStatus.END, reason="referee_hangup", force=True)
+            session.append_event("hangup", reason="referee_hangup", initiated_by="ai")
+            return Directive.RETURN
+        # transfer
+        session.pipeline_trace_records.append(
+            _gated_trace(
+                main_stream, ts_start, user_text, None, referee_results, action,
+                sel, persona_candidates, reply_suppressed=True,
+            )
+        )
+        await _perform_handoff(
+            session, sm, telephony, providers.tts,
+            trigger_type="referee", trigger_detail="referee_decision",
+            phrase="", voice_id=voice_id,
+        )
+        return Directive.RETURN
+
+    # ---- restructure route: re-voice InterruptText (no new reply) ----
+    if sel.route_id == "restructure":
+        await _cancel_candidates()
+        capped = (
+            session.consecutive_restructure_count >= config.pipeline.max_continuous_restructure
+        )
+        restructure_text = None if capped else _assemble_interrupt_text(session, sel.source)
+        session.pipeline_trace_records.append(
+            _gated_trace(
+                main_stream, ts_start, user_text, None, referee_results, action, sel,
+                persona_candidates, restructure_text=restructure_text,
+            )
+        )
+        if capped:
+            if config.pipeline.default_replies:
+                await _play_tts(
+                    session, telephony, providers.tts,
+                    random.choice(config.pipeline.default_replies), voice_id=voice_id,
+                )
+            session.consecutive_restructure_count = 0
+            return Directive.CONTINUE
+        if restructure_text is not None:
+            played_rs = await _run_restructure(
+                session, telephony, providers, config, restructure_text,
+                pipeline_timeout_ms=pipeline_timeout_ms,
+            )
+            session.consecutive_restructure_count += 1
+            if not played_rs:
+                session.consecutive_interruption_count += 1
+                session.interruption_signaled = False
+            return Directive.CONTINUE
+        return Directive.CONTINUE  # degraded (no InterruptText)
+
+    # ---- dialogue routes: release the winning reply, cancel the losers ----
+    if sel.route_id in candidates:
+        winner = candidates[sel.route_id]
+        winner_spec = persona_specs.get(sel.route_id)
+        await _cancel_candidates(except_id=sel.route_id)
+    else:
+        # closing / recovery — not speculatively buffered; generate fresh now.
+        await _cancel_candidates()
+        winner_is_wrap_up = sel.route_id == "closing"
+        winner = PipelineStream(
+            session, user_text, config.pipeline, providers.llm, providers.llm,
+            is_wrap_up=winner_is_wrap_up, pipeline_timeout_ms=pipeline_timeout_ms,
+        )
+        winner.turn_id = main_stream.turn_id
+        winner_spec = None
+
+    role_config_id = (
+        winner_spec.role_config_id if winner_spec is not None
+        else config.pipeline.main.role_config_id
+    )
+
+    sm.transition_to(CallStatus.IN_CALL, reason="main_stream_started")
+    first_audio_ms, played = await _play_streaming(
+        session, telephony, providers.tts, winner,
+        voice_id=voice_id, filler=filler,
+        filler_delay_s=config.filler_delay_ms / 1000.0,
+        processing_start=processing_start,
+    )
+    session.total_tokens_in += winner.result.tokens_in
+    session.total_tokens_out += winner.result.tokens_out
+
+    goal_achieved = sel.route_id == "closing"
+    goal_type = sel.goal_type if goal_achieved else ""
+
+    if not played:
+        # barge-in mid winning reply: referees already consumed; remainder was
+        # captured into interrupt_remaining by _play_streaming for next-turn
+        # restructure. Record + flag the interruption.
+        session.pipeline_trace_records.append(
+            _gated_trace(
+                winner, ts_start, user_text, first_audio_ms, referee_results, action,
+                sel, persona_candidates, interrupted=True,
+            )
+        )
+        session.append_event(
+            "ai_reply", text=winner.result.reply_text, turn_id=winner.turn_id,
+            selected_role_config_id=role_config_id or None,
+            goal_achieved=False, goal_type="", extracted={},
+            is_wrap_up=False, interrupted=True,
+        )
+        session.consecutive_interruption_count += 1
+        session.interruption_signaled = False
+        return Directive.CONTINUE
+
+    session.consecutive_interruption_count = 0
+    session.consecutive_restructure_count = 0
+    session.pipeline_trace_records.append(
+        _gated_trace(
+            winner, ts_start, user_text, first_audio_ms, referee_results, action,
+            sel, persona_candidates,
+        )
+    )
+    session.append_event(
+        "ai_reply", text=winner.result.reply_text, turn_id=winner.turn_id,
+        selected_role_config_id=role_config_id or None,
+        goal_achieved=goal_achieved, goal_type=goal_type or "", extracted={},
+        is_wrap_up=goal_achieved, interrupted=False,
+    )
+
+    # ---- project then_state (StateMachine is the sole writer) ----
+    if sel.then_state == "WRAPPING_UP":  # closing → enter wrap-up
+        sm.transition_to(CallStatus.IN_CALL, reason=goal_type or "goal_achieved")
+        session.in_wrap_up = True
+        session.wrap_up_started_at_monotonic = time.monotonic()
+        session.wrap_up_started_at_wallclock = now_utc()
+        session.append_event(
+            "wrap_up_started",
+            rounds_remaining=config.wrap_up.max_rounds,
+            seconds_remaining=config.wrap_up.max_seconds,
+        )
+        session.append_event("goal_achieved", goal_type=goal_type, extracted={})
+    # recovery (ACTIVATING) / main (LISTENING) both project to IN_CALL — no-op.
+    return Directive.CONTINUE
+
+
+async def _gated_wrap_up_turn(
+    session: CallSession,
+    sm: StateMachine,
+    *,
+    config: RuntimeConfig,
+    telephony: TelephonyClient,
+    providers: Providers,
+    user_text: str,
+    ts_start: object,
+    processing_start: float,
+    pipeline_timeout_ms: int,
+) -> Directive:
+    """A wrap-up turn under gate-first: simplified pipeline (no referees/gate),
+    play the closing-style reply, then evaluate wrap-up exhaustion."""
+    voice_id = config.voice_id
+    stream = run_pipeline_stream(
+        session, user_text, config.pipeline, providers.llm, providers.llm,
+        is_wrap_up=True, pipeline_timeout_ms=pipeline_timeout_ms,
+    )
+    sm.transition_to(CallStatus.IN_CALL, reason="main_stream_started")
+    first_audio_ms, played = await _play_streaming(
+        session, telephony, providers.tts, stream,
+        voice_id=voice_id, filler=None,
+        filler_delay_s=config.filler_delay_ms / 1000.0,
+        processing_start=processing_start,
+    )
+    session.total_tokens_in += stream.result.tokens_in
+    session.total_tokens_out += stream.result.tokens_out
+    session.pipeline_trace_records.append(
+        {**_base_trace(stream, ts_start, user_text, first_audio_ms),
+         "referee_results": [], "matched_rule": None,
+         "restructure_active": False, "restructure_trigger": None,
+         "restructure_source_text": None,
+         "selected_route_id": "closing", "selected_route_kind": "dialogue",
+         "persona_candidates": None}
+    )
+    session.append_event(
+        "ai_reply", text=stream.result.reply_text, turn_id=stream.turn_id,
+        selected_role_config_id=config.pipeline.main.role_config_id or None,
+        goal_achieved=False, goal_type="", extracted={},
+        is_wrap_up=True, interrupted=not played,
+    )
+    if not played:
+        session.consecutive_interruption_count += 1
+        session.interruption_signaled = False
+        return Directive.CONTINUE
+
+    session.wrap_up_round_count += 1
+    wrap_decision = evaluate_wrap_up(
+        rounds_so_far=session.wrap_up_round_count,
+        started_at_monotonic=session.wrap_up_started_at_monotonic,
+        config=config.wrap_up,
+    )
+    if not wrap_decision.proceed:
+        await _play_tts(
+            session, telephony, providers.tts, wrap_decision.closing_phrase, voice_id=voice_id
+        )
+        session.append_event("wrap_up_completed", reason=wrap_decision.reason)
+        sm.transition_to(CallStatus.END, reason="wrap_up_completed", force=True)
+        session.hangup_cause = HangupCause.WRAP_UP_COMPLETED.value
+        session.append_event("hangup", reason="wrap_up_completed", initiated_by="ai")
+        return Directive.RETURN
+    return Directive.CONTINUE
+
+
+def _gated_trace(
+    stream: PipelineStream,
+    ts_start: object,
+    user_text: str,
+    first_audio_ms: int | None,
+    referee_results: list[RefereeResult],
+    action: DeciderAction,
+    sel: _GatedSelection,
+    persona_candidates: list[str],
+    *,
+    restructure_text: str | None = None,
+    reply_suppressed: bool = False,
+    interrupted: bool = False,
+) -> dict[str, Any]:
+    """Build a gate-first pipeline_trace record: legacy fields + the gating
+    selection columns (selected_route_id / selected_route_kind /
+    persona_candidates)."""
+    _ = (reply_suppressed, interrupted)  # reflected via reply_text / event, kept for clarity
+    return {
+        **_base_trace(stream, ts_start, user_text, first_audio_ms),
+        "referee_results": [r.as_trace() for r in referee_results],
+        "matched_rule": action.matched_rule,
+        "restructure_active": restructure_text is not None,
+        "restructure_trigger": (
+            sel.restructure_trigger if restructure_text is not None else None
+        ),
+        "restructure_source_text": restructure_text,
+        "selected_route_id": sel.route_id,
+        "selected_route_kind": sel.kind,
+        "persona_candidates": persona_candidates if len(persona_candidates) > 1 else None,
+    }
 
 
 def _assemble_interrupt_text(session: CallSession, source: str | None) -> str | None:
