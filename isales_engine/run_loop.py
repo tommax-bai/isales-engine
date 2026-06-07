@@ -1,21 +1,22 @@
-"""End-to-end CallSession driver.
+"""End-to-end CallSession driver (flat, gate-first).
 
-Spec: cross-cut — wires state machine + pipeline + filler + transfer + wrap-up
-+ silence + telephony + event publishing into a single async loop.
+Spec: cross-cut — wires the state machine + dual-LLM pipeline + filler +
+transfer + wrap-up + silence + telephony + event publishing into one async
+driver. ``run_session`` is the entry; ``_main_turn_loop`` is the pull-loop shell
+(await user-final / silence each turn); ``_run_gated_turn`` is the gate-first
+turn (judge-then-speak: spawn referees + eager dialogue candidates, await the
+pre-reply gate, then release ONE route or execute a lazy tool).
 
-Stage-5 (impl-engine-providers PR #6) added:
-
-* **Real-time interruption during SPEAKING / FILLER.** The ASR pump now
-  multiplexes partials → ``asr_partials_q`` and finals → ``asr_finals_q``.
-  ``_partial_monitor`` consumes partials, runs ``evaluate_partial``, and on
-  ``triggered`` cancels ``session.current_speaking_task`` (which is set by
-  ``_play_tts``).
-* **Continuous-interruption protection** per ai-pipeline spec delta: counter
-  ≥ ``max_continuous_interruptions`` triggers ``short_reply`` (prompt-side
-  hint to keep the next reply terse) or ``listen_only`` (skip PROCESSING,
-  play a short cue, return to LISTENING).
-* ``audio_out`` MUST be cancel-aware on every TelephonyClient implementation
-  (contract test exercises this).
+* **Real-time interruption (barge-in) during playback.** The ASR pump
+  multiplexes partials → ``asr_partials_q`` / finals → ``asr_finals_q``;
+  ``_partial_monitor`` runs ``evaluate_partial`` and on ``triggered`` cancels
+  ``session.current_speaking_task`` (set by ``_play_chunks``). The not-yet-spoken
+  remainder is captured for a next-turn restructure.
+* **Continuous-interruption protection** (ai-pipeline spec): once the counter
+  hits ``max_continuous_interruptions`` the turn runs ``short_reply`` (terse-reply
+  prompt hint) or ``listen_only`` (skip the LLM, play a short cue). These are
+  internal phases — the observable ``CallStatus`` stays ``IN_CALL`` throughout.
+* ``audio_out`` MUST be cancel-aware on every TelephonyClient (contract test).
 """
 
 from __future__ import annotations
@@ -1018,7 +1019,7 @@ async def _play_streaming(
         # buffer can lead the bounded job queue, so the not-yet-replayed tail is
         # also unspoken — fold it into the barge-in remainder. Then cancel the
         # eager task so its chat_stream / TTS connections are released. Both
-        # no-op for the legacy non-eager path (flag-OFF stays byte-identical).
+        # no-op for the non-eager path (wrap-up / restructure single-shot plays).
         if capture and stream.is_eager:
             captured.append(stream.buffer_remainder())
         await stream.cancel_eager()
@@ -1095,9 +1096,10 @@ async def _await_referees(
     labelled fail-open result so it simply matches no routing rule; one slow
     referee never blocks the others (they are awaited concurrently).
 
-    ``timeout_s`` defaults to 2.0 (legacy post-reply await, byte-identical). The
-    gate-first path passes ``campaign.referee_timeout_ms`` (~600ms) so the
-    pre-reply gate fails open fast (engine-tools-multidialogue-gating).
+    ``timeout_s`` is the per-referee fail-open budget. The gate-first turn passes
+    ``campaign.referee_timeout_ms`` (~600ms) so the pre-reply gate fails open
+    fast; the 2.0s default is the conservative fallback for callers that don't
+    override it.
     """
     if not stream.referee_tasks:
         return []
@@ -1123,14 +1125,13 @@ async def _await_referees(
 
 # ---- Gate-first turn (engine-tools-multidialogue-gating)
 #
-# Inverts the legacy speak-then-judge into judge-then-speak: spawn referees +
-# eager-buffer the candidate dialogue routes (main + opt-in personas) so
-# generation overlaps the gate, AWAIT the referee gate (referee_timeout_ms,
-# fail-open to referee_fail_open_route), then decide() -> select ONE route ->
-# release the winning buffered dialogue reply (cancel the losers) or execute a
-# lazy tool. The selected route's then_state is projected via the StateMachine
-# (sole state writer); routes never transition directly. The legacy flag-OFF
-# path is byte-identical and untouched.
+# Judge-then-speak: spawn referees + eager-buffer the candidate dialogue routes
+# (main + opt-in personas) so generation overlaps the gate, AWAIT the referee
+# gate (referee_timeout_ms, fail-open to referee_fail_open_route), then decide()
+# -> select ONE route -> release the winning buffered dialogue reply (cancel the
+# losers) or execute a lazy tool. The selected route's then_state is projected
+# via the StateMachine (the sole synchronous state writer); routes never call
+# transition_to themselves.
 
 
 @dataclass
@@ -1544,8 +1545,8 @@ def _gated_trace(
     reply_suppressed: bool = False,
     interrupted: bool = False,
 ) -> dict[str, Any]:
-    """Build a gate-first pipeline_trace record: legacy fields + the gating
-    selection columns (selected_route_id / selected_route_kind /
+    """Build a gate-first pipeline_trace record: the base ``_base_trace`` fields
+    + the gating selection columns (selected_route_id / selected_route_kind /
     persona_candidates)."""
     _ = (reply_suppressed, interrupted)  # reflected via reply_text / event, kept for clarity
     return {

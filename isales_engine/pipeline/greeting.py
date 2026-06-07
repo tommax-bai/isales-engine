@@ -1,6 +1,6 @@
 """Greeting generator (固定模板 / LLM 单角色生成).
 
-Spec: ai-pipeline § Requirement: 开场白不走管线 (no judges, no polish);
+Spec: ai-pipeline § Requirement: 开场白不走管线 (no referees);
       transcript § dialog_history 与 full_transcript 双集合 (greeting goes
       into both).
 

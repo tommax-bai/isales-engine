@@ -33,7 +33,8 @@ class DeciderAction:
     restructure_trigger: str | None = None
     # engine-tools-multidialogue-gating: tool alias (RouteToolAction) + the
     # route's declared then_state side-effect (RoutePersonaAction/RouteToolAction)
-    # the StatusProjector reads. Legacy transition/restructure leave these None.
+    # the gate-first turn reads to project state (via the sole state writer).
+    # Legacy transition/restructure leave these None.
     tool: str | None = None
     then_state: str | None = None
     # The matched routing rule (dict), for pipeline_trace; None when none matched.

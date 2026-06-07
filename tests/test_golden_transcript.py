@@ -1,7 +1,7 @@
 """Golden-transcript regression net — change-0 safety net for the flat refactor.
 
 This is the non-negotiable net that MUST stay green through every phase of the
-EventBus / SelectRouter / flatten refactor (see
+EventBus / gate-first flatten refactor (see
 ``isales/openspec/engine-flat-refactor-blueprint.md`` §5 change-0). It drives
 ``run_session()`` through representative scenarios with the deterministic mock
 harness (``test_run_loop`` builders) and asserts ``session.full_transcript`` +

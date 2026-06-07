@@ -49,7 +49,7 @@ async def test_publisher_status_changed(redis_client: Any) -> None:
     await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
 
     event = StatusChanged(
-        call_record_id=42, status=CallStatus.SPEAKING, reason="pipeline_done"
+        call_record_id=42, status=CallStatus.IN_CALL, reason="connected"
     )
     publisher.publish(10, event)
     await publisher.drain()
@@ -61,7 +61,7 @@ async def test_publisher_status_changed(redis_client: Any) -> None:
         data = data.decode()
     parsed = json.loads(data)
     assert parsed["type"] == "status_changed"
-    assert parsed["status"] == "speaking"
+    assert parsed["status"] == "in_call"
 
     await pubsub.unsubscribe("engine:events:campaign:10")
     await pubsub.close()  # type: ignore[no-untyped-call]
@@ -71,7 +71,7 @@ async def test_publisher_does_not_block_when_redis_slow(redis_client: Any) -> No
     """Publisher returns immediately; tasks run in background."""
 
     publisher = EventPublisher(redis_client)
-    event = StatusChanged(call_record_id=1, status=CallStatus.LISTENING)
+    event = StatusChanged(call_record_id=1, status=CallStatus.IN_CALL)
     # Synchronous publish() returns instantly; drain awaits the task.
     publisher.publish(10, event)
     publisher.publish(10, event)

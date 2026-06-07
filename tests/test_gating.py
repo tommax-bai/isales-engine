@@ -1,9 +1,8 @@
 """Pre-reply referee gating + lazy tool routes + eager personas (gate-first).
 
 engine-tools-multidialogue-gating §7.4 / §7.5 / §7.6. These drive run_session
-with ENGINE_USE_ROUTER ON and assert the gate-first behaviors the golden net
-deliberately does not pin (the golden blanks the gating columns + shares one
-fixture across flags for byte-stable scenarios).
+(gate-first is the sole turn path) and assert the gating behaviors the golden
+net deliberately does not pin (it drops the gating columns from its comparison).
 """
 
 from __future__ import annotations

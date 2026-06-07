@@ -1,11 +1,15 @@
-"""Call state machine.
+"""Call state machine — the 4-state lifecycle + the sole state writer.
 
 Spec: call-state-machine § Requirement: 状态集合 / 关键状态转换 /
-      § "非法 transition 改 advisory 警告".
+      § "StatusProjector 单写者投影状态" / § "非法 transition 改 advisory 警告".
 
-The single allowed mutation entry point is :meth:`StateMachine.transition_to`.
-Any caller (orchestrator / filler / silence / transfer / wrap_up) goes through
-this method so transcript events stay aligned with state changes.
+This class IS the spec's "StatusProjector": the single, **synchronous** writer of
+``session.state`` + sole emitter of ``StatusChanged``. The only mutation entry
+point is :meth:`StateMachine.transition_to`; the gate-first turn projects a
+route's ``then_state`` through it (routes never write state directly). Post the
+4-state collapse the observable states are just {init, in_call, transferring,
+end}, so ``transition_to`` is idempotent and most legacy intra-call transitions
+fold to a no-op — a sync sole-writer needs no async bus subscriber.
 
 Transition guard is **advisory**: a transition not listed in
 ``LEGAL_TRANSITIONS`` emits a ``state_warning`` transcript event +

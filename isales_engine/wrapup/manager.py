@@ -1,11 +1,13 @@
-"""WRAPPING_UP state helpers — dual counter + closing phrase.
+"""Wrap-up helpers — dual counter + closing phrase.
 
 Spec: goal-achievement § Requirement: 收尾双计数器与主动挂断;
       § Requirement: 收尾期间的特殊情况处理.
 
-The state machine transition into WRAPPING_UP and the simplified pipeline
-itself live elsewhere (PR #11 + PR #6's ``run_pipeline(is_wrap_up=True)``).
-This module owns the round / time counter logic and the closing-phrase pick.
+Wrap-up is an engine-INTERNAL phase (the ``session.in_wrap_up`` flag), not a
+``CallStatus`` — the 4-state collapse dropped WRAPPING_UP; the observable status
+stays ``IN_CALL`` through wrap-up. This module owns the round / time counter
+logic + the closing-phrase pick; the gate-first turn
+(``run_loop._gated_wrap_up_turn``) drives the simplified wrap-up pipeline.
 """
 
 from __future__ import annotations

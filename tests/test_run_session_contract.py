@@ -1,15 +1,16 @@
 """Frozen-contract tripwires — change-0 safety net for the flat refactor.
 
 These lock the *immovable* external/contract surface that the EventBus /
-SelectRouter / flatten refactor MUST NOT break (see
+gate-first flatten refactor MUST NOT break (see
 ``isales/openspec/engine-flat-refactor-blueprint.md`` §6 hard-constraints):
 
 - ``run_session()``'s call signature (every isales-engine e2e test + dial_consumer
   drive it; the refactor freezes this contract).
 - ``TRANSCRIPT_EVENT_TYPES`` — the transcript event vocabulary consumed by
   isales-worker / isales-web. Dropping or renaming one breaks downstream silently.
-- ``CallStatus`` — the 11-value enum projected to api/web/transcript/worker. In
-  the flat model CallStatus becomes a *projected label*, but the enum stays closed.
+- ``CallStatus`` — the 4-value coarse-lifecycle enum (collapsed from 11 in
+  change-3: init/in_call/transferring/end) projected to api/web/transcript/
+  worker; a projected label, the enum stays closed.
 - ``HangupCause`` — so adding ``REFEREE_HANGUP`` (change-3) is a deliberate,
   test-visible act, and the worker's enum-validated CallEnded boundary is guarded.
 
@@ -56,7 +57,7 @@ def test_run_session_signature_frozen() -> None:
 
 def test_transcript_event_vocabulary_frozen() -> None:
     """The transcript event vocabulary is an external contract (worker/web)."""
-    assert TRANSCRIPT_EVENT_TYPES == frozenset(
+    assert frozenset(
         {
             "greeting",
             "user_speech",
@@ -75,7 +76,7 @@ def test_transcript_event_vocabulary_frozen() -> None:
             "state_error",
             "state_warning",
         }
-    )
+    ) == TRANSCRIPT_EVENT_TYPES
 
 
 def test_call_status_enum_frozen() -> None:
