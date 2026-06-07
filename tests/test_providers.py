@@ -117,7 +117,7 @@ def _msgs(system: str, user: str) -> list[Message]:
 
 
 # Referee user-message primer (mirrors isales_engine.referee._USER_PRIMER).
-_REF_PRIMER = "请根据以上输入，按指定 JSON schema 输出 {category, confidence}。"
+_REF_PRIMER = "请只输出一个词：pass 或 hold，不要任何其他内容、标点或 JSON。"
 
 
 async def test_main_chat_stream_emits_plain_text() -> None:
@@ -150,31 +150,28 @@ async def test_main_wrap_up_segment_says_goodbye() -> None:
 
 async def test_referee_continue_default() -> None:
     llm = KeywordDrivenMockLLM()
-    resp = await llm.chat(_msgs("用户最后一句话：随便聊聊", _REF_PRIMER), json_mode=True)
-    parsed = json.loads(resp.content)
-    assert parsed["category"] == "continue"
-    assert "confidence" in parsed
+    resp = await llm.chat(_msgs("用户最后一句话：随便聊聊", _REF_PRIMER), json_mode=False)
+    assert resp.content == "continue"  # bare token, no JSON
 
 
 async def test_referee_appointment_goal_achieved() -> None:
     llm = KeywordDrivenMockLLM()
     resp = await llm.chat(
-        _msgs("用户最后一句话：我已经为您预约成功", _REF_PRIMER), json_mode=True
+        _msgs("用户最后一句话：我已经为您预约成功", _REF_PRIMER), json_mode=False
     )
-    parsed = json.loads(resp.content)
-    assert parsed["category"] == "goal_achieved"
+    assert resp.content == "goal_achieved"
 
 
 async def test_referee_transfer() -> None:
     llm = KeywordDrivenMockLLM()
-    resp = await llm.chat(_msgs("用户最后一句话：我要转人工", _REF_PRIMER), json_mode=True)
-    assert json.loads(resp.content)["category"] == "transfer"
+    resp = await llm.chat(_msgs("用户最后一句话：我要转人工", _REF_PRIMER), json_mode=False)
+    assert resp.content == "transfer"
 
 
 async def test_referee_customer_decline() -> None:
     llm = KeywordDrivenMockLLM()
-    resp = await llm.chat(_msgs("用户最后一句话：我不需要没兴趣", _REF_PRIMER), json_mode=True)
-    assert json.loads(resp.content)["category"] == "customer_decline"
+    resp = await llm.chat(_msgs("用户最后一句话：我不需要没兴趣", _REF_PRIMER), json_mode=False)
+    assert resp.content == "customer_decline"
 
 
 async def test_greeting_chat_returns_plain_text() -> None:

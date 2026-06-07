@@ -12,7 +12,7 @@
       "referee_results": [
         {
           "category": "continue",
-          "confidence": 0.9,
+          "confidence": 1.0,
           "duration_ms": "<volatile>",
           "label": "main_judge"
         }

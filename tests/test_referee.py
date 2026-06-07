@@ -1,8 +1,12 @@
-"""Tests for the referee module (engine-multi-referee-and-restructure)."""
+"""Tests for the referee module.
+
+engine-tools-multidialogue-gating: the referee emits a **bare category token**
+(e.g. ``pass`` / ``hold``) — no JSON, no confidence — so generation is one token
+and the pre-reply gate stays fast. The parser takes the first whitespace token,
+lowercased + stripped of trailing punctuation; confidence is fixed to 1.0.
+"""
 
 from __future__ import annotations
-
-import json
 
 import pytest
 from isales_common.providers._models import LLMResponse
@@ -24,24 +28,10 @@ def _spec(label: str = "main_judge") -> RefereeSpec:
         prompt_version_id=8,
         system_prompt=(
             "用户最后一句话：{{user_last_utterance}}\n"
-            "最近对话：\n{{recent_dialog_history}}\n输出 JSON。"
+            "最近对话：\n{{recent_dialog_history}}\n只输出 pass 或 hold。"
         ),
         model="qwen-turbo",
         label=label,
-    )
-
-
-def _llm(payload: dict) -> MockLLMProvider:
-    return MockLLMProvider(
-        responses=[
-            LLMResponse(
-                content=json.dumps(payload, ensure_ascii=False),
-                tokens_in=10,
-                tokens_out=5,
-                finish_reason="stop",
-                latency_ms=0,
-            )
-        ]
     )
 
 
@@ -78,57 +68,40 @@ def test_recent_dialog_rounds_caps_at_3_rounds():
     assert recent[-1].text == "19"
 
 
-# ---- category output -------------------------------------------------------
+# ---- bare-token category output -------------------------------------------
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "payload,expected_category",
+    "raw,expected_category",
     [
-        ({"category": "continue", "confidence": 0.9}, "continue"),
-        ({"category": "goal_achieved", "confidence": 0.95}, "goal_achieved"),
-        ({"category": "NEGATIVE", "confidence": 0.88}, "NEGATIVE"),
-        ({"category": "OPERATOR", "confidence": 0.9}, "OPERATOR"),
+        ("pass", "pass"),
+        ("hold", "hold"),
+        ("PASS", "PASS"),  # case preserved (categories are case-sensitive)
+        ("pass.", "pass"),  # trailing punctuation stripped
+        ("pass\n", "pass"),  # whitespace stripped
+        ("hold ，因为答非所问", "hold"),  # first token only (model added explanation)
     ],
 )
-async def test_category_passthrough(payload, expected_category):
-    result = await run_referee(None, "好的", [], _spec(), _llm(payload))
+async def test_bare_token_passthrough(raw, expected_category):
+    result = await run_referee(None, "好的", [], _spec(), _raw_llm(raw))
     assert result.label == "main_judge"
     assert result.category == expected_category
-    assert result.confidence == payload["confidence"]
+    assert result.confidence == 1.0  # fixed; model no longer scores itself
     assert result.failopen_reason is None
-
-
-@pytest.mark.asyncio
-async def test_low_confidence_not_downgraded_in_parser():
-    """The confidence floor is a decider concern — the parser keeps the raw
-    category + confidence so the decider can drive the low-confidence path."""
-    result = await run_referee(
-        None, "x", [], _spec(), _llm({"category": "goal_achieved", "confidence": 0.5})
-    )
-    assert result.category == "goal_achieved"
-    assert result.confidence == 0.5
-    # below the floor → not usable for rule matching
-    assert result.effective_category() is None
-    assert result.trace_category() == "low_confidence"
+    assert result.effective_category() == expected_category  # confidence floor is a no-op
 
 
 # ---- fail-open paths -------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_fail_open_on_invalid_json():
-    result = await run_referee(None, "x", [], _spec(), _raw_llm("not json at all"))
+@pytest.mark.parametrize("raw", ["", "   ", "\n\t"])
+async def test_fail_open_on_empty_output(raw):
+    result = await run_referee(None, "x", [], _spec(), _raw_llm(raw))
     assert result.category is None
     assert result.failopen_reason == "invalid"
     assert result.effective_category() is None
-
-
-@pytest.mark.asyncio
-async def test_fail_open_on_missing_category():
-    result = await run_referee(None, "x", [], _spec(), _llm({"confidence": 0.9}))
-    assert result.category is None
-    assert result.failopen_reason == "invalid"
 
 
 @pytest.mark.asyncio
@@ -144,7 +117,7 @@ async def test_fail_open_on_llm_exception():
 
 @pytest.mark.asyncio
 async def test_placeholder_substituted_into_prompt():
-    llm = _llm({"category": "continue", "confidence": 0.9})
+    llm = _raw_llm("pass")
     await run_referee(None, "周三方便", [DialogTurn(role="user", text="嗯", ts_ms=0)], _spec(), llm)
     system_msg = llm.calls[0].messages[0].content
     assert "周三方便" in system_msg

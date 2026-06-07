@@ -181,7 +181,7 @@ async def test_gate_fails_open_to_main_on_referee_timeout() -> None:
     class _SlowRefereeLLM(KeywordDrivenMockLLM):
         async def chat(self, messages, *, json_mode=False, **kw):
             user = self._first_role(messages, "user")
-            if "JSON schema 输出" in user:  # referee call → stall past the gate
+            if "pass 或 hold" in user:  # referee call → stall past the gate
                 await asyncio.sleep(0.2)
             return await super().chat(messages, json_mode=json_mode, **kw)
 

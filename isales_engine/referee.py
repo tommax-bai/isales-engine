@@ -2,8 +2,10 @@
 
 Spec: ai-pipeline § "referee LLM 二级决策"; role-prompt § "referee prompt 内容规范".
 engine-multi-referee-and-restructure: N referees run in parallel, each with its
-own prompt-defined category enum. A referee returns ``{category, confidence}``;
-the engine never interprets the category string — the routing-rule decider does.
+own prompt-defined category enum. engine-tools-multidialogue-gating: a referee
+now returns a **bare category token** (e.g. ``pass`` / ``hold``) — no JSON, no
+confidence — so output is one token and the pre-reply gate stays fast; the engine
+never interprets the category string — the routing-rule decider does.
 
 The referee takes the user's last utterance + the last ≤3 rounds of dialog
 history. It runs on a cheap small model concurrently with main TTS playback and
@@ -17,7 +19,6 @@ boundary — there is no second fallback layer.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import Iterable
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 RECENT_ROUNDS = 3
 _EMPTY_HISTORY_PLACEHOLDER = "（首轮对话，无历史）"
 
-_USER_PRIMER = "请根据以上输入，按指定 JSON schema 输出 {category, confidence}。"
+_USER_PRIMER = "请只输出一个词：pass 或 hold，不要任何其他内容、标点或 JSON。"
 
 
 def _render_dialog_history_for_referee(dialog_history: Iterable[DialogTurn]) -> str:
@@ -94,7 +95,7 @@ async def run_referee(
     try:
         resp = await llm.chat(
             messages,
-            json_mode=True,
+            json_mode=False,
             temperature=referee_spec.temperature,
             top_p=referee_spec.top_p,
         )
@@ -113,39 +114,26 @@ async def run_referee(
 
 
 def _parse_referee_output(raw: str, *, label: str, duration_ms: int) -> RefereeResult:
-    """Validate the referee JSON ``{category, confidence}``; fail-open on any
-    structural problem. The confidence floor is **not** applied here — it is a
-    routing-policy concern owned by the decider (so it can distinguish a low-
-    confidence parse from an invalid one for the low-confidence restructure)."""
-    try:
-        obj = json.loads(raw)
-    except (ValueError, TypeError, json.JSONDecodeError):
-        logger.warning("referee %s output not JSON: %r; fail-open", label, raw)
+    """Parse the referee's **bare-token** category (e.g. ``pass`` / ``hold``).
+
+    engine-tools-multidialogue-gating: the referee emits a single category word —
+    no JSON, no confidence — so generation is one token and the pre-reply gate
+    fits its tight budget. We take the first whitespace-delimited token,
+    stripped of surrounding punctuation (case preserved — categories are
+    case-sensitive); ``confidence`` is fixed to
+    1.0 (the model no longer scores itself, so the decider's confidence floor is a
+    no-op). Empty output fails open."""
+    tokens = (raw or "").strip().split()
+    category = tokens[0].strip(".,。，!！?？\"'`：:") if tokens else ""
+    if not category:
+        logger.warning("referee %s empty output: %r; fail-open", label, raw)
         return RefereeResult.fail_open(
             label=label, reason=FAILOPEN_INVALID, duration_ms=duration_ms, raw_output=raw
         )
-
-    if not isinstance(obj, dict):
-        return RefereeResult.fail_open(
-            label=label, reason=FAILOPEN_INVALID, duration_ms=duration_ms, raw_output=raw
-        )
-
-    category = obj.get("category")
-    if not isinstance(category, str) or not category.strip():
-        logger.warning("referee %s category invalid: %r; fail-open", label, category)
-        return RefereeResult.fail_open(
-            label=label, reason=FAILOPEN_INVALID, duration_ms=duration_ms, raw_output=raw
-        )
-
-    confidence = obj.get("confidence")
-    if not isinstance(confidence, (int, float)):
-        confidence = 0.0
-    confidence = max(0.0, min(1.0, float(confidence)))
-
     return RefereeResult(
         label=label,
-        category=category.strip(),
-        confidence=confidence,
+        category=category,
+        confidence=1.0,
         duration_ms=duration_ms,
         raw_output=raw,
     )

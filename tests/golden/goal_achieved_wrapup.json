@@ -22,7 +22,7 @@
       "referee_results": [
         {
           "category": "goal_achieved",
-          "confidence": 0.95,
+          "confidence": 1.0,
           "duration_ms": "<volatile>",
           "label": "main_judge"
         }

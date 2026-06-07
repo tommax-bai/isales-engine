@@ -81,7 +81,7 @@ class _ScriptedLLM(LLMProvider):
     ):
         self.chat_calls += 1
         user = next((m.content for m in messages if m.role == "user"), "")
-        content = self._referee_json if "JSON schema 输出" in user else (
+        content = self._referee_json if "pass 或 hold" in user else (
             self._stream_text or "您好。"
         )
         return _resp(content)
@@ -107,7 +107,7 @@ async def _drain(stream) -> list[str]:
 async def test_main_streams_sentences_and_referee_runs_parallel():
     llm = _ScriptedLLM(
         stream_text="您好。请问现在方便吗？",
-        referee_json='{"category": "continue", "confidence": 0.9}',
+        referee_json="continue",
     )
     stream = run_pipeline_stream(_session(), "你好", _config(), llm, llm, is_wrap_up=False)
     assert len(stream.referee_tasks) == 1  # spawned immediately
@@ -125,7 +125,7 @@ async def test_multiple_referees_run_in_parallel():
     cfg = _config(referees=[_referee("intent"), _referee("reject")])
     llm = _ScriptedLLM(
         stream_text="好的。",
-        referee_json='{"category": "NEGATIVE", "confidence": 0.9}',
+        referee_json="NEGATIVE",
     )
     stream = run_pipeline_stream(_session(), "随便", cfg, llm, llm)
     assert len(stream.referee_tasks) == 2
@@ -144,10 +144,10 @@ async def test_single_referee_fail_open_isolated():
         async def chat(self, messages, *, json_mode=False, **k):
             self.chat_calls += 1
             system = next((m.content for m in messages if m.role == "system"), "")
-            # 'reject' referee prompt emits invalid JSON; others are fine.
+            # 'reject' referee emits empty output (fails open); others are fine.
             if "reject-prompt" in system:
-                return _resp("not json")
-            return _resp('{"category": "POSITIVE", "confidence": 0.9}')
+                return _resp("")
+            return _resp("POSITIVE")
 
     cfg = _config(
         referees=[
@@ -207,7 +207,7 @@ async def test_restructure_stream_skips_referee_and_uses_only_interrupt_text():
 async def test_chat_stream_failure_falls_back_to_chat():
     llm = _ScriptedLLM(
         stream_text="兜底回复内容。",
-        referee_json='{"category": "continue", "confidence": 0.9}',
+        referee_json="continue",
         stream_raises=True,
     )
     stream = run_pipeline_stream(_session(), "你好", _config(), llm, llm)
@@ -246,7 +246,7 @@ async def test_referee_sees_recent_dialog_history():
     sess.dialog_history.append(DialogTurn(role="user", text="嗯", ts_ms=1))
     llm = _ScriptedLLM(
         stream_text="好的。",
-        referee_json='{"category": "continue", "confidence": 0.9}',
+        referee_json="continue",
     )
     stream = run_pipeline_stream(sess, "周三方便", _config(), llm, llm)
     await _drain(stream)
