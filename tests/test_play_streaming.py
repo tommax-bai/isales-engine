@@ -40,11 +40,20 @@ class _FakeStream:
         self.result = SimpleNamespace(error=None, reply_text="")
         self.referee_tasks: list = []
         self.is_restructure = False
+        # engine-tools-multidialogue-gating: _play_streaming now also queries the
+        # eager-buffer interface; the non-eager fake reports no speculation.
+        self.is_eager = False
 
     async def sentences(self) -> AsyncIterator[str]:
         for s in self._sentences:
             self.result.reply_text += s
             yield s
+
+    def buffer_remainder(self) -> str:
+        return ""
+
+    async def cancel_eager(self) -> None:
+        return None
 
 
 class _RecordingTTS(TTSProvider):

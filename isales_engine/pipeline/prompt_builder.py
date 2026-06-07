@@ -21,6 +21,7 @@ from isales_common.providers._models import Message
 from isales_common.schemas.pipeline import (
     ExtractorSpec,
     MainSpec,
+    PersonaSpec,
     RefereeSpec,
     RestructureSpec,
 )
@@ -81,6 +82,20 @@ class PipelineConfig:
     # Snapshot helper: True once a WRAPPING_UP turn appended the closing
     # instruction (written to call_record.prompt_versions.wrap_up_appended).
     wrap_up_appended: bool = field(default=False)
+    # gating + multi-persona (engine-tools-multidialogue-gating). ``personas``:
+    # opt-in speculative dialogue slots run eagerly in parallel with main; the
+    # referee gate selects one and cancels the rest. ``tools``: raw alias →
+    # hangup/transfer config dicts (campaign.tools JSONB, stored raw like
+    # ``routing_rules`` — the tool route reads ``closing_phrase`` / ``interrupt``
+    # off the dict). ``persona_fanout_cap``: total speculative routes incl main,
+    # clamped to [1,3] by the engine (default 1 = main only, no speculation).
+    # ``referee_timeout_ms`` / ``referee_fail_open_route``: pre-reply gating
+    # timeout + the dialogue route released when the gate times out / fails open.
+    personas: list[PersonaSpec] = field(default_factory=list)
+    tools: dict[str, Any] = field(default_factory=dict)
+    persona_fanout_cap: int = 1
+    referee_timeout_ms: int = 600
+    referee_fail_open_route: str = "main"
 
 
 def build_main_messages(

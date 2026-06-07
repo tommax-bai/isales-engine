@@ -24,6 +24,7 @@ from isales_common.schemas.messages.dial import DialRequest
 from isales_common.schemas.pipeline import (
     ExtractorSpec,
     MainSpec,
+    PersonaSpec,
     RefereeSpec,
     RestructureSpec,
 )
@@ -161,6 +162,20 @@ async def load_runtime_config(
             label=rc.label or f"referee_{rc.id}",
         )
 
+    def _persona_spec(rc: RoleConfig) -> PersonaSpec:
+        model, prompt, pv_id = _spec_for(rc)
+        return PersonaSpec(
+            role_config_id=rc.id,
+            prompt_version_id=pv_id,
+            system_prompt=prompt,
+            model=model,
+            temperature=rc.temperature or 1.0,
+            top_p=rc.top_p or 1.0,
+            # label binds routing rules ({type: route, to: <label>}); api
+            # enforces non-empty for personas, namespace-isolated from referees.
+            label=rc.label or f"persona_{rc.id}",
+        )
+
     def _restructure_spec(rc: RoleConfig | None) -> RestructureSpec | None:
         if rc is None:
             return None
@@ -207,6 +222,16 @@ async def load_runtime_config(
         last_call_summary=(request.history[0].summary if request.history else None),
         follow_up_count=len(request.history),
         short_reply_active=False,
+        # gating + multi-persona (engine-tools-multidialogue-gating). Personas are
+        # the enabled kind=persona role_configs (eager speculative dialogue
+        # routes); tools/persona_fanout_cap/referee gating scalars come straight
+        # off the campaign (common 0.8 columns). persona_fanout_cap is clamped to
+        # [1,3] at fan-out time in run_loop, not here.
+        personas=[_persona_spec(rc) for rc in _all_enabled(RoleKind.PERSONA)],
+        tools={str(k): dict(v) for k, v in (campaign.tools or {}).items()},
+        persona_fanout_cap=campaign.persona_fanout_cap,
+        referee_timeout_ms=campaign.referee_timeout_ms,
+        referee_fail_open_route=campaign.referee_fail_open_route,
     )
 
     # Filler sets (sorted by sort_order in FillerManager).

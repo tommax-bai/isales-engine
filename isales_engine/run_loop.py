@@ -157,7 +157,7 @@ async def run_session(
             session.hangup_cause = HangupCause.NO_ANSWER.value
             session.append_event("hangup", reason="no_answer", initiated_by="ai")
             return
-        sm.transition_to(CallStatus.GREETING, reason="connected")
+        sm.transition_to(CallStatus.IN_CALL, reason="connected")
         _publish_status(publisher, session, "connected")
 
         # NOTE on greeting interruptibility: listen pumps start AFTER the
@@ -170,7 +170,7 @@ async def run_session(
         # theory without fresh evidence.)
 
         await _do_greeting(session, config, providers, telephony)
-        sm.transition_to(CallStatus.LISTENING, reason="greeting_done")
+        sm.transition_to(CallStatus.IN_CALL, reason="greeting_done")
         _publish_status(publisher, session, "greeting_done")
 
         listen_ctx = await _start_listen_pumps(session, config, telephony, providers)
@@ -543,7 +543,7 @@ async def _main_turn_loop(
                 return
 
             if outcome.kind == "silence_activation":
-                sm.transition_to(CallStatus.ACTIVATING, reason="silence_threshold")
+                sm.transition_to(CallStatus.IN_CALL, reason="silence_threshold")
                 session.append_event(
                     "silence_activation",
                     text=outcome.text or "",
@@ -555,7 +555,7 @@ async def _main_turn_loop(
                 )
                 session.silence_activation_count += 1
                 session.last_tts_end_at = time.monotonic()
-                sm.transition_to(CallStatus.LISTENING, reason="activation_done")
+                sm.transition_to(CallStatus.IN_CALL, reason="activation_done")
                 continue
 
             if outcome.kind != "user_final" or outcome.text is None:
@@ -611,14 +611,14 @@ async def _main_turn_loop(
                 )
                 return
 
-            is_wrap_up = session.state is CallStatus.WRAPPING_UP
+            is_wrap_up = session.in_wrap_up
 
             # Continuous-interruption protection (ai-pipeline spec delta).
             protection = _decide_protection(session, config)
             if protection == "listen_only":
                 # Skip PROCESSING this turn. Play a short cue + return to
                 # LISTENING; counter resets so we give the user a clean slate.
-                sm.transition_to(CallStatus.SPEAKING, reason="listen_only_cue")
+                sm.transition_to(CallStatus.IN_CALL, reason="listen_only_cue")
                 await _play_tts(
                     session, telephony, providers.tts,
                     "您请说。",
@@ -627,14 +627,14 @@ async def _main_turn_loop(
                 )
                 session.consecutive_interruption_count = 0
                 config.pipeline.short_reply_active = False
-                sm.transition_to(CallStatus.LISTENING, reason="listen_only_done")
+                sm.transition_to(CallStatus.IN_CALL, reason="listen_only_done")
                 continue
             elif protection == "short_reply":
                 config.pipeline.short_reply_active = True
             else:
                 config.pipeline.short_reply_active = False
 
-            sm.transition_to(CallStatus.PROCESSING, reason="speech_end")
+            sm.transition_to(CallStatus.IN_CALL, reason="speech_end")
             _publish_status(publisher, session, "speech_end")
             ts_start = now_utc()
             processing_start = time.monotonic()
@@ -692,7 +692,7 @@ async def _main_turn_loop(
                 pipeline_timeout_ms=pipeline_timeout_ms,
             )
 
-            sm.transition_to(CallStatus.SPEAKING, reason="main_stream_started")
+            sm.transition_to(CallStatus.IN_CALL, reason="main_stream_started")
             first_audio_ms, played = await _play_streaming(
                 session,
                 telephony,
@@ -757,7 +757,7 @@ async def _main_turn_loop(
                 session.consecutive_interruption_count += 1
                 session.interruption_signaled = False
                 sm.transition_to(
-                    CallStatus.INTERRUPTED, reason="speaking_interrupted"
+                    CallStatus.IN_CALL, reason="speaking_interrupted"
                 )
                 # Next loop iteration will await the user's interrupting final.
                 continue
@@ -883,8 +883,9 @@ async def _main_turn_loop(
                     # restructure-cap-reset below (legacy continue / degraded).
                 elif action.kind == "transition" and action.to == "goal_achieved":
                     sm.transition_to(
-                        CallStatus.WRAPPING_UP, reason=goal_type or "goal_achieved"
+                        CallStatus.IN_CALL, reason=goal_type or "goal_achieved"
                     )
+                    session.in_wrap_up = True  # 4-state collapse: wrap-up is an internal flag
                     session.wrap_up_started_at_monotonic = time.monotonic()
                     session.wrap_up_started_at_wallclock = now_utc()
                     session.append_event(
@@ -909,10 +910,10 @@ async def _main_turn_loop(
                     return
                 elif action.kind == "transition" and action.to == "customer_decline":
                     sm.transition_to(
-                        CallStatus.ACTIVATING, reason="customer_decline_recovery"
+                        CallStatus.IN_CALL, reason="customer_decline_recovery"
                     )
                     sm.transition_to(
-                        CallStatus.LISTENING, reason="customer_decline_done"
+                        CallStatus.IN_CALL, reason="customer_decline_done"
                     )
                     continue
                 elif action.kind == "restructure":
@@ -927,7 +928,7 @@ async def _main_turn_loop(
                             )
                         session.consecutive_restructure_count = 0
                         sm.transition_to(
-                            CallStatus.LISTENING, reason="restructure_capped"
+                            CallStatus.IN_CALL, reason="restructure_capped"
                         )
                         continue
                     if restructure_text is not None:
@@ -940,11 +941,11 @@ async def _main_turn_loop(
                             session.consecutive_interruption_count += 1
                             session.interruption_signaled = False
                             sm.transition_to(
-                                CallStatus.INTERRUPTED, reason="restructure_interrupted"
+                                CallStatus.IN_CALL, reason="restructure_interrupted"
                             )
                             continue
                         sm.transition_to(
-                            CallStatus.LISTENING, reason="restructure_done"
+                            CallStatus.IN_CALL, reason="restructure_done"
                         )
                         continue
                     # restructure degraded (no InterruptText available) → continue.
@@ -975,10 +976,10 @@ async def _main_turn_loop(
                     )
                     return
                 # Continue another wrap-up turn. SPEAKING → WRAPPING_UP transition.
-                sm.transition_to(CallStatus.WRAPPING_UP, reason="wrap_up_continue")
+                sm.transition_to(CallStatus.IN_CALL, reason="wrap_up_continue")
                 continue
 
-            sm.transition_to(CallStatus.LISTENING, reason="tts_done")
+            sm.transition_to(CallStatus.IN_CALL, reason="tts_done")
     finally:
         # Pump lifecycle now belongs to run_session — these locals just keep
         # type checkers happy that they were "used" in this scope.
@@ -1286,6 +1287,14 @@ async def _play_streaming(
                 if capture:
                     captured.append(pending_job.text)
                 await pending_job.aclose()
+        # Eager fan-out (engine-tools-multidialogue-gating): the speculative
+        # buffer can lead the bounded job queue, so the not-yet-replayed tail is
+        # also unspoken — fold it into the barge-in remainder. Then cancel the
+        # eager task so its chat_stream / TTS connections are released. Both
+        # no-op for the legacy non-eager path (flag-OFF stays byte-identical).
+        if capture and stream.is_eager:
+            captured.append(stream.buffer_remainder())
+        await stream.cancel_eager()
         if filler is not None:
             await filler.stop()
         if capture:

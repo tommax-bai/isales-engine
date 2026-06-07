@@ -33,68 +33,22 @@ CallState = CallStatus
 
 
 # Each entry maps a state to the set of states it can legally transition to.
-# Sourced directly from call-state-machine spec § Requirement: 关键状态转换 +
-# § Requirement: TRANSFERRING 状态的边界 + § Requirement: WRAPPING_UP 期间走简化管线.
+# engine-tools-multidialogue-gating collapsed the 11-value FSM-as-controller set
+# to 4 coarse lifecycle labels: the whole conversation is ``IN_CALL``; the fine
+# phases (greeting / listening / processing / speaking / interrupted / filler /
+# wrapping_up / activating) are now engine-internal flags (e.g.
+# ``session.in_wrap_up``) + transcript events, NOT call states. Only a
+# human-handoff (``TRANSFERRING``) and the bookends (``INIT`` / ``END``) are
+# distinct. ``transition_to`` is idempotent (same-state → no-op) so the many
+# legacy intra-call transitions that now all map to ``IN_CALL`` collapse to a
+# single ``INIT → IN_CALL`` with no history/event churn.
 LEGAL_TRANSITIONS: dict[CallState, set[CallState]] = {
     CallState.INIT: {
-        CallState.GREETING,
+        CallState.IN_CALL,
         CallState.END,  # dial fail / no_answer / etc.
     },
-    CallState.GREETING: {
-        CallState.LISTENING,
-        CallState.END,  # remote_hangup mid-greeting
-    },
-    CallState.LISTENING: {
-        CallState.PROCESSING,
-        CallState.ACTIVATING,
+    CallState.IN_CALL: {
         CallState.TRANSFERRING,
-        CallState.WRAPPING_UP,  # rare: explicit goal_achieved before any user speech
-        # SPEAKING reachable from LISTENING for listen_only continuous-
-        # interruption protection (AI plays a cue without going through
-        # PROCESSING).
-        CallState.SPEAKING,
-        CallState.END,
-    },
-    CallState.SPEAKING: {
-        CallState.LISTENING,  # TTS finished cleanly
-        CallState.INTERRUPTED,
-        CallState.WRAPPING_UP,  # post goal_achieved reply finished playing
-        CallState.TRANSFERRING,
-        CallState.END,
-    },
-    CallState.INTERRUPTED: {
-        CallState.PROCESSING,
-        # SPEAKING reachable from INTERRUPTED for the "listen_only" continuous-
-        # interruption protection: AI plays a short prompt before yielding.
-        CallState.SPEAKING,
-        CallState.END,
-    },
-    CallState.FILLER: {
-        # FILLER runs concurrently with PROCESSING and naturally returns to
-        # SPEAKING when the pipeline finishes, or to PROCESSING when the user
-        # interrupts the filler audio.
-        CallState.SPEAKING,
-        CallState.PROCESSING,
-        CallState.END,
-    },
-    CallState.PROCESSING: {
-        CallState.SPEAKING,
-        CallState.LISTENING,  # default reply skipping speak phase is legal too
-        CallState.TRANSFERRING,
-        CallState.WRAPPING_UP,
-        CallState.END,
-    },
-    CallState.WRAPPING_UP: {
-        # Wrap-up runs its own simplified pipeline: PROCESSING / SPEAKING are
-        # entered in the wrap-up loop; counter exhaustion ends the call.
-        CallState.PROCESSING,
-        CallState.SPEAKING,
-        CallState.LISTENING,
-        CallState.TRANSFERRING,
-        CallState.END,
-    },
-    CallState.ACTIVATING: {
-        CallState.LISTENING,
         CallState.END,
     },
     CallState.TRANSFERRING: {
@@ -147,6 +101,12 @@ class StateMachine:
         """
 
         current = self._session.state
+        if new_state == current:
+            # Idempotent: the 4-state collapse maps the many legacy intra-call
+            # transitions (listening/processing/speaking/...) all to IN_CALL, so
+            # most calls are now same-state no-ops. Skip them so state_history /
+            # previous_state / StatusChanged don't churn on a non-event.
+            return
         if new_state not in LEGAL_TRANSITIONS.get(current, set()):
             logger.warning(
                 "state_transition_unusual current=%s new=%s reason=%s",

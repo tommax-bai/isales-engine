@@ -111,6 +111,13 @@ class CallSession:
     # Wrap-up counters.
     wrap_up_round_count: int = 0
     wrap_up_started_at_monotonic: float | None = None
+    # engine-tools-multidialogue-gating: the call-status collapse (11→4) dropped
+    # WRAPPING_UP as a CallStatus, so the "are we in the wrap-up simplified
+    # pipeline" decision moves to this internal flag. Set when a goal_achieved /
+    # closing route fires; read where the code used to check
+    # ``state is CallStatus.WRAPPING_UP``. The observable CallStatus stays
+    # IN_CALL throughout wrap-up.
+    in_wrap_up: bool = False
 
     # Pipeline turn id (incremented per PROCESSING entry).
     current_turn_id: int = 0

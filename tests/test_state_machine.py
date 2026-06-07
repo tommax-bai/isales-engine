@@ -25,48 +25,66 @@ def make_session(call_record_id: int = 1) -> CallSession:
 # ---- StateMachine ----------------------------------------------------------
 
 
-def test_init_to_greeting_legal() -> None:
+def test_init_to_in_call_legal() -> None:
     s = make_session()
     sm = StateMachine(s)
-    sm.transition_to(CallStatus.GREETING, reason="connected")
-    assert s.state == CallStatus.GREETING
+    sm.transition_to(CallStatus.IN_CALL, reason="connected")
+    assert s.state == CallStatus.IN_CALL
     assert s.previous_state == CallStatus.INIT
 
 
 def test_full_normal_path() -> None:
+    """4-state collapse: the many legacy intra-call transitions all map to
+    IN_CALL and are idempotent no-ops, so the observable path is INIT → IN_CALL →
+    END (one entry per real change in state_history)."""
     s = make_session()
     sm = StateMachine(s)
     for state, reason in [
-        (CallStatus.GREETING, "connected"),
-        (CallStatus.LISTENING, "greeting_done"),
-        (CallStatus.PROCESSING, "speech_end"),
-        (CallStatus.SPEAKING, "pipeline_done"),
-        (CallStatus.LISTENING, "tts_done"),
-        (CallStatus.PROCESSING, "speech_end"),
-        (CallStatus.SPEAKING, "pipeline_done"),
-        (CallStatus.WRAPPING_UP, "goal_achieved"),
+        (CallStatus.IN_CALL, "connected"),
+        (CallStatus.IN_CALL, "greeting_done"),  # no-op
+        (CallStatus.IN_CALL, "speech_end"),  # no-op
+        (CallStatus.IN_CALL, "pipeline_done"),  # no-op
+        (CallStatus.IN_CALL, "goal_achieved"),  # no-op (wrap-up is an internal flag)
         (CallStatus.END, "wrap_up_completed"),
     ]:
         sm.transition_to(state, reason=reason)
     assert s.state == CallStatus.END
+    # Only the two real transitions were recorded; no-ops left no history churn.
+    assert s.state_history == [
+        (CallStatus.INIT, CallStatus.IN_CALL, "connected"),
+        (CallStatus.IN_CALL, CallStatus.END, "wrap_up_completed"),
+    ]
+
+
+def test_idempotent_same_state_is_noop() -> None:
+    """Same-state transitions (the common case post-collapse) are no-ops: no
+    history, no previous_state churn, no warning."""
+    s = make_session()
+    sm = StateMachine(s)
+    sm.transition_to(CallStatus.IN_CALL, reason="connected")
+    history_len = len(s.state_history)
+    sm.transition_to(CallStatus.IN_CALL, reason="still_in_call")
+    assert len(s.state_history) == history_len  # unchanged
+    assert s.previous_state == CallStatus.INIT  # unchanged
+    assert not any(e["type"] == "state_warning" for e in s.full_transcript)
 
 
 def test_unusual_transition_writes_warning_and_continues(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Spec call-state-machine § 非法 transition 改 advisory 警告 / Scenario 非常规 transition 不抛异常."""
+    """Spec call-state-machine § 非法 transition 改 advisory 警告（不抛异常）."""
 
     s = make_session()
     sm = StateMachine(s)
 
     with caplog.at_level(logging.WARNING, logger="isales_engine.state_machine"):
-        # INIT -> SPEAKING is not in LEGAL_TRANSITIONS — should NOT raise.
-        sm.transition_to(CallStatus.SPEAKING, reason="bug")
+        # INIT -> TRANSFERRING is not in LEGAL_TRANSITIONS — should NOT raise.
+        sm.transition_to(CallStatus.TRANSFERRING, reason="bug")
 
     # State actually advanced.
-    assert s.state == CallStatus.SPEAKING
+    assert s.state == CallStatus.TRANSFERRING
     assert s.previous_state == CallStatus.INIT
-    assert s.state_history[-1] == (CallStatus.INIT, CallStatus.SPEAKING, "bug")
+    assert s.state_history[-1] == (CallStatus.INIT, CallStatus.TRANSFERRING, "bug")
 
     # Transcript got a state_warning event (NOT state_error).
     assert any(e["type"] == "state_warning" for e in s.full_transcript)
@@ -85,12 +103,12 @@ def test_state_warning_event_payload() -> None:
 
     s = make_session()
     sm = StateMachine(s)
-    sm.transition_to(CallStatus.SPEAKING, reason="bug")
+    sm.transition_to(CallStatus.TRANSFERRING, reason="bug")
 
     warn = next(e for e in s.full_transcript if e["type"] == "state_warning")
     assert warn["attempted"] == "bug"
     assert warn["from_state"] == "init"
-    assert warn["to_state"] == "speaking"
+    assert warn["to_state"] == "transferring"
 
 
 def test_force_true_backward_compat() -> None:
@@ -107,15 +125,15 @@ def test_force_true_backward_compat() -> None:
     sm.transition_to(CallStatus.END, reason="dial_fail")
     assert s.state == CallStatus.END
 
-    # END -> GREETING is unusual (END has no outgoing transitions). With
+    # END -> IN_CALL is unusual (END has no outgoing transitions). With
     # force=True, transition still completes via the advisory path — same as
     # if force had been omitted.
-    sm.transition_to(CallStatus.GREETING, reason="forced", force=True)
-    assert s.state == CallStatus.GREETING
+    sm.transition_to(CallStatus.IN_CALL, reason="forced", force=True)
+    assert s.state == CallStatus.IN_CALL
 
     # The advisory event was still written even with force=True.
     assert any(
-        e["type"] == "state_warning" and e["from_state"] == "end" and e["to_state"] == "greeting"
+        e["type"] == "state_warning" and e["from_state"] == "end" and e["to_state"] == "in_call"
         for e in s.full_transcript
     )
 
@@ -127,20 +145,19 @@ def test_unusual_transition_from_terminal_end_does_not_raise() -> None:
     sm = StateMachine(s)
     sm.transition_to(CallStatus.END, reason="dial_fail")
     # END has no outgoing transitions — pre-soften this raised. Now advisory.
-    sm.transition_to(CallStatus.LISTENING, reason="bug")
-    assert s.state == CallStatus.LISTENING
+    sm.transition_to(CallStatus.IN_CALL, reason="bug")
+    assert s.state == CallStatus.IN_CALL
 
 
 def test_unusual_transition_from_transferring_does_not_raise() -> None:
-    """TRANSFERRING -> PROCESSING is not in LEGAL_TRANSITIONS but no longer raises."""
+    """TRANSFERRING -> IN_CALL is not in LEGAL_TRANSITIONS but no longer raises."""
 
     s = make_session()
     sm = StateMachine(s)
-    sm.transition_to(CallStatus.GREETING, reason="connected")
-    sm.transition_to(CallStatus.LISTENING, reason="greeting_done")
+    sm.transition_to(CallStatus.IN_CALL, reason="connected")
     sm.transition_to(CallStatus.TRANSFERRING, reason="keyword_hit")
-    sm.transition_to(CallStatus.PROCESSING, reason="bug")
-    assert s.state == CallStatus.PROCESSING
+    sm.transition_to(CallStatus.IN_CALL, reason="bug")
+    assert s.state == CallStatus.IN_CALL
     sm.transition_to(CallStatus.END, reason="marked_for_handoff")
     assert s.state == CallStatus.END
 
@@ -151,18 +168,18 @@ def test_illegal_transition_class_still_importable() -> None:
     # Class definition retained.
     assert issubclass(IllegalTransition, RuntimeError)
     # Can still be constructed (in case any caller code still does so).
-    exc = IllegalTransition(CallStatus.INIT, CallStatus.SPEAKING, reason="bug")
-    assert "init -> speaking" in str(exc)
+    exc = IllegalTransition(CallStatus.INIT, CallStatus.TRANSFERRING, reason="bug")
+    assert "init -> transferring" in str(exc)
     assert exc.reason == "bug"
 
 
 def test_meta_dict_emits_state_changed_event() -> None:
     s = make_session()
     sm = StateMachine(s)
-    sm.transition_to(CallStatus.GREETING, reason="connected", meta={"source": "modem"})
+    sm.transition_to(CallStatus.IN_CALL, reason="connected", meta={"source": "modem"})
     sc = next(e for e in s.full_transcript if e["type"] == "state_changed")
     assert sc["from_state"] == "init"
-    assert sc["to_state"] == "greeting"
+    assert sc["to_state"] == "in_call"
     assert sc["source"] == "modem"
 
 

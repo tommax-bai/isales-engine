@@ -58,7 +58,8 @@ class GoalAchievedRoute:
     metadata: dict[str, Any] = field(default_factory=lambda: {"kind": "effect"})
 
     async def execute(self, ctx: EffectContext) -> Directive:
-        ctx.sm.transition_to(CallStatus.WRAPPING_UP, reason=ctx.goal_type or "goal_achieved")
+        ctx.sm.transition_to(CallStatus.IN_CALL, reason=ctx.goal_type or "goal_achieved")
+        ctx.session.in_wrap_up = True  # 4-state collapse: wrap-up is an internal flag
         ctx.session.wrap_up_started_at_monotonic = time.monotonic()
         ctx.session.wrap_up_started_at_wallclock = ctx.now_utc()
         ctx.session.append_event(
@@ -99,8 +100,8 @@ class CustomerDeclineRoute:
     metadata: dict[str, Any] = field(default_factory=lambda: {"kind": "effect"})
 
     async def execute(self, ctx: EffectContext) -> Directive:
-        ctx.sm.transition_to(CallStatus.ACTIVATING, reason="customer_decline_recovery")
-        ctx.sm.transition_to(CallStatus.LISTENING, reason="customer_decline_done")
+        ctx.sm.transition_to(CallStatus.IN_CALL, reason="customer_decline_recovery")
+        ctx.sm.transition_to(CallStatus.IN_CALL, reason="customer_decline_done")
         return Directive.CONTINUE
 
 
@@ -125,7 +126,7 @@ class RestructureRoute:
                     voice_id=ctx.config.voice_id,
                 )
             ctx.session.consecutive_restructure_count = 0
-            ctx.sm.transition_to(CallStatus.LISTENING, reason="restructure_capped")
+            ctx.sm.transition_to(CallStatus.IN_CALL, reason="restructure_capped")
             return Directive.CONTINUE
         if ctx.restructure_text is not None:
             played_rs = await ctx.run_restructure(
@@ -140,9 +141,9 @@ class RestructureRoute:
             if not played_rs:
                 ctx.session.consecutive_interruption_count += 1
                 ctx.session.interruption_signaled = False
-                ctx.sm.transition_to(CallStatus.INTERRUPTED, reason="restructure_interrupted")
+                ctx.sm.transition_to(CallStatus.IN_CALL, reason="restructure_interrupted")
                 return Directive.CONTINUE
-            ctx.sm.transition_to(CallStatus.LISTENING, reason="restructure_done")
+            ctx.sm.transition_to(CallStatus.IN_CALL, reason="restructure_done")
             return Directive.CONTINUE
         # restructure degraded (no InterruptText available) → continue (fall through
         # to the shared restructure-cap-reset + LISTENING tail).

@@ -39,6 +39,7 @@ class _FakeSession:
         self.consecutive_restructure_count = 0
         self.consecutive_interruption_count = 0
         self.interruption_signaled = True
+        self.in_wrap_up = False
         self.wrap_up_started_at_monotonic: Any = None
         self.wrap_up_started_at_wallclock: Any = None
 
@@ -118,7 +119,10 @@ async def test_goal_achieved_route() -> None:
         goal_type="appointment",
     )
     assert await GoalAchievedRoute().execute(ctx) is Directive.CONTINUE
-    assert sm.transitions == [(CallStatus.WRAPPING_UP, "appointment")]
+    # 4-state collapse: WRAPPING_UP folded into IN_CALL; wrap-up is now the
+    # in_wrap_up internal flag (set by the route), not a distinct call state.
+    assert sm.transitions == [(CallStatus.IN_CALL, "appointment")]
+    assert session.in_wrap_up is True
     assert [e[0] for e in session.events] == ["wrap_up_started", "goal_achieved"]
     assert session.wrap_up_started_at_wallclock == "WALL"
 
@@ -129,7 +133,7 @@ async def test_goal_achieved_route_empty_goal_type_uses_default_reason() -> None
         session, sm, action=DeciderAction(kind="transition", to="goal_achieved"), goal_type=""
     )
     await GoalAchievedRoute().execute(ctx)
-    assert sm.transitions == [(CallStatus.WRAPPING_UP, "goal_achieved")]
+    assert sm.transitions == [(CallStatus.IN_CALL, "goal_achieved")]
 
 
 async def test_transfer_route() -> None:
@@ -149,8 +153,8 @@ async def test_customer_decline_route() -> None:
     ctx, _ = _ctx(session, sm, action=DeciderAction(kind="transition", to="customer_decline"))
     assert await CustomerDeclineRoute().execute(ctx) is Directive.CONTINUE
     assert sm.transitions == [
-        (CallStatus.ACTIVATING, "customer_decline_recovery"),
-        (CallStatus.LISTENING, "customer_decline_done"),
+        (CallStatus.IN_CALL, "customer_decline_recovery"),
+        (CallStatus.IN_CALL, "customer_decline_done"),
     ]
 
 
@@ -164,7 +168,7 @@ async def test_restructure_capped_with_default_reply() -> None:
     assert await RestructureRoute().execute(ctx) is Directive.CONTINUE
     assert calls.get("tts")  # default reply played
     assert session.consecutive_restructure_count == 0
-    assert sm.transitions == [(CallStatus.LISTENING, "restructure_capped")]
+    assert sm.transitions == [(CallStatus.IN_CALL, "restructure_capped")]
 
 
 async def test_restructure_capped_no_default_reply() -> None:
@@ -174,7 +178,7 @@ async def test_restructure_capped_no_default_reply() -> None:
     )
     assert await RestructureRoute().execute(ctx) is Directive.CONTINUE
     assert "tts" not in calls
-    assert sm.transitions == [(CallStatus.LISTENING, "restructure_capped")]
+    assert sm.transitions == [(CallStatus.IN_CALL, "restructure_capped")]
 
 
 async def test_restructure_text_played() -> None:
@@ -185,7 +189,7 @@ async def test_restructure_text_played() -> None:
     calls["restructure_played"] = True
     assert await RestructureRoute().execute(ctx) is Directive.CONTINUE
     assert session.consecutive_restructure_count == 1
-    assert sm.transitions == [(CallStatus.LISTENING, "restructure_done")]
+    assert sm.transitions == [(CallStatus.IN_CALL, "restructure_done")]
 
 
 async def test_restructure_text_interrupted() -> None:
@@ -198,7 +202,7 @@ async def test_restructure_text_interrupted() -> None:
     assert session.consecutive_restructure_count == 1
     assert session.consecutive_interruption_count == 1
     assert session.interruption_signaled is False
-    assert sm.transitions == [(CallStatus.INTERRUPTED, "restructure_interrupted")]
+    assert sm.transitions == [(CallStatus.IN_CALL, "restructure_interrupted")]
 
 
 async def test_restructure_degraded_falls_through() -> None:

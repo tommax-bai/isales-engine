@@ -26,6 +26,7 @@ produced offline by the worker. The main LLM itself emits **plain text only**.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 import time
@@ -99,6 +100,21 @@ class PipelineStream:
         self.referee_labels: list[str] = []
         self.result = MainStreamResult()
         self.turn_id = 0
+        # ---- eager speculative buffering (engine-tools-multidialogue-gating) ----
+        # When ``start_eager()`` is called the reply is generated NOW into a
+        # replay buffer, concurrent with the pre-reply referee gate, so the gate
+        # adds ~0ms p50 (overlap). On a multi-route fan-out every candidate
+        # buffers in parallel; the gate selects one and ``cancel_eager()`` cancels
+        # the losers (the vendor bills the cancelled tokens — opt-in, cap ≤3).
+        # The SELECTED route's ``sentences()`` REPLAYS this buffer and is handed
+        # to ``_play_streaming`` un-iterated (AGEN_CREATED) — the eager generation
+        # runs on the hidden ``_generate_core()`` task, NEVER on the handed-off
+        # generator (the blueprint's #1 "eager-generator" footgun guard).
+        self._buffer: list[str] = []
+        self._buffer_cond: asyncio.Condition | None = None
+        self._eager_task: asyncio.Task[None] | None = None
+        self._eager_done: bool = False
+        self._replayed_count: int = 0
 
     @property
     def is_restructure(self) -> bool:
@@ -148,8 +164,17 @@ class PipelineStream:
             self._session, self._config, is_wrap_up=self._is_wrap_up
         )
 
-    async def sentences(self) -> AsyncGenerator[str, None]:
-        """Yield TTS-ready sentences from the streaming reply (main/restructure)."""
+    async def _generate_core(self) -> AsyncGenerator[str, None]:
+        """Pure token→sentence generation: NO default-reply, NO transcript events.
+
+        Builds ``result.reply_text`` / tokens / timing and runs the single,
+        removal-tracked ``chat_stream → chat()`` fallback. Shared by both the
+        direct ``sentences()`` path (legacy / flag-OFF, byte-identical) and the
+        eager buffer (``start_eager``). It is side-effect-free w.r.t. the session
+        so a *speculative loser* route can run it and be cancelled without ever
+        emitting a ``default_reply_used`` event — that winner-only side effect
+        lives in ``sentences()`` below.
+        """
         messages = self._build_messages()
         temperature, top_p = self._stream_params()
         start = time.monotonic()
@@ -197,6 +222,25 @@ class PipelineStream:
             self.result.tokens_in = self._main_llm.last_call_tokens_in or 0
             self.result.tokens_out = self._main_llm.last_call_tokens_out or 0
 
+    async def sentences(self) -> AsyncGenerator[str, None]:
+        """Yield TTS-ready sentences for the SELECTED route, handed to playback.
+
+        In eager mode (``start_eager`` was called) this REPLAYS the buffer the
+        background ``_generate_core`` task is filling; otherwise it drives
+        ``_generate_core`` directly (legacy / flag-OFF, byte-identical). Either
+        way the generator object returned here is fresh/un-iterated
+        (AGEN_CREATED) at hand-off — the eager generation never touches THIS
+        generator (blueprint risk #1: a "fix" that drains it silences the turn).
+        The default-reply guard + ``default_reply_used`` event fire here, so only
+        the winner (which alone calls ``sentences()``) ever emits them.
+        """
+        if self._eager_task is not None:
+            async for sentence in self._replay():
+                yield sentence
+        else:
+            async for sentence in self._generate_core():
+                yield sentence
+
         if not self.result.reply_text.strip():
             # Stream + fallback both silent → default reply, never go silent.
             default = (
@@ -212,6 +256,74 @@ class PipelineStream:
                 "default_reply_used", text=default, reason=self.result.error
             )
             yield default
+
+    @property
+    def is_eager(self) -> bool:
+        """True once ``start_eager()`` kicked off speculative buffering."""
+        return self._eager_task is not None
+
+    def start_eager(self) -> None:
+        """Begin generating the reply NOW into a replay buffer (overlaps the gate).
+
+        Idempotent-guarded by the caller (run_loop spawns one per candidate
+        route). Must run inside the event loop (creates the buffer condition +
+        task). Restructure / wrap-up streams have no referees but MAY still be
+        eager-buffered; the gate simply selects them directly.
+        """
+        if self._eager_task is not None:
+            return
+        self._buffer_cond = asyncio.Condition()
+
+        async def _drain_eager() -> None:
+            assert self._buffer_cond is not None
+            try:
+                async for sentence in self._generate_core():
+                    async with self._buffer_cond:
+                        self._buffer.append(sentence)
+                        self._buffer_cond.notify_all()
+            finally:
+                async with self._buffer_cond:
+                    self._eager_done = True
+                    self._buffer_cond.notify_all()
+
+        self._eager_task = asyncio.create_task(
+            _drain_eager(), name=f"eager-turn-{self.turn_id}"
+        )
+
+    async def _replay(self) -> AsyncGenerator[str, None]:
+        """Replay the eager buffer + live tail. Created fresh per hand-off
+        (AGEN_CREATED) so the playback owner drives it byte-identically to the
+        direct path; the underlying generation runs on the ``_drain_eager`` task.
+        """
+        assert self._buffer_cond is not None
+        while True:
+            async with self._buffer_cond:
+                while (
+                    self._replayed_count >= len(self._buffer)
+                    and not self._eager_done
+                ):
+                    await self._buffer_cond.wait()
+                if self._replayed_count >= len(self._buffer):
+                    return  # eager done, nothing more buffered
+                sentence = self._buffer[self._replayed_count]
+                self._replayed_count += 1
+            yield sentence
+
+    def buffer_remainder(self) -> str:
+        """Eager sentences generated but not yet replayed to playback — used by
+        ``_play_streaming`` to extend the barge-in ``interrupt_remaining`` capture
+        beyond the bounded job queue (the eager buffer can lead it). Empty for the
+        non-eager path."""
+        return "".join(self._buffer[self._replayed_count :])
+
+    async def cancel_eager(self) -> None:
+        """Cancel the speculative generation (loser route, or winner teardown on
+        barge-in) so its ``chat_stream`` + vendor TTS connections are released.
+        No-op for the non-eager path."""
+        if self._eager_task is not None and not self._eager_task.done():
+            self._eager_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._eager_task
 
     async def _chat_fallback(self, messages: list[Message]) -> AsyncIterator[str]:
         """One-shot non-streaming fallback (removal-tracked)."""

@@ -79,17 +79,14 @@ def test_transcript_event_vocabulary_frozen() -> None:
 
 
 def test_call_status_enum_frozen() -> None:
-    """CallStatus stays an 11-value closed enum even after flatten (projection)."""
+    """CallStatus is the collapsed 4-value coarse lifecycle (engine-tools-
+    multidialogue-gating). The fine in-call phases (greeting/listening/speaking/
+    interrupted/filler/processing/wrapping_up/activating) are no longer call
+    states — they are engine-internal flags + transcript events. ``in_call``
+    spans the whole conversation; only handoff + the bookends are distinct."""
     assert {s.value for s in CallStatus} == {
         "init",
-        "greeting",
-        "listening",
-        "speaking",
-        "interrupted",
-        "filler",
-        "processing",
-        "wrapping_up",
-        "activating",
+        "in_call",
         "transferring",
         "end",
     }
@@ -117,4 +114,8 @@ def test_hangup_cause_enum_frozen() -> None:
         "marked_for_handoff",
         "no_progress_timeout",
         "manual_hangup",
+        # change-3: referee gating may terminate the call (pre-reply hangup tool
+        # route). Added in lockstep with isales-common 0.8.0 + the worker pin
+        # (>=0.8) so the enum-validated CallEnded boundary accepts it (no DLQ).
+        "referee_hangup",
     }
