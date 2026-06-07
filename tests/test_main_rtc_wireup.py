@@ -84,10 +84,14 @@ def test_build_telephony_rtc_requires_dispatcher_and_server() -> None:
         _build_telephony(s)
 
 
-def test_build_telephony_rtc_requires_edge_device_id() -> None:
+def test_build_telephony_rtc_dynamic_routing_with_empty_edge_device_id() -> None:
+    """Empty engine_edge_device_id is valid — enables dynamic routing mode
+    where the RtcTelephonyClient resolves the target edge per-call from the
+    gRPC server's device→edge mapping (populated by heartbeats)."""
     s = _settings(engine_edge_device_id="")
-    with pytest.raises(RuntimeError, match="EDGE_DEVICE_ID"):
-        _build_telephony(s, dispatcher=MagicMock(), grpc_server=MagicMock())
+    client = _build_telephony(s, dispatcher=MagicMock(), grpc_server=MagicMock())
+    assert isinstance(client, RtcTelephonyClient)
+    assert client._legacy_edge_device_id == ""
 
 
 def test_build_telephony_rtc_rejects_unknown_sdk_kind() -> None:
@@ -105,7 +109,7 @@ def test_build_telephony_rtc_returns_rtc_client_in_memory() -> None:
 
     assert isinstance(client, RtcTelephonyClient)
     # The client's edge_device_id binding matches settings.
-    assert client._edge_device_id == "edge-test"
+    assert client._legacy_edge_device_id == "edge-test"
     # Dispatcher and grpc_server are wired through.
     assert client._dispatcher is dispatcher
     assert client._grpc is grpc_server

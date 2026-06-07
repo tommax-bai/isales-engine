@@ -69,14 +69,24 @@ async def test_apply_heartbeat_writes_last_seen_at(sessionmaker_) -> None:  # ty
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_apply_heartbeat_does_not_change_status(sessionmaker_) -> None:  # type: ignore[no-untyped-def]
-    """Even if the heartbeat carries status=offline, the cloud doesn't
-    flip status from the heartbeat (spec Scenario "进程恢复"). The udev /
-    pyserial path owns status transitions; heartbeat owns liveness only.
+async def test_apply_heartbeat_syncs_status(sessionmaker_) -> None:  # type: ignore[no-untyped-def]
+    """Heartbeat carrying a valid device_status updates PG device.status.
+
+    This is the primary mechanism for recovering from edge crashes: the
+    daemon restarts, sends heartbeat with IDLE, and the scheduler can
+    pick the device again.
     """
     device_id = await _seed_device(sessionmaker_)
-    hb = _heartbeat(devices=[(device_id, DeviceStatus.OFFLINE)])
 
+    # Manually set device to DIALING (simulating a crash mid-call)
+    async with sessionmaker_() as session:
+        dev = await session.get(Device, device_id)
+        assert dev is not None
+        dev.status = DeviceStatus.DIALING
+        await session.commit()
+
+    # Edge sends heartbeat with IDLE
+    hb = _heartbeat(devices=[(device_id, DeviceStatus.IDLE)])
     async with sessionmaker_() as session:
         await apply_heartbeat(session, _identity(), hb)
         await session.commit()

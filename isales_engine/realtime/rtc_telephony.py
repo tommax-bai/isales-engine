@@ -119,6 +119,7 @@ class _CallState:
         rtc_session: RtcSession,
         edge_uid: str,
         device_id: int,
+        edge_device_id: str,
         outbound_frame_ms: int,
     ) -> None:
         self.call_id = call_id
@@ -126,6 +127,7 @@ class _CallState:
         self.rtc_session = rtc_session
         self.edge_uid = edge_uid
         self.device_id = device_id
+        self.edge_device_id = edge_device_id
         self.events_q: asyncio.Queue[TelephonyEvent | object] = asyncio.Queue()
         self.inbound_q: asyncio.Queue[bytes | object] = asyncio.Queue()
         # Forked stream of the SAME inbound PCM frames, so a VAD monitor can
@@ -457,7 +459,7 @@ class RtcTelephonyClient(TelephonyClient):
         rtc_session_factory: Callable[[], RtcSession],
         outbound_frame_ms: int = 20,
     ) -> None:
-        self._edge_device_id = edge_device_id
+        self._legacy_edge_device_id = edge_device_id
         self._grpc = grpc_server
         self._dispatcher = dispatcher
         self._issuer = token_issuer
@@ -492,8 +494,20 @@ class RtcTelephonyClient(TelephonyClient):
             rtc_session=rtc_session,
             edge_uid=edge_creds.user_id,
             device_id=self._pending_devices.pop(call_id, 0),
+            edge_device_id="",  # resolved below
             outbound_frame_ms=self._outbound_frame_ms,
         )
+
+        # Resolve the target edge: if a legacy edge_device_id was configured,
+        # always route to that single edge; otherwise use the dynamic
+        # device→edge mapping maintained by the gRPC server from heartbeats.
+        target_edge: str
+        if self._legacy_edge_device_id:
+            target_edge = self._legacy_edge_device_id
+        else:
+            target_edge = self._grpc.resolve_edge_for_device(state.device_id)
+        state.edge_device_id = target_edge
+
         self._calls[call_id] = state
         state.start_inbound_pump()
 
@@ -502,7 +516,7 @@ class RtcTelephonyClient(TelephonyClient):
         # a session to deliver it to.
         self._dispatcher.register(
             sid,
-            edge_device_id=self._edge_device_id,
+            edge_device_id=target_edge,
             on_call_event=state.on_call_event,
             on_dial_ack=state.on_dial_ack,
         )
@@ -519,7 +533,7 @@ class RtcTelephonyClient(TelephonyClient):
         )
         try:
             await self._grpc.send_to_edge(
-                self._edge_device_id,
+                target_edge,
                 pb.Cloud2Edge(dial=dial_cmd),
             )
         except EdgeNotConnected:
@@ -544,7 +558,7 @@ class RtcTelephonyClient(TelephonyClient):
         # gone (call ended remotely a tick ago), which is fine.
         with contextlib.suppress(EdgeNotConnected):
             await self._grpc.send_to_edge(
-                self._edge_device_id,
+                state.edge_device_id,
                 pb.Cloud2Edge(
                     cancel=pb.CancelCommand(call_id=state.sid, reason="local hangup"),
                 ),

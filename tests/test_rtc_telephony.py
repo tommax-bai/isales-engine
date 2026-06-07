@@ -455,3 +455,59 @@ async def test_events_unknown_call_id_raises() -> None:
     async with _wired() as (client, _edge, _):
         with pytest.raises(RuntimeError, match="unknown call_id"):
             client.events(999)
+
+
+# --------------------------------------------------------------------------
+# Dynamic device → edge routing
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dial_routes_to_correct_edge() -> None:
+    """When edge_device_id is empty (dynamic mode), dial() should use
+    resolve_edge_for_device to determine the target edge."""
+    server = InMemoryCloudEdgeServer(
+        token_verifier=StaticTokenVerifier(token="t", edge_device_id="edge-1"),
+    )
+    dispatcher = EngineSessionDispatcher()
+    server.on_edge_message(dispatcher.handle_edge_message)
+    await server.start("memory")
+
+    grpc_client = InMemoryCloudEdgeClient(server=server)
+    await grpc_client.start("memory", "t")
+
+    issuer = RtcTokenIssuer(app_id="a", app_key="k")
+    cloud_rtc, _ = linked_pair(a_uid="x", b_uid="y")
+
+    # Pass empty edge_device_id to activate dynamic routing.
+    client = RtcTelephonyClient(
+        edge_device_id="",
+        grpc_server=server,
+        dispatcher=dispatcher,
+        token_issuer=issuer,
+        rtc_session_factory=lambda: cloud_rtc,
+    )
+    # Inject device hint (call_id=7 → device_id=3).
+    client.set_device_for_session(7, 3)
+
+    # Monkey-patch resolve_edge_for_device onto the InMemoryCloudEdgeServer
+    # (this method only exists on CloudEdgeGrpcServer in production).
+    server.resolve_edge_for_device = lambda device_id: "edge-1"  # type: ignore[attr-defined]
+
+    # Track what send_to_edge is called with.
+    original_send = server.send_to_edge
+    sent_edges: list[str] = []
+
+    async def tracking_send(edge_device_id: str, message: pb.Cloud2Edge) -> None:
+        sent_edges.append(edge_device_id)
+        await original_send(edge_device_id, message)
+
+    server.send_to_edge = tracking_send  # type: ignore[assignment]
+
+    try:
+        await client.dial(call_id=7, phone="+8613800138000")
+        # Verify the dial was routed to the correct edge.
+        assert sent_edges == ["edge-1"]
+    finally:
+        await grpc_client.stop()
+        await server.stop()

@@ -91,7 +91,7 @@ class _ServerStream:
     by pushing the :data:`_CLOSE` sentinel.
     """
 
-    def __init__(self, identity: EdgeIdentity) -> None:
+    def __init__(self, identity: EdgeIdentity, *, send_timeout_s: float = 5.0) -> None:
         self.identity = identity
         # Bounded queue — 64 messages is generous for cloud → edge control
         # plane (dial / cancel / heartbeat). If we ever fill this, the
@@ -101,6 +101,7 @@ class _ServerStream:
             maxsize=64,
         )
         self._closed = False
+        self._send_timeout_s = send_timeout_s
 
     @property
     def connected(self) -> bool:
@@ -109,7 +110,13 @@ class _ServerStream:
     async def send(self, message: pb.Cloud2Edge) -> None:
         if self._closed:
             raise EdgeNotConnected(self.identity.edge_device_id)
-        await self._outbound.put(message)
+        try:
+            await asyncio.wait_for(
+                self._outbound.put(message),
+                timeout=self._send_timeout_s,
+            )
+        except TimeoutError as exc:
+            raise EdgeNotConnected(self.identity.edge_device_id) from exc
 
     async def outbound(self) -> AsyncIterator[pb.Cloud2Edge]:
         while True:
@@ -165,14 +172,19 @@ class CloudEdgeGrpcServer(CloudEdgeServer):
     testing`; this class is for integration tests + production.
     """
 
-    def __init__(self, *, token_verifier: TokenVerifier) -> None:
+    def __init__(self, *, token_verifier: TokenVerifier, send_timeout_s: float = 5.0) -> None:
         self._verifier = token_verifier
+        self._send_timeout_s = send_timeout_s
         self._edge_callback: EdgeMessageCallback | None = None
         self._streams: dict[str, _ServerStream] = {}
         # Guards _streams + the reconnect race (concurrent connects from
         # the same edge_device_id displacing each other).
         self._streams_lock = asyncio.Lock()
         self._server: grpc.aio.Server | None = None
+        # device_id (int) → edge_device_id (str) mapping, populated from
+        # Heartbeat.DeviceHealth and consumed by resolve_edge_for_device().
+        # Cleared when the owning edge disconnects.
+        self._device_to_edge: dict[int, str] = {}
 
     # ----- CloudEdgeServer surface ---------------------------------------
 
@@ -223,6 +235,20 @@ class CloudEdgeGrpcServer(CloudEdgeServer):
             raise EdgeNotConnected(edge_device_id)
         await stream.send(message)
 
+    def resolve_edge_for_device(self, device_id: int) -> str:
+        """Lookup which edge owns this device.
+
+        The mapping is populated from Heartbeat.DeviceHealth frames and
+        cleared when the owning edge disconnects.
+
+        Raises:
+            EdgeNotConnected: no edge has registered ownership of *device_id*.
+        """
+        edge_id = self._device_to_edge.get(device_id)
+        if edge_id is None:
+            raise EdgeNotConnected(f"no edge for device_id={device_id}")
+        return edge_id
+
     def on_edge_message(self, callback: EdgeMessageCallback) -> None:
         self._edge_callback = callback
 
@@ -253,7 +279,7 @@ class CloudEdgeGrpcServer(CloudEdgeServer):
             extra={"edge_device_id": identity.edge_device_id},
         )
 
-        stream = _ServerStream(identity)
+        stream = _ServerStream(identity, send_timeout_s=self._send_timeout_s)
         await self._register_stream(stream)
 
         reader_task = asyncio.create_task(
@@ -312,6 +338,15 @@ class CloudEdgeGrpcServer(CloudEdgeServer):
         async with self._streams_lock:
             if self._streams.get(edge_id) is stream:
                 del self._streams[edge_id]
+        # Only clean up device mappings if the edge truly disconnected
+        # (no new stream displaced it).  If a reconnect displaced the old
+        # stream, the device mappings must persist — the same edge is
+        # still connected.
+        if edge_id not in self._streams:
+            stale = [did for did, eid in self._device_to_edge.items() if eid == edge_id]
+            for did in stale:
+                if self._device_to_edge.get(did) == edge_id:
+                    del self._device_to_edge[did]
 
     async def _reader_loop(
         self,
@@ -333,6 +368,11 @@ class CloudEdgeGrpcServer(CloudEdgeServer):
         """
         try:
             async for msg in request_iterator:
+                # Update device→edge mapping from heartbeat payloads before
+                # dispatching to the application callback.
+                if msg.HasField("heartbeat"):
+                    for dev in msg.heartbeat.devices:
+                        self._device_to_edge[dev.device_id] = identity.edge_device_id
                 if self._edge_callback is None:
                     continue
                 try:

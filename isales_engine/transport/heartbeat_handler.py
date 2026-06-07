@@ -1,4 +1,5 @@
-"""Cloud-side heartbeat handler — updates ``device.last_seen_at`` in PG.
+"""Cloud-side heartbeat handler — updates ``device.last_seen_at`` and
+``device.status`` in PG.
 
 Spec: arch-cloud-edge-split § device-hardware Requirement "modem-controller
       心跳与失联探测";
@@ -7,20 +8,18 @@ Spec: arch-cloud-edge-split § device-hardware Requirement "modem-controller
 The cloud-edge bidi stream carries ``Edge2Cloud.Heartbeat`` every 30 s. Each
 heartbeat includes a ``devices`` list of ``DeviceHealth`` rows summarizing
 the modems attached to that edge. This handler writes each device's
-``last_seen_at`` so the worker watchdog
-(:mod:`isales_worker.device_watchdog`) can mark stale devices ``offline``
-when the heartbeat goes silent for ≥ 120 s.
+``last_seen_at`` and syncs ``status`` so the scheduler's
+``pick_idle_device()`` sees the correct state even after an edge daemon
+restart (e.g. recovering from a crash that left ``status='dialing'``).
 
 Wire-up at engine startup (Task 14 e2e demo)::
 
     handler = make_heartbeat_handler(sessionmaker)
     dispatcher.on_heartbeat(handler)
 
-Idempotency: a heartbeat may arrive after a watchdog already flipped the
-device offline; the handler only refreshes ``last_seen_at`` (it does NOT
-change ``status``). Re-enabling a recovered device goes through the udev /
-pyserial path that emits ``CallEvent.device_state_changed`` (spec
-device-hardware Scenario "进程恢复").
+Idempotency: receiving the same heartbeat status multiple times is a no-op
+(the UPDATE is unconditional but the value is the same). The handler is
+the single source of truth for edge-reported device state.
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
+from isales_common.enums import DeviceStatus
 from isales_common.models import Device
 from isales_common.proto import cloud_edge_pb2 as pb
 from isales_common.transport.cloud_edge import EdgeIdentity
@@ -39,6 +39,22 @@ logger = logging.getLogger(__name__)
 
 
 HeartbeatHandler = Callable[[EdgeIdentity, pb.Heartbeat], Awaitable[None]]
+
+# Mapping from proto DeviceStatus enum to Python DeviceStatus StrEnum.
+# DEVICE_STATUS_UNSPECIFIED (0) is excluded — it means "not set" and should
+# not trigger a status update. DEVICE_STATUS_ERROR (9) has no Python
+# counterpart; map to OFFLINE as a safe fallback.
+_PROTO_STATUS_TO_ENUM: dict[int, DeviceStatus] = {
+    int(pb.DEVICE_STATUS_UNKNOWN): DeviceStatus.UNKNOWN,
+    int(pb.DEVICE_STATUS_DETECTED): DeviceStatus.DETECTED,
+    int(pb.DEVICE_STATUS_REGISTERED): DeviceStatus.REGISTERED,
+    int(pb.DEVICE_STATUS_IDLE): DeviceStatus.IDLE,
+    int(pb.DEVICE_STATUS_DIALING): DeviceStatus.DIALING,
+    int(pb.DEVICE_STATUS_IN_CALL): DeviceStatus.IN_CALL,
+    int(pb.DEVICE_STATUS_OFFLINE): DeviceStatus.OFFLINE,
+    int(pb.DEVICE_STATUS_FLAGGED): DeviceStatus.FLAGGED,
+    int(pb.DEVICE_STATUS_ERROR): DeviceStatus.OFFLINE,
+}
 
 
 def _heartbeat_ts(heartbeat: pb.Heartbeat) -> datetime:
@@ -84,12 +100,27 @@ async def apply_heartbeat(
                 },
             )
             continue
+
+        # Build the values dict: always update last_seen_at; conditionally
+        # sync status when the edge reports a meaningful value.
+        values: dict[str, object] = {"last_seen_at": ts}
+        proto_status = int(device_health.status)
+        mapped_status = _PROTO_STATUS_TO_ENUM.get(proto_status)
+        if mapped_status is not None:
+            values["status"] = mapped_status
+
         result = await session.execute(
             update(Device)
             .where(Device.id == device_health.device_id)
-            .values(last_seen_at=ts)
+            .values(**values)
         )
         rowcount = getattr(result, "rowcount", 0) or 0
+        if rowcount and mapped_status is not None:
+            logger.info(
+                "device_status_synced device_id=%d status=%s",
+                device_health.device_id,
+                mapped_status.value,
+            )
         touched += int(rowcount)
     return touched
 

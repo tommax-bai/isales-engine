@@ -82,10 +82,6 @@ def _build_telephony(
             raise RuntimeError(
                 "rtc telephony requires dispatcher + grpc_server",
             )
-        if not settings.engine_edge_device_id:
-            raise RuntimeError(
-                "ISALES_ENGINE_EDGE_DEVICE_ID must be set for rtc mode",
-            )
         issuer = RtcTokenIssuer(
             app_id=settings.engine_rtc_app_id,
             app_key=settings.engine_rtc_app_key,
@@ -267,7 +263,7 @@ async def _build_rtc_transport(
             "(shared with isales-api edge-token mint)",
         )
     verifier = JwtTokenVerifier(secret=settings.engine_edge_token_jwt_secret)
-    grpc_server = CloudEdgeGrpcServer(token_verifier=verifier)
+    grpc_server = CloudEdgeGrpcServer(token_verifier=verifier, send_timeout_s=settings.engine_grpc_send_timeout_s)
     dispatcher = EngineSessionDispatcher()
     dispatcher.on_hardware_alert(log_hardware_alert)
     dispatcher.on_heartbeat(make_heartbeat_handler(sessionmaker))

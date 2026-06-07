@@ -400,3 +400,59 @@ async def test_stream_opened_log_fires_after_send_initial_metadata(
     ]
     assert opened_logs, "expected cloud_edge_stream_opened INFO line"
     assert getattr(opened_logs[-1], "edge_device_id", None) == "edge-keepalive-test"
+
+
+# ---------------------------------------------------------------------------
+# _ServerStream.send timeout
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_timeout_raises_edge_not_connected() -> None:
+    """When the outbound queue is full, send() should time out and raise
+    EdgeNotConnected rather than blocking indefinitely."""
+    from isales_engine.transport.grpc_server import _ServerStream
+
+    identity = EdgeIdentity(edge_device_id="edge-timeout")
+    stream = _ServerStream(identity, send_timeout_s=0.1)
+
+    # Replace the internal queue with a tiny one (maxsize=1) so we can
+    # easily saturate it without creating 64 dummy messages.
+    stream._outbound = asyncio.Queue(maxsize=1)  # noqa: SLF001
+    # Fill the queue.
+    await stream._outbound.put(pb.Cloud2Edge(heartbeat=pb.Heartbeat()))  # noqa: SLF001
+
+    # Next send must time out and raise EdgeNotConnected.
+    with pytest.raises(EdgeNotConnected):
+        await stream.send(pb.Cloud2Edge(heartbeat=pb.Heartbeat()))
+
+
+# ---------------------------------------------------------------------------
+# resolve_edge_for_device
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_edge_for_device_found() -> None:
+    """resolve_edge_for_device returns the correct edge_id when the
+    mapping is populated."""
+    server, _ = await _start_server(edge_id="edge-1")
+    try:
+        # Manually populate the device→edge mapping (normally done by
+        # heartbeat processing).
+        server._device_to_edge[42] = "edge-1"  # noqa: SLF001
+        assert server.resolve_edge_for_device(42) == "edge-1"
+    finally:
+        await server.stop(grace_seconds=0.1)
+
+
+@pytest.mark.asyncio
+async def test_resolve_edge_for_device_not_found() -> None:
+    """resolve_edge_for_device raises EdgeNotConnected when the device_id
+    has no registered edge."""
+    server, _ = await _start_server(edge_id="edge-1")
+    try:
+        with pytest.raises(EdgeNotConnected):
+            server.resolve_edge_for_device(999)
+    finally:
+        await server.stop(grace_seconds=0.1)

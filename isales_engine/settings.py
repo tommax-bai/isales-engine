@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     )
     # A2 assumes a single edge_device_id per engine process (single-tenant);
     # multi-edge → engine routing arrives with C2.
+    # Non-empty → legacy single-Edge mode (all dials routed to this edge).
+    # Empty string (default) → dynamic routing mode (device → edge mapping
+    # is built from Heartbeat.DeviceHealth frames at runtime).
     engine_edge_device_id: str = Field(
         default="", alias="ISALES_ENGINE_EDGE_DEVICE_ID"
     )
@@ -68,6 +71,9 @@ class Settings(BaseSettings):
     )
     engine_graceful_shutdown_timeout_s: int = Field(
         default=30, alias="ISALES_ENGINE_GRACEFUL_SHUTDOWN_TIMEOUT_S"
+    )
+    engine_grpc_send_timeout_s: float = Field(
+        default=5.0, alias="ISALES_ENGINE_GRPC_SEND_TIMEOUT_S"
     )
 
     engine_dial_queue: str = Field(default="engine:dial", alias="ISALES_ENGINE_DIAL_QUEUE")
@@ -106,19 +112,6 @@ class Settings(BaseSettings):
     # Live-API integration tests opt-in. CI must NOT set this.
     live_provider_tests: bool = Field(
         default=False, alias="ISALES_LIVE_PROVIDER_TESTS"
-    )
-
-    # ---- engine-flat-refactor change-2 (engine-multi-route-dispatch) -----
-
-    # Kill-switch for the SelectRouter decision-dispatch path. OFF (default) →
-    # the legacy ``_main_turn_loop`` inline decision runs (byte-identical, the
-    # golden-transcript net guards it). ON → the per-user-turn decision routes
-    # through SelectRouter + turn_controller (the driver loop, effect functions,
-    # state machine, and finalize all stay verbatim — only the decision compute
-    # moves). Removal trigger: change-3 (engine-tools-multidialogue-gating)
-    # Phase-4 deletes the legacy inline decision block + this flag in one commit.
-    engine_use_router: bool = Field(
-        default=False, alias="ISALES_ENGINE_USE_ROUTER"
     )
 
 
