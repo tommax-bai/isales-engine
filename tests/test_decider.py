@@ -81,36 +81,21 @@ def test_restructure_action_degrades_without_restructure_slot():
     assert action.matched_rule == RESTRUCTURE_RULE  # recorded for trace
 
 
-def test_low_confidence_primary_triggers_restructure():
-    # No rule matches, but the primary referee returned a real category below
-    # the floor → low-confidence restructure (source=last_reply).
+def test_low_confidence_no_longer_triggers_restructure():
+    # engine-interruption-rule-tree D6: the low-confidence→restructure fallback
+    # was removed (dead code — referees hardcode confidence=1.0). A below-floor
+    # primary referee that matches no rule now falls through to fail-open continue,
+    # never restructure, and never a "low_confidence" trigger.
     results = [_r("main_judge", "goal_achieved", confidence=0.4)]
-    action = decide(
-        results,
-        [GOAL_RULE],
-        primary_referee_label="main_judge",
-        restructure_enabled=True,
-    )
-    assert action.kind == "restructure"
-    assert action.source == "last_reply"
-    assert action.restructure_trigger == "low_confidence"
-
-
-def test_low_confidence_primary_no_restructure_when_disabled():
-    results = [_r("main_judge", "goal_achieved", confidence=0.4)]
-    action = decide(
-        results, [GOAL_RULE], primary_referee_label="main_judge", restructure_enabled=False
-    )
+    action = decide(results, [GOAL_RULE], restructure_enabled=True)
     assert action.kind == "continue"
+    assert action.restructure_trigger is None
 
 
-def test_low_confidence_fallback_needs_parseable_category():
-    # A hard fail-open (category None) on the primary referee → continue, not
-    # restructure (only a genuine low-confidence parse triggers re-voicing).
+def test_no_rule_match_falls_through_to_continue():
+    # A hard fail-open (category None) on the only referee → continue.
     results = [RefereeResult.fail_open(label="main_judge", reason="invalid")]
-    action = decide(
-        results, [], primary_referee_label="main_judge", restructure_enabled=True
-    )
+    action = decide(results, [], restructure_enabled=True)
     assert action.kind == "continue"
 
 

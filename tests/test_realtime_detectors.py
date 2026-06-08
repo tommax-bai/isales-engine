@@ -6,6 +6,7 @@ from isales_engine.realtime.interruption_detector import (
     InterruptionConfig,
     evaluate_partial,
 )
+from isales_engine.realtime.interruption_rules import default_rule
 from isales_engine.realtime.no_progress_timer import is_no_progress_exceeded
 from isales_engine.realtime.silence_detector import (
     SilenceConfig,
@@ -16,10 +17,15 @@ from isales_engine.realtime.silence_detector import (
 # ---- interruption ---------------------------------------------------------
 
 
-def _cfg() -> InterruptionConfig:
+_WHITELIST = ["嗯", "嗯嗯", "好", "好的", "哦"]
+
+
+def _cfg(min_duration_ms: int = 800) -> InterruptionConfig:
+    # The default tree reproduces the legacy whitelist(exact) + length(≥2) +
+    # duration sequence (engine-interruption-rule-tree D4).
     return InterruptionConfig(
-        whitelist=("嗯", "嗯嗯", "好", "好的", "哦"),
-        min_duration_ms=800,
+        whitelist=tuple(_WHITELIST),
+        rule=default_rule(whitelist=_WHITELIST, min_duration_ms=min_duration_ms),
     )
 
 
@@ -28,7 +34,7 @@ def test_whitelist_keeps_speaking() -> None:
         text="嗯", speech_started_ts_ms=0, now_ts_ms=2000, config=_cfg()
     )
     assert v.verdict == "ignored"
-    assert v.reason == "whitelist"
+    assert v.reason == "not(keyword)"
 
 
 def test_whitelist_with_whitespace_normalised() -> None:
@@ -43,7 +49,7 @@ def test_below_threshold_ignored() -> None:
         text="你看这个", speech_started_ts_ms=1000, now_ts_ms=1500, config=_cfg()
     )
     assert v.verdict == "ignored"
-    assert v.reason == "below_threshold"
+    assert v.reason == "duration"
 
 
 def test_above_threshold_triggers() -> None:
@@ -54,13 +60,24 @@ def test_above_threshold_triggers() -> None:
 
 
 def test_min_duration_zero_treats_any_non_whitelist_as_trigger() -> None:
-    cfg = InterruptionConfig(whitelist=("好",), min_duration_ms=0)
+    cfg = InterruptionConfig(
+        whitelist=("好",), rule=default_rule(whitelist=["好"], min_duration_ms=0)
+    )
     assert (
         evaluate_partial(
             text="不一样", speech_started_ts_ms=0, now_ts_ms=0, config=cfg
         ).verdict
         == "triggered"
     )
+
+
+def test_single_char_non_whitelist_ignored_by_length() -> None:
+    # length≥2 gate: a 1-char non-whitelist partial does not interrupt.
+    v = evaluate_partial(
+        text="行", speech_started_ts_ms=0, now_ts_ms=5000, config=_cfg()
+    )
+    assert v.verdict == "ignored"
+    assert v.reason == "length"
 
 
 # ---- silence --------------------------------------------------------------

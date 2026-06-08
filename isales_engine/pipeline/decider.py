@@ -7,9 +7,8 @@ The decider is pure: it takes the referees' results + the campaign's ordered
 ``routing_rules`` and returns a single :class:`DeciderAction`. It walks the
 rules in order and the **first** rule whose bound referee returned a matching
 category wins (first-match-wins). A referee below the confidence floor, or with
-no usable category, never matches. No rule matching falls through to a
-low-confidence restructure (if the primary referee is uncertain and a
-restructure stream is configured) or, finally, ``continue``.
+no usable category, never matches. No rule matching falls through to
+``continue`` (fail-open, back to LISTENING).
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ class DeciderAction:
     to: str | None = None  # transition target / route target (persona|closing|recovery|restructure)
     goal_type: str | None = None  # carried by goal_achieved transitions
     source: str | None = None  # restructure InterruptText source
-    # "last_reply" / "interrupt_remaining" / "low_confidence" — for trace.
+    # "last_reply" / "interrupt_remaining" — for trace.
     restructure_trigger: str | None = None
     # engine-tools-multidialogue-gating: tool alias (RouteToolAction) + the
     # route's declared then_state side-effect (RoutePersonaAction/RouteToolAction)
@@ -50,7 +49,6 @@ def decide(
     referee_results: Sequence[RefereeResult],
     routing_rules: Sequence[dict[str, Any]],
     *,
-    primary_referee_label: str | None = None,
     restructure_enabled: bool = False,
     threshold: float = CONFIDENCE_THRESHOLD,
 ) -> DeciderAction:
@@ -105,22 +103,7 @@ def decide(
         # Unknown action type → continue (defensive; api validates on write).
         return DeciderAction(kind="continue", matched_rule=rule)
 
-    # No rule matched. D5 (c): the primary referee returned a real (parseable)
-    # category but is below the confidence floor → re-voice the last reply to
-    # stall a turn rather than silently continuing.
-    if restructure_enabled and primary_referee_label:
-        primary = next(
-            (r for r in referee_results if r.label == primary_referee_label), None
-        )
-        if (
-            primary is not None
-            and primary.category is not None
-            and primary.confidence < threshold
-        ):
-            return DeciderAction(
-                kind="restructure",
-                source="last_reply",
-                restructure_trigger="low_confidence",
-            )
-
+    # No rule matched → fail-open continue (back to LISTENING). The former
+    # low-confidence→restructure fallback was removed (engine-interruption-rule-
+    # tree D6): it was dead code (referees hardcode confidence=1.0).
     return DeciderAction(kind="continue")

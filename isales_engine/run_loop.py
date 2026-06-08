@@ -447,7 +447,6 @@ async def _start_listen_pumps(
         _vad_monitor(
             session,
             audio_in_vad=telephony.audio_in_vad(session.call_record_id),
-            interruption_cfg=config.interruption,
         ),
         name="vad_monitor",
     )
@@ -1291,7 +1290,6 @@ async def _run_gated_turn(
     action: DeciderAction = decide(
         referee_results,
         config.pipeline.routing_rules,
-        primary_referee_label=config.pipeline.primary_referee_label,
         restructure_enabled=config.pipeline.restructure is not None,
     )
     sel = _select_gated_route(action, config)
@@ -1589,7 +1587,7 @@ def _assemble_interrupt_text(session: CallSession, source: str | None) -> str | 
         if remaining and remaining.strip():
             return remaining
         source = "last_reply"  # degrade
-    # last_reply (and low_confidence): last assistant utterance.
+    # last_reply: last assistant utterance.
     for turn in reversed(session.dialog_history):
         if turn.role == "assistant" and turn.text.strip():
             return turn.text
@@ -1811,25 +1809,16 @@ async def _vad_monitor(
     session: CallSession,
     *,
     audio_in_vad: AsyncIterator[bytes],
-    interruption_cfg: InterruptionConfig,
 ) -> None:
-    """RMS-based barge-in detector independent of the ASR partial pipeline.
+    """RMS voice-activity mirror feeding ``_partial_monitor``'s corroboration.
 
-    The partial-monitor path waits for the ASR vendor to emit a transcribed
-    partial (V3 SAUC: ~500–800 ms vendor latency) before the duration
-    condition can even start counting; that pushes the user-perceived
-    cancel latency to ~1.5–2 s. This monitor reads raw PCM directly from
-    ``telephony.audio_in_vad()`` and triggers cancel as soon as the rolling
-    voice-active span exceeds ``interruption_cfg.min_duration_ms``,
-    typically ~250–400 ms after the user actually starts speaking.
-
-    Coordination with ``_partial_monitor``:
-
-    * Both paths gate on ``session.current_speaking_task is not None`` and
-      ``not session.interruption_signaled``. Once either fires it sets the
-      flag and the other path becomes a no-op for this utterance.
-    * The ``interruption`` event emitted here carries ``source="vad"`` so
-      transcripts can distinguish the two paths.
+    This reads raw inbound PCM and maintains ``session.vad_voice_active_ms`` (a
+    rolling voice-active span with a silence-hangover window). It does NOT
+    trigger barge-in cancel — VAD energy is not noise-robust (engine-interruption-
+    rule-tree D5). The SOLE barge-in trigger is ``_partial_monitor`` →
+    ``evaluate_partial``'s rule tree. The mirror exists only so the partial path
+    can corroborate that real voice accompanied a transcribed partial (the
+    550902d anti-self-loopback guard).
     """
 
     try:
@@ -1895,50 +1884,16 @@ async def _vad_monitor(
             # Mirror onto the session so partial_monitor can corroborate.
             session.vad_voice_active_ms = voice_active_ms
 
-            if session.current_speaking_task is None or session.interruption_signaled:
-                # Not in SPEAKING / FILLER, or another path already fired —
-                # keep accumulating voice_active_ms so the surfaced count
-                # in the event reflects the user's actual span, but skip
-                # the cancel side-effect.
-                continue
-
-            if voice_active_ms < interruption_cfg.min_duration_ms:
-                continue
-
-            # PROTOTYPE 2026-06-03: VAD-source cancel DISABLED.
-            # VAD energy 信号容易被 ambient noise (椅子/风扇/呼吸/键盘)
-            # 误触发 — 2026-06-03 真 mic smoke #128 实证 rms=1705
-            # voice_active_ms=200 (接近 mac mic baseline) 误打断 AI
-            # 长回应. 改用 ASR partial text length gate (≥2 字)
-            # 作为唯一 barge-in 信号 (在 evaluate_partial 里),
-            # 噪音过不了 vendor model 不会识别成中文文字这道闸.
-            # VAD 仍 mirror voice_active_ms 给 partial_monitor 做 corroboration
-            # (550902d 加的防自环误触机制保留). 验证通过后 promote 到
-            # InterruptionConfig + openspec change interruption-detection-text-length-gate.
-            logger.info(
-                "vad_monitor_cancel_disabled_prototype "
-                "voice_active_ms=%s rms=%s "
-                "(barge-in 改靠 partial text length, 见 evaluate_partial)",
-                voice_active_ms, rms,
-            )
-            continue
-            # 下面原 cancel 路径暂时不走 (PROTOTYPE)
-            session.interruption_signaled = True
-            session.append_event(
-                "interruption",
-                interrupted_event_id=session.current_turn_id,
-                source="vad",
-                voice_active_ms=voice_active_ms,
-                rms=rms,
-            )
-            speaking_task = session.current_speaking_task
-            if speaking_task is not None and not speaking_task.done():
-                speaking_task.cancel()
-            # Reset so a new utterance after the interrupted reply starts
-            # fresh. ``interruption_signaled`` is cleared by the main loop
-            # after it processes the interruption.
-            voice_active_ms = 0
-            session.vad_voice_active_ms = 0
+            # VAD-source cancel removed (engine-interruption-rule-tree D5,
+            # absorbing interruption-detection-text-length-gate). VAD energy is
+            # not noise-robust: 2026-06-03 real-mic smoke #128 saw rms=1705 /
+            # voice_active_ms=200 (near mac mic baseline) false-fire and cut AI
+            # long replies. _vad_monitor now ONLY mirrors voice_active_ms (above)
+            # for _partial_monitor's anti-self-loopback corroboration (550902d);
+            # the SOLE barge-in trigger is _partial_monitor → evaluate_partial's
+            # rule tree (vendor ASR won't transcribe ambient noise into text).
+            # Removal trigger for the mirror: once an alternative anti-self-
+            # loopback signal exists.
     except asyncio.CancelledError:
         return
 

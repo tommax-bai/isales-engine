@@ -11,16 +11,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # Below this confidence a referee's category is treated as "no usable output"
-# for rule matching (role-prompt spec § confidence 评分). The primary referee
-# being below this floor additionally triggers a low-confidence restructure
-# (engine-multi-referee-and-restructure D5 c) — handled by the decider.
+# for rule matching (role-prompt spec § confidence 评分): such a referee simply
+# matches no rule and the turn falls through to continue (general confidence
+# floor — independent of any restructure trigger).
 CONFIDENCE_THRESHOLD = 0.7
 
 # Fail-open markers recorded in pipeline_trace's referee category when a referee
 # produced no usable category (vs. a real prompt-defined enum value).
 FAILOPEN_TIMEOUT = "timeout"
 FAILOPEN_INVALID = "invalid"
-FAILOPEN_LOW_CONFIDENCE = "low_confidence"
 
 
 @dataclass
@@ -72,8 +71,6 @@ class RefereeResult:
         """The category string recorded in pipeline_trace (real enum or marker)."""
         if self.category is None:
             return self.failopen_reason or FAILOPEN_INVALID
-        if self.confidence < threshold:
-            return FAILOPEN_LOW_CONFIDENCE
         return self.category
 
     def as_trace(self, threshold: float = CONFIDENCE_THRESHOLD) -> dict:

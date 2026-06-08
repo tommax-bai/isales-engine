@@ -75,7 +75,6 @@ class PipelineConfig:
     # Raw routing rules (list of dicts) as stored in campaign.routing_rules.
     routing_rules: list[dict[str, Any]] = field(default_factory=list)
     max_continuous_restructure: int = 2
-    primary_referee_label: str | None = None
     last_call_summary: str | None = None
     follow_up_count: int = 0
     short_reply_active: bool = False

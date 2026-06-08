@@ -27,6 +27,7 @@ from isales_engine.providers.llm_mock import KeywordDrivenMockLLM
 from isales_engine.providers.tts_mock import TextLengthMockTTS
 from isales_engine.realtime.filler_manager import FillerPhraseSpec, FillerSetSpec
 from isales_engine.realtime.interruption_detector import InterruptionConfig
+from isales_engine.realtime.interruption_rules import default_rule
 from isales_engine.realtime.mock_telephony import MockTelephonyClient
 from isales_engine.realtime.silence_detector import SilenceConfig
 from isales_engine.run_loop import (
@@ -116,7 +117,6 @@ def _make_config(
             },
         ],
         max_continuous_restructure=max_continuous_restructure,
-        primary_referee_label="main_judge",
         restructure=restructure_spec,
         extractor=ExtractorSpec(
             role_config_id=500, prompt_version_id=600, system_prompt="抽取字段。"
@@ -158,7 +158,8 @@ def _make_config(
             closing_phrases=("好的，再见。",),
         ),
         interruption=InterruptionConfig(
-            whitelist=("嗯", "好的"), min_duration_ms=400
+            whitelist=("嗯", "好的"),
+            rule=default_rule(whitelist=["嗯", "好的"], min_duration_ms=400),
         ),
         silence=SilenceConfig(
             threshold_ms=silence_threshold_ms,

@@ -11,6 +11,7 @@ from isales_engine.providers.asr_mock import ScriptedMockASR
 from isales_engine.providers.llm_mock import KeywordDrivenMockLLM
 from isales_engine.providers.tts_mock import TextLengthMockTTS
 from isales_engine.realtime.interruption_detector import InterruptionConfig
+from isales_engine.realtime.interruption_rules import default_rule
 from isales_engine.realtime.mock_telephony import MockTelephonyClient
 from isales_engine.run_loop import (
     Providers,
@@ -64,7 +65,8 @@ def test_decide_protection_listen_only_at_threshold() -> None:
 async def test_partial_monitor_triggers_cancel_on_long_non_whitelist_partial() -> None:
     session = _make_session()
     interruption_cfg = InterruptionConfig(
-        whitelist=("嗯", "好的"), min_duration_ms=400
+        whitelist=("嗯", "好的"),
+        rule=default_rule(whitelist=["嗯", "好的"], min_duration_ms=400),
     )
     asr_partials_q: asyncio.Queue[ASRResult] = asyncio.Queue()
 
@@ -117,7 +119,8 @@ async def test_partial_monitor_ignores_when_no_speaking_task() -> None:
     session = _make_session()
     session.current_speaking_task = None
     interruption_cfg = InterruptionConfig(
-        whitelist=("嗯",), min_duration_ms=400
+        whitelist=("嗯",),
+        rule=default_rule(whitelist=["嗯"], min_duration_ms=400),
     )
     asr_partials_q: asyncio.Queue[ASRResult] = asyncio.Queue()
 
@@ -141,7 +144,8 @@ async def test_partial_monitor_ignores_when_no_speaking_task() -> None:
 async def test_partial_monitor_whitelist_partial_does_not_trigger() -> None:
     session = _make_session()
     interruption_cfg = InterruptionConfig(
-        whitelist=("嗯", "好的"), min_duration_ms=400
+        whitelist=("嗯", "好的"),
+        rule=default_rule(whitelist=["嗯", "好的"], min_duration_ms=400),
     )
     asr_partials_q: asyncio.Queue[ASRResult] = asyncio.Queue()
     monitor_task = asyncio.create_task(
@@ -218,7 +222,8 @@ async def test_speaking_interruption_increments_counter_and_loops_to_processing(
     # Tight window so our test feed_turn (10ms partial step) crosses the
     # threshold quickly.
     config.interruption = InterruptionConfig(
-        whitelist=("嗯",), min_duration_ms=20
+        whitelist=("嗯",),
+        rule=default_rule(whitelist=["嗯"], min_duration_ms=20),
     )
     asr = ScriptedMockASR(partial_step_ms=5)
     providers = Providers(
@@ -318,7 +323,10 @@ async def test_partial_monitor_cancels_play_streaming_midflight() -> None:
     tts = _RecordingTTS(synth_delay_s=0.01, chunks_per_sentence=3)
     stream = _FakeStream(["第一句话。", "第二句话。", "第三句话。"])
 
-    interruption_cfg = InterruptionConfig(whitelist=("嗯",), min_duration_ms=400)
+    interruption_cfg = InterruptionConfig(
+        whitelist=("嗯",),
+        rule=default_rule(whitelist=["嗯"], min_duration_ms=400),
+    )
     asr_partials_q: asyncio.Queue[ASRResult] = asyncio.Queue()
     monitor = asyncio.create_task(
         _partial_monitor(

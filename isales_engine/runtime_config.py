@@ -37,6 +37,7 @@ from isales_engine.pipeline.prompt_builder import (
 )
 from isales_engine.realtime.filler_manager import FillerPhraseSpec, FillerSetSpec
 from isales_engine.realtime.interruption_detector import InterruptionConfig
+from isales_engine.realtime.interruption_rules import build_rule, default_rule
 from isales_engine.realtime.silence_detector import SilenceConfig
 from isales_engine.transfer.manager import TransferConfig
 from isales_engine.wrapup.manager import WrapUpConfig
@@ -205,7 +206,6 @@ async def load_runtime_config(
         restructure=_restructure_spec(_first(RoleKind.RESTRUCTURE)),
         routing_rules=[dict(r) for r in (campaign.routing_rules or [])],
         max_continuous_restructure=campaign.max_continuous_restructure,
-        primary_referee_label=campaign.primary_referee_label,
         extractor=_extractor_spec(_first(RoleKind.EXTRACTOR)),
         default_replies=[str(r) for r in (campaign.default_replies or [])],
         lead=LeadInfo(
@@ -297,9 +297,22 @@ async def load_runtime_config(
         ),
     )
 
+    _whitelist = [str(w) for w in (campaign.interruption_whitelist or [])]
+    # Barge-in rule tree: explicit campaign tree if configured, else a backward-
+    # compat default synthesized from the legacy whitelist + min_duration columns
+    # (engine-interruption-rule-tree design D4 — equivalent to the historical
+    # whitelist→length≥2→duration sequence).
+    if campaign.interruption_rules is not None:
+        _interruption_rule = build_rule(campaign.interruption_rules)
+    else:
+        _interruption_rule = default_rule(
+            whitelist=_whitelist,
+            min_text_length=2,
+            min_duration_ms=campaign.interruption_min_duration_ms,
+        )
     interruption = InterruptionConfig(
-        whitelist=tuple(str(w) for w in (campaign.interruption_whitelist or [])),
-        min_duration_ms=campaign.interruption_min_duration_ms,
+        whitelist=tuple(_whitelist),
+        rule=_interruption_rule,
     )
 
     silence = SilenceConfig(
