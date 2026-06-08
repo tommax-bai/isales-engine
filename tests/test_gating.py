@@ -224,3 +224,77 @@ async def test_gate_fails_open_to_main_on_referee_timeout() -> None:
     assert trace["selected_route_id"] == "main"
     # The fail-open referee is recorded with the "timeout" marker category.
     assert any(r["category"] == "timeout" for r in trace["referee_results"])
+
+
+# --------------------------------------------------------------------------- #
+# §11: per-keyword hangup closing phrase
+# --------------------------------------------------------------------------- #
+
+
+async def _run_capture(config, *, turns: tuple[str, ...]):
+    """Like ``_run`` but also returns ``providers`` so a test can inspect what
+    TTS actually played (``providers.tts.calls``)."""
+    session = _make_session()
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    async def driver() -> None:
+        await asyncio.sleep(0.05)
+        for t in turns:
+            await asr.feed_turn(t)
+            await asyncio.sleep(0.15)
+
+    task = asyncio.create_task(driver())
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await task
+    return session, providers
+
+
+async def test_tool_hangup_per_rule_closing_phrase_overrides_tool_config() -> None:
+    # One hangup tool reused by a keyword rule that carries its own closing_phrase;
+    # the per-rule phrase MUST override the tool config's phrase.
+    config = _make_config(
+        routing_rules=[
+            {
+                "referee": "main_judge",
+                "match": ["customer_decline"],
+                "action": {"type": "tool", "tool": "bye", "closing_phrase": "那再见"},
+            }
+        ],
+    )
+    config.pipeline.tools = {
+        "bye": {"type": "hangup", "closing_phrase": "工具默认话术", "interrupt": False}
+    }
+    session, providers = await _run_capture(config, turns=("我不需要了",))
+
+    assert session.hangup_cause == "referee_hangup"
+    spoken = [text for (text, _voice) in providers.tts.calls]
+    assert "那再见" in spoken  # per-rule override played
+    assert "工具默认话术" not in spoken  # tool-config phrase NOT used
+
+
+async def test_tool_hangup_empty_phrase_direct_hangup() -> None:
+    # Both the rule and the tool config omit closing_phrase → direct hangup, no
+    # farewell played (reply still suppressed).
+    config = _make_config(
+        routing_rules=[
+            {
+                "referee": "main_judge",
+                "match": ["customer_decline"],
+                "action": {"type": "tool", "tool": "bye"},
+            }
+        ],
+    )
+    config.pipeline.tools = {
+        "bye": {"type": "hangup", "closing_phrase": None, "interrupt": False}
+    }
+    session, providers = await _run_capture(config, turns=("我不需要了",))
+
+    assert session.hangup_cause == "referee_hangup"
+    types = [e["type"] for e in session.full_transcript]
+    assert "ai_reply" not in types  # dialogue reply suppressed
+    trace = session.pipeline_trace_records[-1]
+    assert trace["selected_route_id"] == "tool:bye"

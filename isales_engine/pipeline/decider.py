@@ -37,6 +37,11 @@ class DeciderAction:
     # Legacy transition/restructure leave these None.
     tool: str | None = None
     then_state: str | None = None
+    # Per-rule hangup closing phrase (RouteToolAction.closing_phrase): a per-
+    # keyword override of HangupToolConfig.closing_phrase so one hangup tool is
+    # reused across keywords with different phrases. None → fall back to the tool
+    # config (engine-tools-multidialogue-gating §11).
+    closing_phrase: str | None = None
     # The matched routing rule (dict), for pipeline_trace; None when none matched.
     matched_rule: dict[str, Any] | None = None
 
@@ -94,6 +99,7 @@ def decide(
                 kind="tool",
                 tool=action.get("tool"),
                 then_state=action.get("then_state"),
+                closing_phrase=action.get("closing_phrase"),
                 matched_rule=rule,
             )
         # Unknown action type → continue (defensive; api validates on write).

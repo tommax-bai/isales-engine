@@ -306,7 +306,9 @@ async def load_runtime_config(
         threshold_ms=campaign.silence_threshold_ms,
         max_activations=campaign.max_silence_activations,
         phrases=tuple(str(p) for p in (campaign.silence_phrases or [])),
-        hangup_phrase=campaign.silence_hangup_phrase or "稍后联系，再见。",
+        # Preserve an empty phrase so silence-max can直接挂断不播话术 (§11);
+        # only coerce a missing (NULL) value to empty, never to a default phrase.
+        hangup_phrase=campaign.silence_hangup_phrase or "",
     )
 
     _ = pipeline_default_timeout_ms  # carried in CallSession.run() args

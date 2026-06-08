@@ -112,3 +112,24 @@ def test_low_confidence_fallback_needs_parseable_category():
         results, [], primary_referee_label="main_judge", restructure_enabled=True
     )
     assert action.kind == "continue"
+
+
+def test_tool_action_carries_per_rule_closing_phrase():
+    # §11: a tool rule's per-keyword closing_phrase rides on the DeciderAction so
+    # one hangup tool can be reused across keywords with different phrases.
+    rule = {
+        "referee": "j",
+        "match": ["OFFENSIVE"],
+        "action": {"type": "tool", "tool": "bye", "closing_phrase": "不打扰了，再见"},
+    }
+    action = decide([_r("j", "OFFENSIVE")], [rule])
+    assert action.kind == "tool"
+    assert action.tool == "bye"
+    assert action.closing_phrase == "不打扰了，再见"
+
+
+def test_tool_action_without_closing_phrase_is_none():
+    rule = {"referee": "j", "match": ["HANGUP"], "action": {"type": "tool", "tool": "bye"}}
+    action = decide([_r("j", "HANGUP")], [rule])
+    assert action.kind == "tool"
+    assert action.closing_phrase is None

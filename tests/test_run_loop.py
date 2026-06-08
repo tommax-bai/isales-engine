@@ -358,6 +358,26 @@ async def test_run_session_silence_activation_then_hangup() -> None:
     assert "silence_activation" in types
 
 
+async def test_run_session_silence_max_empty_phrase_direct_hangup() -> None:
+    # §11: empty silence_hangup_phrase → direct hangup, no farewell played.
+    session = _make_session()
+    config = _make_config(silence_threshold_ms=100)
+    config.silence = SilenceConfig(
+        threshold_ms=100, max_activations=0, phrases=(), hangup_phrase=""
+    )
+    providers = _make_providers(asr=ScriptedMockASR(partial_step_ms=5))
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+
+    assert session.state.value == "end"
+    assert session.hangup_cause == "silence_max_reached"
+    spoken = [text for (text, _voice) in providers.tts.calls]
+    assert "再见。" not in spoken  # old fallback farewell no longer played
+
+
 # ---- dial timeout / no connect → end with no_answer -----------------------
 
 

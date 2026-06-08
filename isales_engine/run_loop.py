@@ -533,10 +533,12 @@ async def _main_turn_loop(
                 return
 
             if outcome.kind == "silence_hangup":
-                await _play_tts(
-                    session, telephony, providers.tts, outcome.text or "再见。",
-                    voice_id=config.voice_id,
-                )
+                # empty silence_hangup_phrase → direct hangup, no phrase (§11).
+                if outcome.text:
+                    await _play_tts(
+                        session, telephony, providers.tts, outcome.text,
+                        voice_id=config.voice_id,
+                    )
                 sm.transition_to(
                     CallStatus.END, reason="silence_max_reached", force=True
                 )
@@ -1144,6 +1146,9 @@ class _GatedSelection:
     restructure_trigger: str | None = None
     tool_type: str | None = None  # "hangup" | "transfer"
     tool_config: dict[str, Any] | None = None
+    # Per-rule hangup closing phrase (RouteToolAction.closing_phrase); overrides
+    # tool_config["closing_phrase"] so one hangup tool serves many keywords.
+    closing_phrase: str | None = None
 
 
 def _select_gated_route(action: DeciderAction, config: RuntimeConfig) -> _GatedSelection:
@@ -1158,7 +1163,9 @@ def _select_gated_route(action: DeciderAction, config: RuntimeConfig) -> _GatedS
     fail_open = config.pipeline.referee_fail_open_route or "main"
     tools = config.pipeline.tools
 
-    def _tool(alias: str, then_state: str | None) -> _GatedSelection:
+    def _tool(
+        alias: str, then_state: str | None, closing_phrase: str | None = None
+    ) -> _GatedSelection:
         tc = tools.get(alias)
         if not isinstance(tc, dict) or tc.get("type") not in ("hangup", "transfer"):
             return _GatedSelection(route_id=fail_open, kind="dialogue")
@@ -1169,6 +1176,7 @@ def _select_gated_route(action: DeciderAction, config: RuntimeConfig) -> _GatedS
             then_state=then_state or ("END" if ttype == "hangup" else "TRANSFERRING"),
             tool_type=ttype,
             tool_config=tc,
+            closing_phrase=closing_phrase,
         )
 
     _BUILTIN_THEN = {"closing": "WRAPPING_UP", "recovery": "ACTIVATING", "restructure": "LISTENING"}
@@ -1205,7 +1213,7 @@ def _select_gated_route(action: DeciderAction, config: RuntimeConfig) -> _GatedS
             )
         return _GatedSelection(route_id=fail_open, kind="dialogue")
     elif action.kind == "tool":
-        return _tool(action.tool or "", action.then_state)
+        return _tool(action.tool or "", action.then_state, action.closing_phrase)
 
     # continue / no rule matched → fail open to the main dialogue route
     return _GatedSelection(route_id=fail_open, kind="dialogue")
@@ -1322,7 +1330,9 @@ async def _run_gated_turn(
         await _cancel_candidates()
         if sel.tool_type == "hangup":
             session.hangup_cause = HangupCause.REFEREE_HANGUP.value
-            phrase = (sel.tool_config or {}).get("closing_phrase") or ""
+            # per-keyword first: matched rule's closing_phrase overrides the
+            # tool config; both empty → direct hangup, no phrase (§11).
+            phrase = sel.closing_phrase or (sel.tool_config or {}).get("closing_phrase") or ""
             if phrase:
                 await _play_tts(session, telephony, providers.tts, phrase, voice_id=voice_id)
             session.pipeline_trace_records.append(
