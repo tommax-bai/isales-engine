@@ -15,8 +15,11 @@ The TRANSFERRING flow itself (random transfer phrase → TTS → hangup → writ
 ``call_record.transfer_status``) is driven by ``CallSession.run()`` in
 PR #11; this module supplies the trigger detector + a config dataclass.
 
-handoff_task creation is the worker's job (impl-worker stage 3B already
-ships that on receiving CallEnded with ``transfer_status='marked_for_handoff'``).
+v1 transfer is decayed to mark-and-notify: the engine plays the transfer phrase
+and hangs up with ``transfer_status='marked_for_handoff'``; the worker then flips
+``lead.status`` to ``transferred`` on the resulting CallEnded, and a human seat
+calls the lead back via a separate phone system. There is NO handoff_task queue —
+the table + admin page were removed in change ``admin-prune-vestigial-features``.
 """
 
 from __future__ import annotations

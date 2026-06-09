@@ -1060,7 +1060,7 @@ async def _perform_handoff(
         await _play_tts(session, telephony, tts, phrase, voice_id=voice_id)
     session.transfer_status = TransferStatus.MARKED_FOR_HANDOFF.value
     session.transfer_reason = trigger_type
-    session.append_event("transfer_marked", handoff_task_id=0)
+    session.append_event("transfer_marked")
     await _attempt_hangup(telephony, session.call_record_id)
     sm.transition_to(CallStatus.END, reason="marked_for_handoff", force=True)
     session.hangup_cause = HangupCause.MARKED_FOR_HANDOFF.value
