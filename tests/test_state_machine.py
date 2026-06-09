@@ -191,7 +191,7 @@ def test_append_event_routes_dialog_only() -> None:
     s.append_event("greeting", text="您好我是 AI", audio_duration_ms=1200)
     s.append_event("user_speech", text="你好", asr_confidence=0.95, duration_ms=500)
     s.append_event("ai_reply", text="OK", turn_id=1, goal_achieved=False)
-    s.append_event("filler", text="让我看一下", filler_phrase_id=10, duration_ms=400)
+    s.append_event("filler", text="让我看一下", duration_ms=400)
     s.append_event("silence_activation", text="还在吗", activation_index=0)
 
     assert len(s.full_transcript) == 5

@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from isales_common.enums import RoleKind
 from isales_common.models import (
     Campaign,
-    FillerPhrase,
     Lead,
     PromptVersion,
     RoleConfig,
@@ -34,7 +33,6 @@ from isales_engine.pipeline.prompt_builder import (
     LeadInfo,
     PipelineConfig,
 )
-from isales_engine.realtime.filler_manager import FillerPhraseSpec
 from isales_engine.realtime.interruption_detector import InterruptionConfig
 from isales_engine.realtime.interruption_rules import build_rule, default_rule
 from isales_engine.realtime.silence_detector import SilenceConfig
@@ -47,7 +45,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RuntimeConfig:
     pipeline: PipelineConfig
-    filler_phrases: list[FillerPhraseSpec]
+    filler_phrases: list[str]
     transfer: TransferConfig
     wrap_up: WrapUpConfig
     interruption: InterruptionConfig
@@ -227,29 +225,9 @@ async def load_runtime_config(
         referee_fail_open_route=campaign.referee_fail_open_route,
     )
 
-    # Filler phrases — a single flat per-campaign pool (filler-single-pool).
-    phrase_rows = (
-        (
-            await db.execute(
-                select(FillerPhrase).where(FillerPhrase.campaign_id == campaign.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    filler_phrases: list[FillerPhraseSpec] = [
-        FillerPhraseSpec(
-            id=p.id,
-            text=p.phrase,
-            audio_url=p.audio_url,
-            generation_status=(
-                p.generation_status
-                if isinstance(p.generation_status, str)
-                else p.generation_status.value
-            ),
-        )
-        for p in phrase_rows
-    ]
+    # Filler phrases — a flat per-campaign pool of plain strings
+    # (filler-campaign-column), same shape as silence_phrases.
+    filler_phrases = [str(p) for p in (campaign.filler_phrases or [])]
 
     transfer = TransferConfig(
         keyword_enabled=campaign.transfer_keyword_enabled,

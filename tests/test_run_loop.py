@@ -25,7 +25,6 @@ from isales_engine.pipeline.prompt_builder import (
 from isales_engine.providers.asr_mock import ScriptedMockASR
 from isales_engine.providers.llm_mock import KeywordDrivenMockLLM
 from isales_engine.providers.tts_mock import TextLengthMockTTS
-from isales_engine.realtime.filler_manager import FillerPhraseSpec
 from isales_engine.realtime.interruption_detector import InterruptionConfig
 from isales_engine.realtime.interruption_rules import default_rule
 from isales_engine.realtime.mock_telephony import MockTelephonyClient
@@ -126,14 +125,7 @@ def _make_config(
     )
     return RuntimeConfig(
         pipeline=pipeline,
-        filler_phrases=[
-            FillerPhraseSpec(
-                id=11,
-                text="嗯",
-                audio_url="oss://x/11.wav",
-                generation_status="ready",
-            )
-        ],
+        filler_phrases=["嗯"],
         transfer=TransferConfig(
             keyword_enabled=bool(transfer_keywords),
             keywords=transfer_keywords,
