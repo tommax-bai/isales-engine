@@ -15,7 +15,6 @@ from isales_common.enums import RoleKind
 from isales_common.models import (
     Campaign,
     FillerPhrase,
-    FillerSet,
     Lead,
     PromptVersion,
     RoleConfig,
@@ -35,7 +34,7 @@ from isales_engine.pipeline.prompt_builder import (
     LeadInfo,
     PipelineConfig,
 )
-from isales_engine.realtime.filler_manager import FillerPhraseSpec, FillerSetSpec
+from isales_engine.realtime.filler_manager import FillerPhraseSpec
 from isales_engine.realtime.interruption_detector import InterruptionConfig
 from isales_engine.realtime.interruption_rules import build_rule, default_rule
 from isales_engine.realtime.silence_detector import SilenceConfig
@@ -48,7 +47,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RuntimeConfig:
     pipeline: PipelineConfig
-    fillers: list[FillerSetSpec]
+    filler_phrases: list[FillerPhraseSpec]
     transfer: TransferConfig
     wrap_up: WrapUpConfig
     interruption: InterruptionConfig
@@ -228,51 +227,29 @@ async def load_runtime_config(
         referee_fail_open_route=campaign.referee_fail_open_route,
     )
 
-    # Filler sets (sorted by sort_order in FillerManager).
-    filler_sets = (
+    # Filler phrases — a single flat per-campaign pool (filler-single-pool).
+    phrase_rows = (
         (
             await db.execute(
-                select(FillerSet).where(FillerSet.campaign_id == campaign.id)
+                select(FillerPhrase).where(FillerPhrase.campaign_id == campaign.id)
             )
         )
         .scalars()
         .all()
     )
-    fillers: list[FillerSetSpec] = []
-    if filler_sets:
-        fs_ids = [fs.id for fs in filler_sets]
-        phrase_rows = (
-            (
-                await db.execute(
-                    select(FillerPhrase).where(FillerPhrase.filler_set_id.in_(fs_ids))
-                )
-            )
-            .scalars()
-            .all()
+    filler_phrases: list[FillerPhraseSpec] = [
+        FillerPhraseSpec(
+            id=p.id,
+            text=p.phrase,
+            audio_url=p.audio_url,
+            generation_status=(
+                p.generation_status
+                if isinstance(p.generation_status, str)
+                else p.generation_status.value
+            ),
         )
-        phrases_by_set: dict[int, list[FillerPhrase]] = {fs.id: [] for fs in filler_sets}
-        for p in phrase_rows:
-            phrases_by_set[p.filler_set_id].append(p)
-        for fs in filler_sets:
-            fillers.append(
-                FillerSetSpec(
-                    id=fs.id,
-                    sort_order=fs.sort_order,
-                    phrases=[
-                        FillerPhraseSpec(
-                            id=p.id,
-                            text=p.phrase,
-                            audio_url=p.audio_url,
-                            generation_status=(
-                                p.generation_status
-                                if isinstance(p.generation_status, str)
-                                else p.generation_status.value
-                            ),
-                        )
-                        for p in phrases_by_set[fs.id]
-                    ],
-                )
-            )
+        for p in phrase_rows
+    ]
 
     transfer = TransferConfig(
         keyword_enabled=campaign.transfer_keyword_enabled,
@@ -356,7 +333,7 @@ async def load_runtime_config(
 
     return RuntimeConfig(
         pipeline=pipeline,
-        fillers=fillers,
+        filler_phrases=filler_phrases,
         transfer=transfer,
         wrap_up=wrap_up,
         interruption=interruption,

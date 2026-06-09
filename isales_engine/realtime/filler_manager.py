@@ -9,12 +9,12 @@ When the pipeline returns a reply, ``CallSession.run()`` (PR #11) calls
 ``await wait_finished()`` before starting the reply TTS so the conversation
 rhythm stays consistent.
 
-Selection rules (filler spec § 多 filler_set 轮询 + § 集合内随机不重复):
+Selection rules (filler spec § 垫词池随机不重复):
 
-* Walk ``filler_sets`` ordered by ``sort_order`` (id tie-breaker for
-  stability), wrapping around forever.
-* Each call session keeps a per-set "used" set of phrase ids; pick one not
-  in that set; if all are used, reset and pick again.
+* A campaign owns a single flat pool of filler phrases — the ``filler_set``
+  grouping/round-robin layer was removed in ``filler-single-pool``.
+* Each call session keeps one ``used`` set of phrase ids; pick a phrase not in
+  that set; if all are used, reset and pick again.
 * Phrases with empty text are skipped silently — no anonymous fallback.
   ``audio_url`` / ``generation_status`` are *not* selection gates in v1.0:
   they belong to the stage-6 OSS pre-render path, which has no producer yet,
@@ -50,13 +50,6 @@ class FillerPhraseSpec:
     generation_status: str  # "pending" / "ready" / "failed"
 
 
-@dataclass
-class FillerSetSpec:
-    id: int
-    sort_order: int
-    phrases: list[FillerPhraseSpec]
-
-
 # ---- audio loader contract -------------------------------------------------
 
 
@@ -69,14 +62,14 @@ class FillerManager:
     def __init__(
         self,
         session: CallSession,
-        sets: list[FillerSetSpec],
+        phrases: list[FillerPhraseSpec],
         *,
         telephony: TelephonyClient,
         tts: TTSProvider,
         voice_id: str = "default",
     ) -> None:
         self._session = session
-        self._sets = self._sorted_sets(sets)
+        self._phrases = phrases
         self._telephony = telephony
         self._tts = tts
         self._voice_id = voice_id
@@ -120,36 +113,26 @@ class FillerManager:
     # ---- selection -------------------------------------------------------
 
     def _pick_phrase(self) -> FillerPhraseSpec | None:
-        if not self._sets:
+        # v1.0 selects on text only — the phrase is synthesized live in
+        # _stream_audio. audio_url / generation_status are stage-6 OSS fields
+        # with no producer yet; gating on them = filler never fires. Stage-6
+        # (OSS + regenerate_filler_audio worker) restores an "audio_url ready →
+        # stream, else synth" branch in a separate change.
+        ready = [p for p in self._phrases if p.text.strip()]
+        if not ready:
             return None
 
-        for _ in range(len(self._sets)):
-            set_idx = self._session.current_filler_set_index % len(self._sets)
-            chosen_set = self._sets[set_idx]
-            self._session.current_filler_set_index += 1
+        # Single flat per-call pool: don't repeat a phrase until the pool is
+        # exhausted, then reset (filler spec § 垫词池随机不重复).
+        used = self._session.used_filler_phrase_ids
+        unused = [p for p in ready if p.id not in used]
+        if not unused:
+            used.clear()
+            unused = ready
 
-            # v1.0 selects on text only — the phrase is synthesized live in
-            # _stream_audio. audio_url / generation_status are stage-6 OSS
-            # fields with no producer yet; gating on them = filler never fires.
-            # Stage-6 (OSS + regenerate_filler_audio worker) restores an
-            # "audio_url ready → stream, else synth" branch in a separate change.
-            ready = [p for p in chosen_set.phrases if p.text.strip()]
-            if not ready:
-                continue
-
-            used = self._session.used_filler_phrase_ids_per_set.setdefault(
-                chosen_set.id, set()
-            )
-            unused = [p for p in ready if p.id not in used]
-            if not unused:
-                used.clear()
-                unused = ready
-
-            phrase = random.choice(unused)
-            used.add(phrase.id)
-            return phrase
-
-        return None
+        phrase = random.choice(unused)
+        used.add(phrase.id)
+        return phrase
 
     # ---- playback --------------------------------------------------------
 
@@ -201,9 +184,3 @@ class FillerManager:
         approx_duration_ms = max(50, len(phrase.text) * 20)
         await self._telephony.audio_out(self._session.call_record_id, chunks())
         return approx_duration_ms
-
-    # ---- helpers ---------------------------------------------------------
-
-    @staticmethod
-    def _sorted_sets(sets: list[FillerSetSpec]) -> list[FillerSetSpec]:
-        return sorted(sets, key=lambda s: (s.sort_order, s.id))

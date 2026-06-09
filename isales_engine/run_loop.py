@@ -679,7 +679,7 @@ async def _main_turn_loop(
             if config.filler_enabled and not is_wrap_up:
                 filler = FillerManager(
                     session,
-                    config.fillers,
+                    config.filler_phrases,
                     telephony=telephony,
                     tts=providers.tts,
                     voice_id=config.voice_id,

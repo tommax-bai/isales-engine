@@ -97,9 +97,9 @@ class CallSession:
     full_transcript: list[dict[str, Any]] = field(default_factory=list)
     pipeline_trace_records: list[dict[str, Any]] = field(default_factory=list)
 
-    # Filler module bookkeeping.
-    used_filler_phrase_ids_per_set: dict[int, set[int]] = field(default_factory=dict)
-    current_filler_set_index: int = 0
+    # Filler module bookkeeping — single flat per-campaign pool
+    # (filler-single-pool): one "used" set per call, reset when exhausted.
+    used_filler_phrase_ids: set[int] = field(default_factory=set)
 
     # Silence / no-progress / interruption counters.
     silence_activation_count: int = 0
