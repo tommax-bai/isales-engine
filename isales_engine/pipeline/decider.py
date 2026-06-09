@@ -6,9 +6,9 @@ engine-multi-referee-and-restructure D3 / D5.
 The decider is pure: it takes the referees' results + the campaign's ordered
 ``routing_rules`` and returns a single :class:`DeciderAction`. It walks the
 rules in order and the **first** rule whose bound referee returned a matching
-category wins (first-match-wins). A referee below the confidence floor, or with
-no usable category, never matches. No rule matching falls through to
-``continue`` (fail-open, back to LISTENING).
+category wins (first-match-wins). A referee with no usable category (fail-open)
+never matches. No rule matching falls through to ``continue`` (fail-open, back
+to LISTENING).
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from isales_engine.streaming.types import CONFIDENCE_THRESHOLD, RefereeResult
+from isales_engine.streaming.types import RefereeResult
 
 
 @dataclass
@@ -50,10 +50,9 @@ def decide(
     routing_rules: Sequence[dict[str, Any]],
     *,
     restructure_enabled: bool = False,
-    threshold: float = CONFIDENCE_THRESHOLD,
 ) -> DeciderAction:
     """Run first-match-wins over ``routing_rules`` → a single action."""
-    categories = {r.label: r.effective_category(threshold) for r in referee_results}
+    categories = {r.label: r.effective_category() for r in referee_results}
 
     for rule in routing_rules:
         ref = rule.get("referee")

@@ -63,10 +63,13 @@ def test_no_match_continue():
     assert action.kind == "continue"
 
 
-def test_low_confidence_referee_does_not_match():
-    # category matches the rule but confidence is below the floor → no match.
+def test_confidence_ignored_category_drives_match():
+    # engine-tools-multidialogue-gating: the confidence floor is gone (referees
+    # pin confidence=1.0). The bare category alone drives matching — a stray
+    # low-confidence value is ignored, not a no-match.
     action = decide([_r("main_judge", "goal_achieved", confidence=0.5)], [GOAL_RULE])
-    assert action.kind == "continue"
+    assert action.kind == "transition"
+    assert action.to == "goal_achieved"
 
 
 def test_failopen_referee_does_not_match():
@@ -83,10 +86,11 @@ def test_restructure_action_degrades_without_restructure_slot():
 
 def test_low_confidence_no_longer_triggers_restructure():
     # engine-interruption-rule-tree D6: the low-confidence→restructure fallback
-    # was removed (dead code — referees hardcode confidence=1.0). A below-floor
-    # primary referee that matches no rule now falls through to fail-open continue,
-    # never restructure, and never a "low_confidence" trigger.
-    results = [_r("main_judge", "goal_achieved", confidence=0.4)]
+    # was removed (dead code — referees hardcode confidence=1.0). A referee whose
+    # category matches no rule falls through to fail-open continue, never
+    # restructure, and never a "low_confidence" trigger. (The confidence value is
+    # now ignored entirely; only the bare category drives matching.)
+    results = [_r("main_judge", "continue", confidence=0.4)]
     action = decide(results, [GOAL_RULE], restructure_enabled=True)
     assert action.kind == "continue"
     assert action.restructure_trigger is None

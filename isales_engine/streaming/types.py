@@ -1,20 +1,14 @@
 """Shared value objects for the streaming pipeline.
 
 engine-multi-referee-and-restructure: a referee no longer emits a strong
-``decision`` enum. Each referee emits a free ``{category, confidence}`` whose
-semantics live in that referee's own prompt; the engine never interprets the
-category string — it hands ``{label: category}`` to the routing-rule decider.
+``decision`` enum. Each referee emits a **bare category token** whose semantics
+live in that referee's own prompt; the engine never interprets the category
+string — it hands ``{label: category}`` to the routing-rule decider.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-# Below this confidence a referee's category is treated as "no usable output"
-# for rule matching (role-prompt spec § confidence 评分): such a referee simply
-# matches no rule and the turn falls through to continue (general confidence
-# floor — independent of any restructure trigger).
-CONFIDENCE_THRESHOLD = 0.7
 
 # Fail-open markers recorded in pipeline_trace's referee category when a referee
 # produced no usable category (vs. a real prompt-defined enum value).
@@ -58,26 +52,22 @@ class RefereeResult:
             failopen_reason=reason,
         )
 
-    def effective_category(self, threshold: float = CONFIDENCE_THRESHOLD) -> str | None:
-        """Category used for rule matching: ``None`` when not usable (fail-open
-        or below the confidence floor)."""
-        if self.category is None:
-            return None
-        if self.confidence < threshold:
-            return None
+    def effective_category(self) -> str | None:
+        """Category used for rule matching: the raw category, or ``None`` when
+        not usable (fail-open)."""
         return self.category
 
-    def trace_category(self, threshold: float = CONFIDENCE_THRESHOLD) -> str:
+    def trace_category(self) -> str:
         """The category string recorded in pipeline_trace (real enum or marker)."""
         if self.category is None:
             return self.failopen_reason or FAILOPEN_INVALID
         return self.category
 
-    def as_trace(self, threshold: float = CONFIDENCE_THRESHOLD) -> dict:
+    def as_trace(self) -> dict:
         """One ``referee_results`` array element (transcript spec)."""
         return {
             "label": self.label,
-            "category": self.trace_category(threshold),
+            "category": self.trace_category(),
             "confidence": self.confidence,
             "duration_ms": self.duration_ms,
         }

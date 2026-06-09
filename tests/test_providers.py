@@ -117,7 +117,7 @@ def _msgs(system: str, user: str) -> list[Message]:
 
 
 # Referee user-message primer (mirrors isales_engine.referee._USER_PRIMER).
-_REF_PRIMER = "请只输出一个词：pass 或 hold，不要任何其他内容、标点或 JSON。"
+_REF_PRIMER = "请按系统提示只输出一个分类词，不要任何其他内容、标点或 JSON。"
 
 
 async def test_main_chat_stream_emits_plain_text() -> None:

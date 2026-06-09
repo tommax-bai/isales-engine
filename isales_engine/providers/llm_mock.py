@@ -29,7 +29,7 @@ from isales_common.providers._models import LLMResponse, Message
 from isales_common.providers.llm import LLMProvider
 
 # Must match a stable substring of isales_engine.referee._USER_PRIMER.
-_REFEREE_PRIMER_MARK = "pass 或 hold"
+_REFEREE_PRIMER_MARK = "分类词"
 
 
 @dataclass

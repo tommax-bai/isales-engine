@@ -81,7 +81,7 @@ class _ScriptedLLM(LLMProvider):
     ):
         self.chat_calls += 1
         user = next((m.content for m in messages if m.role == "user"), "")
-        content = self._referee_json if "pass 或 hold" in user else (
+        content = self._referee_json if "分类词" in user else (
             self._stream_text or "您好。"
         )
         return _resp(content)

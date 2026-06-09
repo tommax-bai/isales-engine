@@ -5,7 +5,7 @@ Spec: ai-pipeline § "单 main LLM streaming" / "referee 二级决策"; design.m
 
 One ``run_pipeline_stream()`` call drives one PROCESSING turn:
 
-1. Spawn the referee LLM task (side-band enum decision) — unless this is a
+1. Spawn the referee LLM task (gating category decision) — unless this is a
    WRAPPING_UP turn, where no state transition is needed.
 2. Stream the main LLM reply token-by-token through the sentence splitter; the
    caller (run_loop) feeds each sentence to TTS the moment it is ready.
@@ -18,9 +18,12 @@ One ``run_pipeline_stream()`` call drives one PROCESSING turn:
 4. If the reply is still empty (stream + fallback both produced nothing), emit a
    campaign ``default_reply`` so the call never goes silent.
 
-The structured decision (goal_achieved / transfer / customer_decline) comes from
-the referee task the caller awaits after playback; the extracted CRM fields are
-produced offline by the worker. The main LLM itself emits **plain text only**.
+This is a **gate-first** pipeline: the referee category gates the reply *before*
+audio is released. The caller awaits the referee task while the first sentence is
+still buffered, so the structured decision (goal_achieved / transfer /
+customer_decline) is in hand before audio is committed — not after playback. The
+extracted CRM fields are produced offline by the worker. The main LLM itself
+emits **plain text only**.
 """
 
 from __future__ import annotations
@@ -65,7 +68,7 @@ class MainStreamResult:
 class PipelineStream:
     """Handle for one streaming PROCESSING turn.
 
-    ``referee_tasks`` are the side-band decision tasks (empty during wrap-up /
+    ``referee_tasks`` are the gating decision tasks (empty during wrap-up /
     restructure). ``result`` is populated once ``sentences()`` has been fully
     consumed.
     """
