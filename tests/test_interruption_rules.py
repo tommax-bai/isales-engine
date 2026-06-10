@@ -181,3 +181,12 @@ def test_default_rule_empty_whitelist_omits_keyword_leaf() -> None:
     # no whitelist → only length + duration gate
     assert r.evaluate(_ctx("两字", elapsed_ms=0)).interrupt is True
     assert r.evaluate(_ctx("一", elapsed_ms=0)).interrupt is False
+
+
+def test_default_rule_honors_custom_min_text_length() -> None:
+    # interruption-min-chars-and-mode-toggle: runtime_config feeds the length
+    # leaf from campaign.interruption_min_chars (default 2). A non-default value
+    # MUST flow through into the synthesized length gate.
+    r = default_rule(whitelist=[], min_text_length=5, min_duration_ms=0)
+    assert r.evaluate(_ctx("四个字了", elapsed_ms=0)).interrupt is False  # 4 < 5
+    assert r.evaluate(_ctx("整整五个字", elapsed_ms=0)).interrupt is True  # 5 >= 5

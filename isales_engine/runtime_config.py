@@ -253,15 +253,18 @@ async def load_runtime_config(
 
     _whitelist = [str(w) for w in (campaign.interruption_whitelist or [])]
     # Barge-in rule tree: explicit campaign tree if configured, else a backward-
-    # compat default synthesized from the legacy whitelist + min_duration columns
-    # (engine-interruption-rule-tree design D4 — equivalent to the historical
-    # whitelist→length≥2→duration sequence).
+    # compat default synthesized from the legacy scalar columns (whitelist +
+    # min_chars + min_duration; engine-interruption-rule-tree design D4 —
+    # equivalent to the historical whitelist→length→duration sequence). The
+    # length leaf's threshold is campaign.interruption_min_chars (NOT NULL,
+    # default 2), promoted from the former hardcoded min_text_length=2 by
+    # interruption-min-chars-and-mode-toggle.
     if campaign.interruption_rules is not None:
         _interruption_rule = build_rule(campaign.interruption_rules)
     else:
         _interruption_rule = default_rule(
             whitelist=_whitelist,
-            min_text_length=2,
+            min_text_length=campaign.interruption_min_chars,
             min_duration_ms=campaign.interruption_min_duration_ms,
         )
     interruption = InterruptionConfig(

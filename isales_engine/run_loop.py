@@ -1773,8 +1773,9 @@ async def _partial_monitor(
         # removed 2026-06-04: its rationale was the retracted DingRTC
         # self-loopback theory, and with the persistent ASR connection the
         # ASR is reliably listening during SPEAKING, so a `triggered` partial
-        # (evaluate_partial already gates on text length ≥2 + duration +
-        # whitelist) is the barge-in signal. (call 143: the partial monitor
+        # (evaluate_partial already gates on text length ≥ campaign.
+        # interruption_min_chars (default 2) + duration + whitelist) is the
+        # barge-in signal. (call 143: the partial monitor
         # got the user's "1234" during SPEAKING but this gate wrongly blocked
         # the cancel.)
 
