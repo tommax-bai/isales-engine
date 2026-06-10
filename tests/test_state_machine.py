@@ -173,14 +173,14 @@ def test_illegal_transition_class_still_importable() -> None:
     assert exc.reason == "bug"
 
 
-def test_meta_dict_emits_state_changed_event() -> None:
+def test_no_state_changed_event_emitted() -> None:
+    # state_changed (with its **meta spread) was dropped: it had zero production
+    # callers and was incompatible with the read-side forbid-union contract
+    # (fix-transcript-schema-drift). A normal transition emits no state_changed.
     s = make_session()
     sm = StateMachine(s)
-    sm.transition_to(CallStatus.IN_CALL, reason="connected", meta={"source": "modem"})
-    sc = next(e for e in s.full_transcript if e["type"] == "state_changed")
-    assert sc["from_state"] == "init"
-    assert sc["to_state"] == "in_call"
-    assert sc["source"] == "modem"
+    sm.transition_to(CallStatus.IN_CALL, reason="connected")
+    assert all(e["type"] != "state_changed" for e in s.full_transcript)
 
 
 # ---- CallSession.append_event ---------------------------------------------

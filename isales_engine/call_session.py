@@ -41,12 +41,13 @@ TRANSCRIPT_EVENT_TYPES: frozenset[str] = frozenset(
         "wrap_up_started",
         "wrap_up_completed",
         "hangup",
-        # Engine-internal events introduced by impl-engine spec deltas.
-        "state_changed",
+        # Engine-internal state events (call-state-machine spec).
         # state_error: historical, written by transition_to pre-soften-guard.
         # state_warning: current, written when a transition falls outside
         # LEGAL_TRANSITIONS (advisory, non-blocking). See call-state-machine
-        # § "非法 transition 改 advisory 警告".
+        # § "非法 transition 改 advisory 警告". (state_changed dropped: it had a
+        # **meta spread incompatible with the forbid-union read contract and
+        # zero production callers — see fix-transcript-schema-drift.)
         "state_error",
         "state_warning",
     }

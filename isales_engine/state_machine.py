@@ -22,7 +22,7 @@ Rationale: see spec call-state-machine § "非法 transition 改 advisory 警告
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from isales_common.enums import CallStatus
 
@@ -91,7 +91,6 @@ class StateMachine:
         new_state: CallState,
         *,
         reason: str | None = None,
-        meta: dict[str, Any] | None = None,
         force: bool = False,
     ) -> None:
         """Move ``session.state`` to ``new_state``.
@@ -128,15 +127,3 @@ class StateMachine:
         self._session.previous_state = current
         self._session.state = new_state
         self._session.state_history.append((current, new_state, reason))
-
-        # transcript hangup event is the responsibility of the END caller
-        # (it carries reason + initiated_by); state machine only logs the
-        # transition for non-END states to avoid duplication.
-        if new_state is not CallState.END and meta is not None:
-            self._session.append_event(
-                "state_changed",
-                from_state=current.value,
-                to_state=new_state.value,
-                reason=reason,
-                **meta,
-            )

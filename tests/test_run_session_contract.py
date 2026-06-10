@@ -72,7 +72,6 @@ def test_transcript_event_vocabulary_frozen() -> None:
             "wrap_up_started",
             "wrap_up_completed",
             "hangup",
-            "state_changed",
             "state_error",
             "state_warning",
         }

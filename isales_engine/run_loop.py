@@ -1425,7 +1425,7 @@ async def _run_gated_turn(
             "ai_reply", text=winner.result.reply_text, turn_id=winner.turn_id,
             selected_role_config_id=role_config_id or None,
             goal_achieved=False, goal_type="", extracted={},
-            is_wrap_up=False, interrupted=True,
+            is_wrap_up=False,
         )
         session.consecutive_interruption_count += 1
         session.interruption_signaled = False
@@ -1443,7 +1443,7 @@ async def _run_gated_turn(
         "ai_reply", text=winner.result.reply_text, turn_id=winner.turn_id,
         selected_role_config_id=role_config_id or None,
         goal_achieved=goal_achieved, goal_type=goal_type or "", extracted={},
-        is_wrap_up=goal_achieved, interrupted=False,
+        is_wrap_up=goal_achieved,
     )
 
     # ---- project then_state (StateMachine is the sole writer) ----
@@ -1502,7 +1502,7 @@ async def _gated_wrap_up_turn(
         "ai_reply", text=stream.result.reply_text, turn_id=stream.turn_id,
         selected_role_config_id=config.pipeline.main.role_config_id or None,
         goal_achieved=False, goal_type="", extracted={},
-        is_wrap_up=True, interrupted=not played,
+        is_wrap_up=True,
     )
     if not played:
         session.consecutive_interruption_count += 1
@@ -1653,7 +1653,6 @@ async def _run_restructure(
         goal_type="",
         extracted={},
         is_wrap_up=False,
-        interrupted=not played,
     )
     return played
 
