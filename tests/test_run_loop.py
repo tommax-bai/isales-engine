@@ -155,7 +155,6 @@ def _make_config(
         ),
         voice_id="default",
         fixed_greeting="您好我是 AI 助手。",
-        max_no_progress_seconds=None,
         filler_enabled=filler_enabled,
     )
 

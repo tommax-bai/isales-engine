@@ -52,7 +52,6 @@ class RuntimeConfig:
     silence: SilenceConfig
     voice_id: str
     fixed_greeting: str | None
-    max_no_progress_seconds: int | None
     # ASR EOS endpoint in seconds (pipeline-latency-tail § A). Derived from
     # campaign.asr_eos_silence_ms (ms); NULL → default 0.4s. main.py passes
     # this into build_asr so the per-campaign threshold replaces the
@@ -318,7 +317,6 @@ async def load_runtime_config(
         silence=silence,
         voice_id=voice_speaker,
         fixed_greeting=fixed_greeting,
-        max_no_progress_seconds=campaign.max_no_progress_seconds,
         asr_partial_stable_s=asr_partial_stable_s,
         filler_enabled=campaign.filler_enabled,
         filler_delay_ms=filler_delay_ms,

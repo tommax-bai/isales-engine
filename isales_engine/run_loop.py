@@ -72,7 +72,6 @@ from isales_engine.realtime.interruption_detector import (
     InterruptionConfig,
     evaluate_partial,
 )
-from isales_engine.realtime.no_progress_timer import is_no_progress_exceeded
 from isales_engine.realtime.silence_detector import SilenceConfig, evaluate_silence
 from isales_engine.realtime.telephony_client import TelephonyClient
 from isales_engine.runtime_config import RuntimeConfig
@@ -510,9 +509,6 @@ async def _main_turn_loop(
     pump_ev = listen_ctx.pump_ev
     pump_partial_monitor = listen_ctx.pump_partial_monitor
 
-    no_progress_started = time.monotonic()
-    last_progress_ms = _to_ms(no_progress_started)
-
     try:
         while session.state is not CallStatus.END:
             outcome = await _await_user_or_silence(
@@ -564,19 +560,12 @@ async def _main_turn_loop(
                 continue
 
             if outcome.kind != "user_final" or outcome.text is None:
-                if is_no_progress_exceeded(
-                    last_progress_ts_ms=last_progress_ms,
-                    now_ts_ms=_to_ms(time.monotonic()),
-                    max_no_progress_seconds=config.max_no_progress_seconds,
-                ):
-                    sm.transition_to(
-                        CallStatus.END, reason="no_progress_timeout", force=True
-                    )
-                    session.hangup_cause = HangupCause.NO_PROGRESS_TIMEOUT.value
-                    session.append_event(
-                        "hangup", reason="no_progress_timeout", initiated_by="ai"
-                    )
-                    return
+                # Non-actionable outcome (empty / whitelisted input, or a silence
+                # tick that didn't reach the activation/hangup threshold) — loop
+                # and keep listening. The standalone seconds-based no-progress
+                # timeout timer was removed (silence-drop-no-progress-timeout);
+                # silence-driven termination is solely the silence-max path above
+                # (max_silence_activations + silence_threshold_ms → silence_max_reached).
                 continue
 
             user_text = outcome.text
@@ -592,7 +581,6 @@ async def _main_turn_loop(
                         ),
                     ),
                 )
-            last_progress_ms = _to_ms(time.monotonic())
 
             # Cheap (keyword / round) transfer triggers stay inline — zero LLM,
             # deterministic (pipeline-latency-tail § D). The LLM-backed triggers

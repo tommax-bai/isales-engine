@@ -1,4 +1,4 @@
-"""Tests for interruption / silence / no-progress detectors."""
+"""Tests for interruption / silence detectors."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from isales_engine.realtime.interruption_detector import (
     evaluate_partial,
 )
 from isales_engine.realtime.interruption_rules import default_rule
-from isales_engine.realtime.no_progress_timer import is_no_progress_exceeded
 from isales_engine.realtime.silence_detector import (
     SilenceConfig,
     evaluate_silence,
@@ -161,25 +160,4 @@ def test_silence_phrases_more_than_max_only_uses_first_n() -> None:
             silence_elapsed_ms=5000, activations_so_far=2, config=cfg
         ).decision
         == "hangup"
-    )
-
-
-# ---- no_progress ----------------------------------------------------------
-
-
-def test_no_progress_disabled_when_zero_or_none() -> None:
-    assert not is_no_progress_exceeded(
-        last_progress_ts_ms=0, now_ts_ms=1_000_000, max_no_progress_seconds=None
-    )
-    assert not is_no_progress_exceeded(
-        last_progress_ts_ms=0, now_ts_ms=1_000_000, max_no_progress_seconds=0
-    )
-
-
-def test_no_progress_threshold() -> None:
-    assert not is_no_progress_exceeded(
-        last_progress_ts_ms=0, now_ts_ms=59_000, max_no_progress_seconds=60
-    )
-    assert is_no_progress_exceeded(
-        last_progress_ts_ms=0, now_ts_ms=60_000, max_no_progress_seconds=60
     )

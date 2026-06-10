@@ -63,9 +63,6 @@ class Settings(BaseSettings):
     engine_pipeline_default_timeout_ms: int = Field(
         default=8000, alias="ISALES_ENGINE_PIPELINE_DEFAULT_TIMEOUT_MS"
     )
-    engine_max_no_progress_seconds: int = Field(
-        default=60, alias="ISALES_ENGINE_MAX_NO_PROGRESS_SECONDS"
-    )
     engine_mock_connect_delay_ms: int = Field(
         default=200, alias="ISALES_ENGINE_MOCK_CONNECT_DELAY_MS"
     )
