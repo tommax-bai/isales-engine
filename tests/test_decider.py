@@ -58,6 +58,38 @@ def test_goal_achieved_carries_goal_type():
     assert action.goal_type == "appointment"
 
 
+def test_route_closing_carries_goal_type():
+    # fix-goal-achievement-pipeline: the modern `route to=closing` action carries
+    # goal_type symmetrically to the legacy `transition` action above. Regression
+    # for the decider dropping goal_type on the route branch (→ empty goal_type).
+    rule = {
+        "referee": "main_judge",
+        "match": ["SUCCESS"],
+        "action": {
+            "type": "route",
+            "to": "closing",
+            "then_state": "WRAPPING_UP",
+            "goal_type": "intent_confirmed",
+        },
+    }
+    action = decide([_r("main_judge", "SUCCESS")], [rule])
+    assert action.kind == "route"
+    assert action.to == "closing"
+    assert action.then_state == "WRAPPING_UP"
+    assert action.goal_type == "intent_confirmed"
+
+
+def test_route_without_goal_type_is_none():
+    rule = {
+        "referee": "j",
+        "match": ["GO"],
+        "action": {"type": "route", "to": "persona:foo"},
+    }
+    action = decide([_r("j", "GO")], [rule])
+    assert action.kind == "route"
+    assert action.goal_type is None
+
+
 def test_no_match_continue():
     action = decide([_r("main_judge", "continue")], [GOAL_RULE])
     assert action.kind == "continue"

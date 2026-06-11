@@ -88,6 +88,12 @@ def decide(
             return DeciderAction(
                 kind="route",
                 to=action.get("to"),
+                # Symmetric with the legacy ``transition`` branch above: a
+                # ``route to=closing`` action carries goal_type the same way
+                # ``transition to=goal_achieved`` does, so the goal_achieved
+                # event records the configured label instead of "" (goal-
+                # achievement spec § "route 与 transition 动作的 goal_type 提取对称").
+                goal_type=action.get("goal_type"),
                 then_state=action.get("then_state"),
                 matched_rule=rule,
             )
