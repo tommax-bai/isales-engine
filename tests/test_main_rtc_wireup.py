@@ -331,10 +331,18 @@ async def _fake_load_runtime_config(
 
 
 class _NoopProviders:
-    def __init__(self, *, llm: Any = None, asr: Any = None, tts: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        llm: Any = None,
+        asr: Any = None,
+        tts: Any = None,
+        llm_registry: Any = None,
+    ) -> None:
         self.llm = llm
         self.asr = asr
         self.tts = tts
+        self.llm_registry = llm_registry
 
 
 # ----- helper: confirm JWT shape matches verifier expectations ---------------

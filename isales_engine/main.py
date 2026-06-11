@@ -34,6 +34,7 @@ from isales_engine.event_consumer import subscribe_loop
 from isales_engine.event_publisher import EventPublisher
 from isales_engine.events import ManualHangupRequested, TransferRequested
 from isales_engine.providers.factory import build_asr, build_llm, build_tts
+from isales_engine.providers.llm_registry import LLMRegistry
 from isales_engine.providers.tts_cache import CachingTTSProvider, TtsCacheStore
 from isales_engine.realtime.mock_telephony import MockTelephonyClient
 from isales_engine.realtime.real_telephony import RealTelephonyClient
@@ -202,8 +203,12 @@ def _make_runner(
                 pipeline_default_timeout_ms=settings.engine_pipeline_default_timeout_ms,
             )
 
+        # per-role-llm-config-and-restructure-card: the global default LLM is also
+        # the registry's fallback; the registry resolves each slot's provider+model
+        # (role_config) lazily and caches per (provider, model) for this call.
+        default_llm = build_llm(settings.engine_llm_provider, store=credentials)
         providers = Providers(
-            llm=build_llm(settings.engine_llm_provider, store=credentials),
+            llm=default_llm,
             asr=build_asr(
                 settings.engine_asr_provider,
                 store=credentials,
@@ -212,6 +217,11 @@ def _make_runner(
             tts=CachingTTSProvider(
                 build_tts(settings.engine_tts_provider, store=credentials),
                 tts_cache,
+            ),
+            llm_registry=LLMRegistry(
+                store=credentials,
+                default_provider=settings.engine_llm_provider,
+                default_client=default_llm,
             ),
         )
 
@@ -235,14 +245,21 @@ def _make_runner(
                 token_budget_per_call=settings.engine_token_budget_per_call,
             )
         finally:
-            # Providers are per-call; release the TTS + LLM providers'
-            # persistent HTTP clients so their keep-alive connections aren't
-            # leaked (pipeline-latency-tail § C — TTS + LLM connection reuse).
-            for provider in (providers.tts, providers.llm):
-                aclose = getattr(provider, "aclose", None)
-                if callable(aclose):
+            # Providers are per-call; release the TTS + every per-slot LLM
+            # client's persistent HTTP connections (pipeline-latency-tail § C).
+            # The registry's aclose_all() closes the default + each cached
+            # (provider, model) client built this call.
+            tts_aclose = getattr(providers.tts, "aclose", None)
+            if callable(tts_aclose):
+                with contextlib.suppress(Exception):
+                    await tts_aclose()
+            if providers.llm_registry is not None:
+                await providers.llm_registry.aclose_all()
+            else:  # pragma: no cover - main always sets a registry
+                llm_aclose = getattr(providers.llm, "aclose", None)
+                if callable(llm_aclose):
                     with contextlib.suppress(Exception):
-                        await aclose()
+                        await llm_aclose()
 
     return _run
 

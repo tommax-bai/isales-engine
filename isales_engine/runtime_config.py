@@ -107,10 +107,17 @@ async def load_runtime_config(
     ) if pv_ids else []
     pv_by_id = {pv.id: pv for pv in pv_rows}
 
-    def _spec_for(rc: RoleConfig) -> tuple[str, str, int]:
+    def _spec_for(rc: RoleConfig) -> tuple[str | None, str, str, int]:
+        # per-role-llm-config-and-restructure-card: provider SSOT lives in
+        # role_config.ext_params["provider"] (the web PromptTierEditor writes it
+        # there). None → engine LLM registry falls back to the global default.
         pv_id = rc.current_prompt_version_id
         pv = pv_by_id.get(pv_id) if pv_id else None
+        ep = rc.ext_params or {}
+        raw_provider = ep.get("provider")
+        provider = raw_provider.strip() if isinstance(raw_provider, str) and raw_provider.strip() else None
         return (
+            provider,
             rc.model or "mock",
             pv.content if pv else "",
             pv_id or 0,
@@ -130,22 +137,24 @@ async def load_runtime_config(
             # No main slot configured → empty prompt; main stream produces a
             # default_reply, greeting falls back to "您好。".
             return MainSpec(role_config_id=0, prompt_version_id=0, system_prompt="")
-        model, prompt, pv_id = _spec_for(rc)
+        provider, model, prompt, pv_id = _spec_for(rc)
         return MainSpec(
             role_config_id=rc.id,
             prompt_version_id=pv_id,
             system_prompt=prompt,
+            provider=provider,
             model=model,
             temperature=rc.temperature or 1.0,
             top_p=rc.top_p or 1.0,
         )
 
     def _referee_spec(rc: RoleConfig) -> RefereeSpec:
-        model, prompt, pv_id = _spec_for(rc)
+        provider, model, prompt, pv_id = _spec_for(rc)
         return RefereeSpec(
             role_config_id=rc.id,
             prompt_version_id=pv_id,
             system_prompt=prompt,
+            provider=provider,
             model=model,
             temperature=rc.temperature or 1.0,
             top_p=rc.top_p or 1.0,
@@ -154,11 +163,12 @@ async def load_runtime_config(
         )
 
     def _persona_spec(rc: RoleConfig) -> PersonaSpec:
-        model, prompt, pv_id = _spec_for(rc)
+        provider, model, prompt, pv_id = _spec_for(rc)
         return PersonaSpec(
             role_config_id=rc.id,
             prompt_version_id=pv_id,
             system_prompt=prompt,
+            provider=provider,
             model=model,
             temperature=rc.temperature or 1.0,
             top_p=rc.top_p or 1.0,
@@ -170,11 +180,12 @@ async def load_runtime_config(
     def _restructure_spec(rc: RoleConfig | None) -> RestructureSpec | None:
         if rc is None:
             return None
-        model, prompt, pv_id = _spec_for(rc)
+        provider, model, prompt, pv_id = _spec_for(rc)
         return RestructureSpec(
             role_config_id=rc.id,
             prompt_version_id=pv_id,
             system_prompt=prompt,
+            provider=provider,
             model=model,
             temperature=rc.temperature or 1.0,
             top_p=rc.top_p or 1.0,
@@ -186,11 +197,12 @@ async def load_runtime_config(
             return ExtractorSpec(
                 role_config_id=0, prompt_version_id=0, system_prompt=""
             )
-        model, prompt, pv_id = _spec_for(rc)
+        provider, model, prompt, pv_id = _spec_for(rc)
         return ExtractorSpec(
             role_config_id=rc.id,
             prompt_version_id=pv_id,
             system_prompt=prompt,
+            provider=provider,
             model=model,
             temperature=rc.temperature or 1.0,
             top_p=rc.top_p or 1.0,

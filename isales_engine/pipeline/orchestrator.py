@@ -35,6 +35,7 @@ import random
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from isales_common.providers._models import Message
 from isales_common.providers.llm import LLMProvider
@@ -44,6 +45,9 @@ from isales_engine.pipeline.prompt_builder import PipelineConfig, build_main_mes
 from isales_engine.referee import recent_dialog_rounds, run_referee
 from isales_engine.streaming.sentence_splitter import split_sentences
 from isales_engine.streaming.types import RefereeResult
+
+if TYPE_CHECKING:
+    from isales_engine.providers.llm_registry import LLMRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +88,7 @@ class PipelineStream:
         is_wrap_up: bool,
         pipeline_timeout_ms: int,
         restructure_text: str | None = None,
+        llm_registry: LLMRegistry | None = None,
     ) -> None:
         self._session = session
         self._user_input = user_input
@@ -96,6 +101,19 @@ class PipelineStream:
         # this stream re-voices ``restructure_text`` via the restructure slot
         # with no dialog history and no referees.
         self._restructure_text = restructure_text
+        # per-role-llm-config-and-restructure-card: when a registry is provided,
+        # resolve THIS stream's main client by its slot's provider+model
+        # (restructure slot while re-voicing; else main — persona replaces
+        # config.main upstream). Referees resolve per-referee in start(). Without
+        # a registry (unit tests) the passed-in main_llm/referee_llm are used.
+        self._registry = llm_registry
+        if llm_registry is not None:
+            slot = (
+                config.restructure
+                if restructure_text is not None and config.restructure is not None
+                else config.main
+            )
+            self._main_llm = llm_registry.resolve(slot.provider, slot.model)
         # N parallel referee tasks (was a single referee_task). Empty during
         # wrap-up / restructure turns. ``referee_labels`` is the parallel list of
         # labels so the awaiter can build a labelled fail-open on timeout.
@@ -135,6 +153,13 @@ class PipelineStream:
             return
         recent = recent_dialog_rounds(self._session.dialog_history)
         for spec in self._config.referees:
+            # per-role-llm-config-and-restructure-card: each referee uses its own
+            # provider+model when a registry is present.
+            referee_llm = (
+                self._registry.resolve(spec.provider, spec.model)
+                if self._registry is not None
+                else self._referee_llm
+            )
             self.referee_tasks.append(
                 asyncio.create_task(
                     run_referee(
@@ -142,7 +167,7 @@ class PipelineStream:
                         self._user_input,
                         recent,
                         spec,
-                        self._referee_llm,
+                        referee_llm,
                     ),
                     name=f"referee-{spec.label}-turn-{self.turn_id}",
                 )
@@ -362,6 +387,7 @@ def run_pipeline_stream(
     *,
     is_wrap_up: bool = False,
     pipeline_timeout_ms: int = 8000,
+    llm_registry: LLMRegistry | None = None,
 ) -> PipelineStream:
     """Build + start a :class:`PipelineStream` (referee spawned immediately)."""
     stream = PipelineStream(
@@ -372,6 +398,7 @@ def run_pipeline_stream(
         referee_llm,
         is_wrap_up=is_wrap_up,
         pipeline_timeout_ms=pipeline_timeout_ms,
+        llm_registry=llm_registry,
     )
     stream.start()
     return stream
@@ -384,6 +411,7 @@ def run_restructure_stream(
     llm: LLMProvider,
     *,
     pipeline_timeout_ms: int = 8000,
+    llm_registry: LLMRegistry | None = None,
 ) -> PipelineStream:
     """Build + start a restructure :class:`PipelineStream` (no referees).
 
@@ -400,6 +428,7 @@ def run_restructure_stream(
         is_wrap_up=False,
         pipeline_timeout_ms=pipeline_timeout_ms,
         restructure_text=restructure_text,
+        llm_registry=llm_registry,
     )
     stream.start()
     return stream
