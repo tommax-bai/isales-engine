@@ -108,7 +108,7 @@ def test_build_llm_real_providers_require_credentials() -> None:
     with pytest.raises(NotImplementedError, match="app_token"):
         build_llm("volcengine", store=empty_store)
     with pytest.raises(NotImplementedError, match="api_key"):
-        build_llm("openai", store=empty_store)
+        build_llm("dashscope", store=empty_store)
 
 
 def test_build_llm_volcengine_with_credentials() -> None:
@@ -123,23 +123,23 @@ def test_build_llm_volcengine_with_credentials() -> None:
     assert isinstance(provider, OpenAICompatibleLLMProvider)
 
 
-def test_build_llm_openai_with_credentials() -> None:
+def test_build_llm_dashscope_with_credentials() -> None:
     from isales_engine.providers.llm_openai_compatible import (
         OpenAICompatibleLLMProvider,
     )
 
-    store = CredentialStore({"openai": {"api_key": "sk-x"}})
-    provider = build_llm("openai", store=store)
+    store = CredentialStore({"dashscope": {"api_key": "sk-x"}})
+    provider = build_llm("dashscope", store=store)
     assert isinstance(provider, OpenAICompatibleLLMProvider)
 
 
 def test_build_llm_with_explicit_model_override() -> None:
     """Campaign-level model selection: 显式 model 参数覆盖 store default。"""
     store = CredentialStore(
-        {"openai": {"api_key": "sk-x", "default_model": "gpt-4o-mini"}}
+        {"dashscope": {"api_key": "sk-x", "default_model": "qwen-plus"}}
     )
-    provider = build_llm("openai", store=store, model="gpt-4o")
-    assert provider._model == "gpt-4o"  # type: ignore[attr-defined]
+    provider = build_llm("dashscope", store=store, model="qwen-max")
+    assert provider._model == "qwen-max"  # type: ignore[attr-defined]
 
 
 def test_build_asr_mock_works() -> None:

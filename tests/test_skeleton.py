@@ -29,10 +29,10 @@ def test_settings_load_from_env(monkeypatch) -> None:  # type: ignore[no-untyped
 def test_settings_overrides_via_env(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("ISALES_DATABASE_URL", "postgresql+asyncpg://x/y")
     monkeypatch.setenv("ISALES_REDIS_URL", "redis://localhost:6379/0")
-    monkeypatch.setenv("ISALES_ENGINE_LLM_PROVIDER", "openai")
+    monkeypatch.setenv("ISALES_ENGINE_LLM_PROVIDER", "dashscope")
     monkeypatch.setenv("ISALES_ENGINE_PIPELINE_DEFAULT_TIMEOUT_MS", "12000")
 
     settings = Settings()
 
-    assert settings.engine_llm_provider == "openai"
+    assert settings.engine_llm_provider == "dashscope"
     assert settings.engine_pipeline_default_timeout_ms == 12000

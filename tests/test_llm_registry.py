@@ -68,24 +68,24 @@ def test_distinct_provider_model_get_distinct_clients(monkeypatch):
 
 def test_same_provider_model_is_cached(monkeypatch):
     r, _default, built = _make(monkeypatch)
-    a = r.resolve("openai", "gpt-4o")
-    b = r.resolve("openai", "gpt-4o")
+    a = r.resolve("volcengine", "doubao-pro")
+    b = r.resolve("volcengine", "doubao-pro")
     assert a is b
-    assert built == [("openai", "gpt-4o")]  # built exactly once
+    assert built == [("volcengine", "doubao-pro")]  # built exactly once
 
 
 def test_missing_credential_falls_back_to_default_and_warns(monkeypatch, caplog):
-    r, default, built = _make(monkeypatch, bad=frozenset({"openai"}))
+    r, default, built = _make(monkeypatch, bad=frozenset({"volcengine"}))
     with caplog.at_level(logging.WARNING):
-        client = r.resolve("openai", "gpt-4o")
+        client = r.resolve("volcengine", "doubao-pro")
     assert client is default
     assert any(
         "llm_slot_provider_fallback" in rec.getMessage() for rec in caplog.records
     )
     # The failed build is cached as the default → not retried every turn.
-    again = r.resolve("openai", "gpt-4o")
+    again = r.resolve("volcengine", "doubao-pro")
     assert again is default
-    assert built == [("openai", "gpt-4o")]  # only one build attempt
+    assert built == [("volcengine", "doubao-pro")]  # only one build attempt
 
 
 def test_resolve_spec_reads_provider_and_model_attrs(monkeypatch):
@@ -110,7 +110,7 @@ def test_resolve_spec_without_provider_uses_default(monkeypatch):
 
 async def test_aclose_all_closes_default_and_every_cached_client(monkeypatch):
     r, default, _built = _make(monkeypatch)
-    c1 = r.resolve("openai", "gpt-4o")
+    c1 = r.resolve("volcengine", "doubao-pro")
     c2 = r.resolve("dashscope", "qwen-plus")
     await r.aclose_all()
     assert default.closed

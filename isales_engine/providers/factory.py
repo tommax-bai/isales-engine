@@ -5,14 +5,14 @@ Spec: provider-abc § Requirement: Provider ABC 集中定义在 isales-common;
       再读 DB"。
 
 Stage-4 mock providers are always available (used by tests + dev mock mode).
-Real providers (volcengine / openai / dashscope) read credentials from a
+Real providers (volcengine / dashscope) read credentials from a
 ``CredentialStore`` (装载自 ``provider_credential`` 表) — env 不再持有
 provider 密钥。
 
 凭据来源:
 - ``mock``: 不需凭据。
 - ``volcengine``: ``app_key`` + ``app_token`` (双密钥)。
-- ``openai`` / ``dashscope``: ``api_key`` + ``endpoint`` (可选)。
+- ``dashscope``: ``api_key`` + ``endpoint`` (可选)。
 
 调用方 (engine main.py / 测试) 负责在 startup 装载 CredentialStore 并
 透传给 ``build_*``；store=None 仅在 mock 路径下合法 (NotImplementedError
@@ -37,7 +37,7 @@ from isales_engine.providers.tts_mock import TextLengthMockTTS
 # this constant + the corresponding build_* branch + the
 # ``ALLOWED_PROVIDER_IDS`` in isales-api routers/provider_credentials.py.
 KNOWN_LLM_PROVIDERS: frozenset[str] = frozenset(
-    {"mock", "volcengine", "openai", "dashscope"}
+    {"mock", "volcengine", "dashscope"}
 )
 KNOWN_ASR_PROVIDERS: frozenset[str] = frozenset({"mock", "volcengine"})
 KNOWN_TTS_PROVIDERS: frozenset[str] = frozenset({"mock", "volcengine"})
@@ -47,7 +47,6 @@ KNOWN_TTS_PROVIDERS: frozenset[str] = frozenset({"mock", "volcengine"})
 # missing the optional `endpoint` field. Volcengine LLM uses ark.
 _DEFAULT_ENDPOINT: dict[str, str] = {
     "volcengine_llm": "https://ark.cn-beijing.volces.com/api/v3",
-    "openai_llm": "https://api.openai.com/v1",
     "dashscope_llm": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "volcengine_asr": "wss://openspeech.bytedance.com/api/v3/asr",
     "volcengine_tts": "https://openspeech.bytedance.com/api/v1",
@@ -55,7 +54,6 @@ _DEFAULT_ENDPOINT: dict[str, str] = {
 
 _DEFAULT_MODEL: dict[str, str] = {
     "volcengine": "doubao-pro-32k",
-    "openai": "gpt-4o-mini",
     "dashscope": "qwen-plus",
 }
 
@@ -110,14 +108,6 @@ def build_llm(
             api_key=api_key,
             base_url=s.get("volcengine", "endpoint") or _DEFAULT_ENDPOINT["volcengine_llm"],
             model=model or s.get("volcengine", "default_model") or _DEFAULT_MODEL["volcengine"],
-        )
-    if name == "openai":
-        api_key = _require_field(s, "openai", "api_key")
-        return OpenAICompatibleLLMProvider(
-            provider="openai",
-            api_key=api_key,
-            base_url=s.get("openai", "endpoint") or _DEFAULT_ENDPOINT["openai_llm"],
-            model=model or s.get("openai", "default_model") or _DEFAULT_MODEL["openai"],
         )
     if name == "dashscope":
         api_key = _require_field(s, "dashscope", "api_key")

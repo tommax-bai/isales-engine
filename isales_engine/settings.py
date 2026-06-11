@@ -1,6 +1,6 @@
 """Process-level settings loaded from environment variables.
 
-provider 凭据 (volcengine app_key/app_token, openai api_key 等) 不再
+provider 凭据 (volcengine app_key/app_token, dashscope api_key 等) 不再
 从 env 读取，转走 provider_credential 表 + CredentialStore。本 Settings
 对象只持有非凭据配置 (DB URL、provider 名字、telephony 模式等)。
 

@@ -1,12 +1,12 @@
-"""OpenAI-compatible LLM provider (used for OpenAI + 火山豆包 + 兼容服务).
+"""OpenAI-compatible LLM provider (火山豆包 / dashscope 等 OpenAI 兼容服务).
 
 Spec: provider-abc § Requirement: LLM Provider chat 接口与 JSON Mode;
       role-prompt § Requirement: JSON Mode 强制策略.
 
-Both OpenAI and 火山豆包 expose a compatible Chat Completions endpoint
-(``POST {base_url}/chat/completions``) with ``response_format={"type":
-"json_object"}`` for native JSON Mode. We wrap a single httpx call with the
-``ProviderError`` mapping from ``providers/_errors.py``.
+火山豆包 (ark) 与 dashscope (通义千问 OpenAI 兼容模式) 都暴露 OpenAI 兼容的
+Chat Completions endpoint (``POST {base_url}/chat/completions``) with
+``response_format={"type": "json_object"}`` for native JSON Mode. We wrap a
+single httpx call with the ``ProviderError`` mapping from ``providers/_errors.py``.
 """
 
 from __future__ import annotations
@@ -36,9 +36,9 @@ class OpenAICompatibleLLMProvider(LLMProvider):
     """Implements LLMProvider against any OpenAI-compatible chat-completions API.
 
     Used for:
-      * OpenAI         — ``base_url=https://api.openai.com/v1``
       * Volcengine 豆包 — ``base_url=https://ark.cn-beijing.volces.com/api/v3``
-      * Azure OpenAI / 第三方兼容 — ``base_url`` to the matching prefix
+      * DashScope 通义   — ``base_url=https://dashscope.aliyuncs.com/compatible-mode/v1``
+      * 其他第三方 OpenAI 兼容服务 — ``base_url`` to the matching prefix
 
     The ``provider`` label is carried on every ``ProviderError`` so logs +
     runbooks can attribute failures.

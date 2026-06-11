@@ -34,7 +34,7 @@ def test_factory_rejects_real_providers_without_credentials() -> None:
 
     # 1) store=None → 任何非 mock provider 都报错。
     with pytest.raises(NotImplementedError):
-        build_llm("openai")
+        build_llm("dashscope")
     with pytest.raises(NotImplementedError):
         build_asr("volcengine")
     with pytest.raises(NotImplementedError):
@@ -43,7 +43,7 @@ def test_factory_rejects_real_providers_without_credentials() -> None:
     # 2) store 在但缺字段 → 同样报错。
     empty_store = CredentialStore()
     with pytest.raises(NotImplementedError):
-        build_llm("openai", store=empty_store)
+        build_llm("dashscope", store=empty_store)
     with pytest.raises(NotImplementedError):
         build_asr("volcengine", store=empty_store)
 
@@ -71,28 +71,8 @@ def test_asr_partial_stable_s_default_and_override() -> None:
     assert overridden._partial_stable_s == 0.25
 
 
-def test_factory_builds_openai_llm_from_store() -> None:
-    """Smoke: store 含 api_key → build_llm 不抛。
-
-    实际 HTTP 调用走 live-provider-tests gate；这里仅验证 store 装载路径。
-    """
-    from isales_common.credentials import CredentialStore
-
-    store = CredentialStore(
-        {
-            "openai": {
-                "api_key": "sk-test-1234",
-                "endpoint": "https://api.openai.com/v1",
-                "default_model": "gpt-4o-mini",
-            }
-        }
-    )
-    provider = build_llm("openai", store=store)
-    assert provider is not None
-
-
 def test_factory_builds_dashscope_llm_from_store() -> None:
-    """dashscope 是新加入的 LLM provider (OpenAI 兼容模式)。"""
+    """dashscope 是 LLM provider (OpenAI 兼容模式)；验证 store 装载路径不抛。"""
     from isales_common.credentials import CredentialStore
 
     store = CredentialStore(
