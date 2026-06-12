@@ -1,15 +1,22 @@
-"""Assemble system / user messages for the main LLM call.
+"""Assemble native multi-turn messages for the main LLM call.
 
-Spec: role-prompt § "System message 内容" / "User message 拼接结构" /
+Spec: role-prompt § "Prompt 三段式组装" (System message 内容 / 会话级静态上下文置于
+system message / 对话历史映射为多轮 message / 使用标准 chat multi-turn) /
 "收尾期间在 system prompt 末尾追加指令" / "跟进通话的 prompt 增强".
+
+engine-main-native-multiturn: the main LLM receives a single system message
+followed by ``dialog_history`` mapped 1:1 to native user/assistant chat turns
+— NOT a flattened single-user-message transcript. This mirrors voxen's main
+dialogue line (core/llm/chat_history.go GetHistory); the flattened format is
+intentionally kept only for the referee (referee._render_dialog_history_for_referee).
 
 pipeline-stream-and-referee: the judge / polish builders and the
 ROLE/JUDGE/POLISH_OUTPUT_SCHEMA_SUFFIX constants are gone. The main LLM now
 emits **plain text** (no JSON Mode), so the engine MUST NOT inject any
 output-format suffix — the campaign-authored prompt owns its output rules
 (role-prompt § "输出格式约束必须保留" — engine MUST NOT 强制注入约束). The only
-engine-appended segment is the WRAPPING_UP closing instruction, which MUST be
-last.
+engine-appended instruction segment is the WRAPPING_UP closing instruction,
+which MUST be last.
 """
 
 from __future__ import annotations
@@ -40,7 +47,7 @@ WRAP_UP_APPEND = """
 FOLLOW_UP_APPEND_TEMPLATE = """
 
 【跟进上下文】
-这是对该用户的第 {n} 次跟进。请根据下面的【上次通话纪要】调整开场和后续话术，避免重复内容。
+这是对该用户的第 {n} 次跟进。请根据上述【上次通话纪要】调整开场和后续话术，避免重复内容。
 """
 
 SHORT_REPLY_APPEND = "\n\n【打断保护】请用一句话回应。"
@@ -108,12 +115,20 @@ def build_main_messages(
     *,
     is_wrap_up: bool,
 ) -> list[Message]:
-    """Assemble the [system, user] messages for one main LLM streaming call.
+    """Assemble native multi-turn messages for one main LLM streaming call.
 
-    The whole conversation goes in a single user message (role-prompt § "不使用
-    标准 chat multi-turn"). No output-format suffix is injected.
+    Returns ``[system] + dialog_history mapped to native user/assistant turns``
+    (role-prompt § "使用标准 chat multi-turn"). Session-static context (last-call
+    summary + lead info) lives in the system message — it is context, not a
+    dialogue turn — placed before the instruction appends so WRAP_UP_APPEND stays
+    last. No flattened transcript, no trailing "AI:" hook: the latest user turn is
+    naturally the last message and the model generates the next assistant reply.
+    No output-format suffix is injected.
     """
     system = config.main.system_prompt
+    # Session-static context first so the instruction appends below it stay
+    # contiguous and WRAP_UP_APPEND remains the literal tail.
+    system += _render_context(config)
     if config.follow_up_count > 0:
         system += FOLLOW_UP_APPEND_TEMPLATE.format(n=config.follow_up_count)
     if config.short_reply_active:
@@ -122,8 +137,12 @@ def build_main_messages(
     if is_wrap_up:
         system += WRAP_UP_APPEND
 
-    user = _build_user_message(session, config)
-    return [Message(role="system", content=system), Message(role="user", content=user)]
+    messages: list[Message] = [Message(role="system", content=system)]
+    # dialog_history → native multi-turn. DialogTurn.role is already
+    # "user" (user_speech) / "assistant" (greeting, ai_reply); map 1:1.
+    for turn in session.dialog_history:
+        messages.append(Message(role=turn.role, content=turn.text))
+    return messages
 
 
 def build_greeting_messages(config: PipelineConfig) -> list[Message]:
@@ -136,24 +155,21 @@ def build_greeting_messages(config: PipelineConfig) -> list[Message]:
     return [Message(role="system", content=system), Message(role="user", content=user)]
 
 
-def _build_user_message(session: CallSession, config: PipelineConfig) -> str:
+def _render_context(config: PipelineConfig) -> str:
+    """Session-static context appended to the system message (not a dialogue turn).
+
+    【上次通话纪要】(follow-up only) + 【线索信息】, set off from the campaign prompt
+    body by a separator. The dialogue itself is carried by native multi-turn
+    messages in ``build_main_messages`` — see role-prompt § "会话级静态上下文置于
+    system message".
+    """
     parts: list[str] = []
     if config.last_call_summary and config.follow_up_count > 0:
         parts.append("【上次通话纪要】\n" + config.last_call_summary)
     parts.append(_render_lead_info(config.lead))
-    parts.append(_render_dialog(session))
-    return "\n\n".join(parts)
+    return "\n\n---\n" + "\n\n".join(parts)
 
 
 def _render_lead_info(lead: LeadInfo) -> str:
     custom = ", ".join(f"{k}={v}" for k, v in lead.custom_data.items()) or "—"
     return f"【线索信息】name={lead.name or '—'}, phone={lead.phone}, custom_data={custom}"
-
-
-def _render_dialog(session: CallSession) -> str:
-    lines = ["【对话】"]
-    for turn in session.dialog_history:
-        prefix = "用户" if turn.role == "user" else "AI"
-        lines.append(f"{prefix}: {turn.text}")
-    lines.append("AI:")
-    return "\n".join(lines)
