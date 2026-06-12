@@ -214,6 +214,7 @@ async def load_runtime_config(
         restructure=_restructure_spec(_first(RoleKind.RESTRUCTURE)),
         routing_rules=[dict(r) for r in (campaign.routing_rules or [])],
         max_continuous_restructure=campaign.max_continuous_restructure,
+        auto_restructure_on_interrupt=campaign.auto_restructure_on_interrupt,
         extractor=_extractor_spec(_first(RoleKind.EXTRACTOR)),
         default_replies=[str(r) for r in (campaign.default_replies or [])],
         lead=LeadInfo(

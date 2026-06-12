@@ -1298,6 +1298,29 @@ async def _run_gated_turn(
         config.pipeline.routing_rules,
         restructure_enabled=config.pipeline.restructure is not None,
     )
+    # engine-auto-restructure-on-interrupt: when the prior turn was barge-in
+    # interrupted (interrupt_remaining_text set) and NO explicit routing rule
+    # vetoed (decide() fell through to continue), resume the cut-off line via
+    # restructure instead of replying. decide() stays pure — this is the only
+    # call-site override, and only takes the no-match fallback slot (referee +
+    # explicit rules are the veto via first-match-wins). Removal trigger: drop
+    # when restructure routing becomes first-class per-rule with a default
+    # template. (ai-pipeline § 被打断自动重组开关)
+    if (
+        action.kind == "continue"
+        and config.pipeline.auto_restructure_on_interrupt
+        and config.pipeline.restructure is not None
+        and session.interrupt_remaining_text
+    ):
+        action = DeciderAction(
+            kind="restructure",
+            source="interrupt_remaining",
+            restructure_trigger="interrupt_remaining",
+        )
+        logger.info(
+            "auto_restructure_on_interrupt fired (call_record_id=%s)",
+            session.call_record_id,
+        )
     sel = _select_gated_route(action, config)
 
     async def _cancel_candidates(except_id: str | None = None) -> None:

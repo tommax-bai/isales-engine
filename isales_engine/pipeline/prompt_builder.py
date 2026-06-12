@@ -75,6 +75,11 @@ class PipelineConfig:
     # Raw routing rules (list of dicts) as stored in campaign.routing_rules.
     routing_rules: list[dict[str, Any]] = field(default_factory=list)
     max_continuous_restructure: int = 2
+    # engine-auto-restructure-on-interrupt: when True, a barge-in-interrupted turn
+    # (session.interrupt_remaining_text set) with no explicit routing-rule match
+    # falls through to restructure(interrupt_remaining) instead of continue. The
+    # referee gate + explicit rules stay the veto (first-match-wins).
+    auto_restructure_on_interrupt: bool = False
     last_call_summary: str | None = None
     follow_up_count: int = 0
     short_reply_active: bool = False

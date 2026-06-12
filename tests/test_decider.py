@@ -135,6 +135,17 @@ def test_no_rule_match_falls_through_to_continue():
     assert action.kind == "continue"
 
 
+def test_decider_stays_pure_no_auto_restructure_knowledge():
+    # engine-auto-restructure-on-interrupt: decide() has NO session / switch /
+    # interrupt_remaining_text awareness — it always returns continue on no-match.
+    # The auto-restructure override lives ONLY at the run_loop call site, so
+    # decide()'s contract is unchanged regardless of campaign switches.
+    results = [_r("main_judge", "continue", confidence=1.0)]
+    action = decide(results, [], restructure_enabled=True)
+    assert action.kind == "continue"
+    assert action.matched_rule is None
+
+
 def test_tool_action_carries_per_rule_closing_phrase():
     # §11: a tool rule's per-keyword closing_phrase rides on the DeciderAction so
     # one hangup tool can be reused across keywords with different phrases.

@@ -60,6 +60,7 @@ def _make_config(
     enable_restructure: bool = False,
     routing_rules: list | None = None,
     max_continuous_restructure: int = 2,
+    auto_restructure_on_interrupt: bool = False,
     # Legacy params kept for call-site compatibility; the dual-LLM pipeline has
     # exactly one main / referee / extractor slot (no N-role / M-judge PK).
     n_roles: int = 1,
@@ -116,6 +117,7 @@ def _make_config(
             },
         ],
         max_continuous_restructure=max_continuous_restructure,
+        auto_restructure_on_interrupt=auto_restructure_on_interrupt,
         restructure=restructure_spec,
         extractor=ExtractorSpec(
             role_config_id=500, prompt_version_id=600, system_prompt="抽取字段。"
@@ -511,6 +513,173 @@ async def test_run_session_restructure_caps_then_plays_default() -> None:
     # has restructure_active=False even though the rule matched restructure.
     active = [t for t in session.pipeline_trace_records if t["restructure_active"]]
     assert len(active) == 1, "only the first (uncapped) turn should re-voice"
+
+
+async def test_auto_restructure_on_interrupt_fires_without_rule() -> None:
+    """auto_restructure_on_interrupt: when a prior barge-in left
+    interrupt_remaining_text and NO explicit routing rule matches, the turn
+    resumes the cut-off line (restructure source=interrupt_remaining) instead of
+    replying. (engine-auto-restructure-on-interrupt)"""
+    session = _make_session()
+    session.interrupt_remaining_text = "那我先帮您把套餐"  # leftover from a prior barge-in
+    config = _make_config(
+        enable_restructure=True,
+        routing_rules=[],  # no explicit rule → decide() falls through to continue
+        auto_restructure_on_interrupt=True,
+        silence_threshold_ms=3000,
+    )
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    async def driver() -> None:
+        await asyncio.sleep(0.05)
+        await asr.feed_turn("嗯你继续")  # trivial interjection, matches no rule
+        await asyncio.sleep(0.2)
+        await tel.simulate_remote_hangup(1)
+
+    driver_task = asyncio.create_task(driver())
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await driver_task
+
+    traces = session.pipeline_trace_records
+    assert traces, "expected at least one PROCESSING trace"
+    first = traces[0]
+    assert first["restructure_active"] is True
+    assert first["restructure_trigger"] == "interrupt_remaining"
+    assert first["restructure_source_text"]  # the captured leftover was re-voiced
+    assert session.consecutive_restructure_count >= 1
+
+
+async def test_auto_restructure_vetoed_by_explicit_rule() -> None:
+    """The auto fallback only takes the no-match slot: an explicit routing rule
+    that matches the referee category wins (first-match-wins veto), so NO auto
+    restructure even though interrupt_remaining_text is set."""
+    session = _make_session()
+    session.interrupt_remaining_text = "那我先帮您把套餐"
+    veto_rule = [
+        {
+            "referee": "main_judge",
+            "match": ["continue"],
+            "action": {"type": "transition", "to": "customer_decline"},
+        }
+    ]
+    config = _make_config(
+        enable_restructure=True,
+        routing_rules=veto_rule,
+        auto_restructure_on_interrupt=True,
+        silence_threshold_ms=3000,
+    )
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    async def driver() -> None:
+        await asyncio.sleep(0.05)
+        await asr.feed_turn("随便聊聊")  # mock referee → "continue", matches veto rule
+        await asyncio.sleep(0.2)
+        await tel.simulate_remote_hangup(1)
+
+    driver_task = asyncio.create_task(driver())
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await driver_task
+
+    assert all(
+        not t["restructure_active"] for t in session.pipeline_trace_records
+    ), "explicit rule must veto the auto restructure"
+
+
+async def test_auto_restructure_noop_without_restructure_slot() -> None:
+    """Switch ON but no restructure slot configured → fallback stays continue, no
+    error, no restructure."""
+    session = _make_session()
+    session.interrupt_remaining_text = "那我先帮您把套餐"
+    config = _make_config(
+        enable_restructure=False,  # no restructure slot
+        routing_rules=[],
+        auto_restructure_on_interrupt=True,
+        silence_threshold_ms=3000,
+    )
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    async def driver() -> None:
+        await asyncio.sleep(0.05)
+        await asr.feed_turn("嗯你继续")
+        await asyncio.sleep(0.2)
+        await tel.simulate_remote_hangup(1)
+
+    driver_task = asyncio.create_task(driver())
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await driver_task
+
+    assert all(not t.get("restructure_active") for t in session.pipeline_trace_records)
+
+
+async def test_auto_restructure_noop_without_interrupt_remaining() -> None:
+    """Switch ON but no barge-in this turn (interrupt_remaining_text empty) →
+    fallback stays continue."""
+    session = _make_session()  # interrupt_remaining_text stays None
+    config = _make_config(
+        enable_restructure=True,
+        routing_rules=[],
+        auto_restructure_on_interrupt=True,
+        silence_threshold_ms=3000,
+    )
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    async def driver() -> None:
+        await asyncio.sleep(0.05)
+        await asr.feed_turn("嗯你继续")
+        await asyncio.sleep(0.2)
+        await tel.simulate_remote_hangup(1)
+
+    driver_task = asyncio.create_task(driver())
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await driver_task
+
+    assert all(not t["restructure_active"] for t in session.pipeline_trace_records)
+
+
+async def test_auto_restructure_off_ignores_interrupt_remaining() -> None:
+    """Switch OFF (default): even with interrupt_remaining_text set and no rule
+    match, the turn falls through to continue — byte-for-byte unchanged."""
+    session = _make_session()
+    session.interrupt_remaining_text = "那我先帮您把套餐"
+    config = _make_config(
+        enable_restructure=True,
+        routing_rules=[],
+        auto_restructure_on_interrupt=False,
+        silence_threshold_ms=3000,
+    )
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    async def driver() -> None:
+        await asyncio.sleep(0.05)
+        await asr.feed_turn("嗯你继续")
+        await asyncio.sleep(0.2)
+        await tel.simulate_remote_hangup(1)
+
+    driver_task = asyncio.create_task(driver())
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await driver_task
+
+    assert all(not t["restructure_active"] for t in session.pipeline_trace_records)
 
 
 # Silence the unused-import linter for ASRResult (used in type hints in the
