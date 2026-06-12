@@ -230,7 +230,7 @@ def test_wrapup_rounds_exhausted_returns_closing_phrase() -> None:
         rounds_so_far=2, started_at_monotonic=100.0, config=_wcfg(), now_monotonic=101.0
     )
     assert d.proceed is False
-    assert d.reason == "rounds_exhausted"
+    assert d.reason == "max_rounds"
     assert d.closing_phrase == "好的再见。"
 
 
@@ -242,7 +242,7 @@ def test_wrapup_seconds_exhausted() -> None:
         now_monotonic=120.0,
     )
     assert d.proceed is False
-    assert d.reason == "seconds_exhausted"
+    assert d.reason == "max_seconds"
 
 
 def test_wrapup_no_started_at_means_only_rounds_apply() -> None:

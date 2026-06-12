@@ -105,7 +105,7 @@
       "type": "ai_reply"
     },
     {
-      "reason": "rounds_exhausted",
+      "reason": "max_rounds",
       "ts": "<volatile>",
       "type": "wrap_up_completed"
     },

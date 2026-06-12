@@ -31,7 +31,12 @@ class WrapUpDecision:
 
     proceed: bool
     closing_phrase: str
-    reason: str  # "rounds_exhausted" / "seconds_exhausted" / "ok"
+    # On proceed=False this value is persisted verbatim as the
+    # ``wrap_up_completed`` transcript event's ``reason`` (run_loop.py), so it
+    # MUST stay within that event's spec vocabulary
+    # ``Literal["max_rounds", "max_seconds"]`` (transcript spec § event table).
+    # "ok" is the proceed=True sentinel and is never persisted.
+    reason: str  # "max_rounds" / "max_seconds" / "ok"
 
 
 def evaluate_wrap_up(
@@ -47,7 +52,7 @@ def evaluate_wrap_up(
         return WrapUpDecision(
             proceed=False,
             closing_phrase=_pick_phrase(config),
-            reason="rounds_exhausted",
+            reason="max_rounds",
         )
     if started_at_monotonic is not None:
         now = now_monotonic if now_monotonic is not None else time.monotonic()
@@ -55,7 +60,7 @@ def evaluate_wrap_up(
             return WrapUpDecision(
                 proceed=False,
                 closing_phrase=_pick_phrase(config),
-                reason="seconds_exhausted",
+                reason="max_seconds",
             )
     return WrapUpDecision(proceed=True, closing_phrase="", reason="ok")
 
