@@ -103,9 +103,13 @@ def test_build_llm_mock_works() -> None:
 
 
 def test_build_llm_real_providers_require_credentials() -> None:
-    """store=None 或 store 缺字段 = NotImplementedError."""
+    """store=None 或 store 缺字段 = NotImplementedError.
+
+    split-model-and-speech-provider-config: 火山方舟 Ark LLM 读
+    volcengine.api_key (ark key), 缺它即报错 (不再误读语音 app_token)。
+    """
     empty_store = CredentialStore()
-    with pytest.raises(NotImplementedError, match="app_token"):
+    with pytest.raises(NotImplementedError, match="api_key"):
         build_llm("volcengine", store=empty_store)
     with pytest.raises(NotImplementedError, match="api_key"):
         build_llm("dashscope", store=empty_store)
@@ -116,8 +120,9 @@ def test_build_llm_volcengine_with_credentials() -> None:
         OpenAICompatibleLLMProvider,
     )
 
+    # ark LLM key 持在 volcengine.api_key (非 app_token)。
     store = CredentialStore(
-        {"volcengine": {"app_token": "t", "app_key": "k"}}
+        {"volcengine": {"api_key": "ark-uuid-key"}}
     )
     provider = build_llm("volcengine", store=store)
     assert isinstance(provider, OpenAICompatibleLLMProvider)
@@ -147,19 +152,20 @@ def test_build_asr_mock_works() -> None:
 
 
 def test_build_asr_volcengine_requires_credentials() -> None:
-    """缺 app_key / app_token 任一字段 = NotImplementedError."""
+    """缺 app_key / app_token 任一字段 = NotImplementedError
+    (语音 provider_id = volcengine_speech, split-model-and-speech-provider-config)."""
     empty_store = CredentialStore()
     with pytest.raises(NotImplementedError, match="app_key"):
-        build_asr("volcengine", store=empty_store)
+        build_asr("volcengine_speech", store=empty_store)
 
 
 def test_build_asr_volcengine_with_credentials() -> None:
     from isales_engine.providers.asr_volcengine import VolcengineASRProvider
 
     store = CredentialStore(
-        {"volcengine": {"app_key": "k", "app_token": "t"}}
+        {"volcengine_speech": {"app_key": "k", "app_token": "t"}}
     )
-    provider = build_asr("volcengine", store=store)
+    provider = build_asr("volcengine_speech", store=store)
     assert isinstance(provider, VolcengineASRProvider)
 
 
@@ -171,7 +177,7 @@ def test_build_tts_volcengine_requires_credentials() -> None:
 
     empty_store = CredentialStore()
     with pytest.raises(ProviderInvalidRequest, match="app_key"):
-        build_tts("volcengine", store=empty_store)
+        build_tts("volcengine_speech", store=empty_store)
 
 
 def test_unknown_provider_lists_known_set() -> None:

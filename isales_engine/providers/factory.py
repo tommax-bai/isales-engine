@@ -9,10 +9,13 @@ Real providers (volcengine / dashscope) read credentials from a
 ``CredentialStore`` (装载自 ``provider_credential`` 表) — env 不再持有
 provider 密钥。
 
-凭据来源:
+凭据来源 (split-model-and-speech-provider-config — 火山两条产品线两套密钥):
 - ``mock``: 不需凭据。
-- ``volcengine``: ``app_key`` + ``app_token`` (双密钥)。
-- ``dashscope``: ``api_key`` + ``endpoint`` (可选)。
+- ``volcengine`` (LLM, 火山方舟 Ark 豆包大模型): ``api_key`` (ark key) +
+  ``endpoint`` + ``default_model``。
+- ``volcengine_speech`` (ASR/TTS, 豆包语音): ``api_key`` (新版 X-Api-Key) /
+  ``app_key`` + ``app_token`` (旧版) + ``*_resource_id``。
+- ``dashscope`` (LLM): ``api_key`` + ``endpoint`` (可选)。
 
 调用方 (engine main.py / 测试) 负责在 startup 装载 CredentialStore 并
 透传给 ``build_*``；store=None 仅在 mock 路径下合法 (NotImplementedError
@@ -39,8 +42,11 @@ from isales_engine.providers.tts_mock import TextLengthMockTTS
 KNOWN_LLM_PROVIDERS: frozenset[str] = frozenset(
     {"mock", "volcengine", "dashscope"}
 )
-KNOWN_ASR_PROVIDERS: frozenset[str] = frozenset({"mock", "volcengine"})
-KNOWN_TTS_PROVIDERS: frozenset[str] = frozenset({"mock", "volcengine"})
+# 语音 (ASR/TTS) 与 LLM 分属不同产品线/provider_id
+# (split-model-and-speech-provider-config): 火山语音 = ``volcengine_speech``,
+# 持语音密钥; ``volcengine`` 仅作火山方舟 Ark LLM id。
+KNOWN_ASR_PROVIDERS: frozenset[str] = frozenset({"mock", "volcengine_speech"})
+KNOWN_TTS_PROVIDERS: frozenset[str] = frozenset({"mock", "volcengine_speech"})
 
 
 # Provider-specific defaults for endpoint when the credential row is
@@ -102,7 +108,11 @@ def build_llm(
     s = _require(store, name)
 
     if name == "volcengine":
-        api_key = _require_field(s, "volcengine", "app_token")
+        # 火山方舟 Ark LLM 用独立的 ark API Key (UUID), 持在
+        # volcengine.api_key。历史 bug: 这里曾误读 app_token (语音旧版 token),
+        # 每轮 401 "format incorrect" — split-model-and-speech-provider-config
+        # 修正为读 api_key (语音密钥已搬到 volcengine_speech, 不再混读)。
+        api_key = _require_field(s, "volcengine", "api_key")
         return OpenAICompatibleLLMProvider(
             provider="volcengine",
             api_key=api_key,
@@ -144,22 +154,24 @@ def build_asr(
             f"(known: {sorted(KNOWN_ASR_PROVIDERS)})"
         )
     s = _require(store, name)
-    if name == "volcengine":
+    if name == "volcengine_speech":
         # 豆包 V3 SAUC ASR 两套鉴权 (vendor 文档 § 鉴权), 跟 TTS V3 同一模型:
-        #   1. 新版控制台: X-Api-Key 单 UUID (provider_credential.volcengine.api_key)
-        #   2. 旧版控制台: X-Api-App-Key + X-Api-Access-Key (复用 volcengine.app_key
-        #      / app_token 的现存值, 注意 ASR 用 X-Api-App-Key header 名,TTS 用
+        #   1. 新版控制台: X-Api-Key 单 UUID (volcengine_speech.api_key)
+        #   2. 旧版控制台: X-Api-App-Key + X-Api-Access-Key (volcengine_speech
+        #      .app_key / app_token, 注意 ASR 用 X-Api-App-Key header 名,TTS 用
         #      X-Api-App-Id, vendor 文档命名不一致但本质同一字段)
-        # resource_id 决定 ASR 模型版本 (volc.bigasr.sauc.duration 1.0 /
-        # volc.seedasr.sauc.duration 2.0 / .concurrent 并发版).
+        # 凭据读自 volcengine_speech (与火山方舟 Ark LLM 的 volcengine 分开,
+        # split-model-and-speech-provider-config)。resource_id 决定 ASR 模型版本
+        # (volc.bigasr.sauc.duration 1.0 / volc.seedasr.sauc.duration 2.0 /
+        # .concurrent 并发版).
         from isales_engine.providers.asr_volcengine import (  # noqa: PLC0415
             DEFAULT_ASR_RESOURCE_ID,
             VolcengineASRProvider,
         )
 
-        api_key = s.get("volcengine", "api_key")
+        api_key = s.get("volcengine_speech", "api_key")
         resource_id = (
-            s.get("volcengine", "asr_resource_id") or DEFAULT_ASR_RESOURCE_ID
+            s.get("volcengine_speech", "asr_resource_id") or DEFAULT_ASR_RESOURCE_ID
         )
         # None lets the provider keep its own DEFAULT_PARTIAL_STABLE_S.
         if api_key:
@@ -169,8 +181,8 @@ def build_asr(
                 partial_stable_s=partial_stable_s,
             )
         # legacy fallback
-        app_key = _require_field(s, "volcengine", "app_key")
-        app_token = _require_field(s, "volcengine", "app_token")
+        app_key = _require_field(s, "volcengine_speech", "app_key")
+        app_token = _require_field(s, "volcengine_speech", "app_token")
         return VolcengineASRProvider(
             app_key=app_key,
             access_key=app_token,
@@ -191,10 +203,11 @@ def build_tts(
             f"(known: {sorted(KNOWN_TTS_PROVIDERS)})"
         )
     s = _require(store, name)
-    if name == "volcengine":
+    if name == "volcengine_speech":
         # 豆包 V3 SSE TTS 构造统一下沉到 isales-common, 供 engine + api 共用
-        # (campaign-greeting-tts-preview § 决策 1). 新版 X-Api-Key 优先, 没配
-        # 再降旧版 app_key/app_token 三件套; resource_id 决定模型 SKU.
+        # (campaign-greeting-tts-preview § 决策 1). build_volcengine_tts 读
+        # volcengine_speech 凭据 (新版 X-Api-Key 优先, 没配再降旧版
+        # app_key/app_token 三件套; resource_id 决定模型 SKU)。
         from isales_common.providers.tts_volcengine import build_volcengine_tts
 
         return build_volcengine_tts(s)

@@ -3,8 +3,9 @@
 The provider implementation + its SSE/error/reuse tests moved to isales-common
 (campaign-greeting-tts-preview § 决策 1); see
 isales-common/tests/test_tts_volcengine.py. What remains engine-specific is
-that ``isales_engine.providers.factory.build_tts`` routes "volcengine" to the
-shared constructor.
+that ``isales_engine.providers.factory.build_tts`` routes "volcengine_speech"
+to the shared constructor (split-model-and-speech-provider-config moved the
+语音 provider_id from "volcengine" to "volcengine_speech").
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ def test_factory_volcengine_requires_credentials() -> None:
 
     empty_store = CredentialStore()
     with pytest.raises(ProviderInvalidRequest, match="app_key"):
-        build_tts("volcengine", store=empty_store)
+        build_tts("volcengine_speech", store=empty_store)
 
 
 def test_factory_volcengine_with_credentials() -> None:
@@ -33,6 +34,8 @@ def test_factory_volcengine_with_credentials() -> None:
 
     from isales_engine.providers.factory import build_tts
 
-    store = CredentialStore({"volcengine": {"app_key": "k", "app_token": "t"}})
-    provider = build_tts("volcengine", store=store)
+    store = CredentialStore(
+        {"volcengine_speech": {"app_key": "k", "app_token": "t"}}
+    )
+    provider = build_tts("volcengine_speech", store=store)
     assert isinstance(provider, VolcengineTTSProvider)

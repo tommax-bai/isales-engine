@@ -36,7 +36,7 @@ def test_factory_rejects_real_providers_without_credentials() -> None:
     with pytest.raises(NotImplementedError):
         build_llm("dashscope")
     with pytest.raises(NotImplementedError):
-        build_asr("volcengine")
+        build_asr("volcengine_speech")
     with pytest.raises(NotImplementedError):
         build_tts("alibaba")
 
@@ -45,7 +45,67 @@ def test_factory_rejects_real_providers_without_credentials() -> None:
     with pytest.raises(NotImplementedError):
         build_llm("dashscope", store=empty_store)
     with pytest.raises(NotImplementedError):
-        build_asr("volcengine", store=empty_store)
+        build_asr("volcengine_speech", store=empty_store)
+
+
+def test_volcengine_asr_tts_no_longer_known() -> None:
+    """split-model-and-speech-provider-config: 火山语音 id 改 volcengine_speech;
+    旧的 ``volcengine`` 不再是 ASR/TTS provider (它现在只是 LLM id)。"""
+    from isales_engine.providers.factory import (
+        KNOWN_ASR_PROVIDERS,
+        KNOWN_LLM_PROVIDERS,
+        KNOWN_TTS_PROVIDERS,
+    )
+
+    assert "volcengine_speech" in KNOWN_ASR_PROVIDERS
+    assert "volcengine_speech" in KNOWN_TTS_PROVIDERS
+    assert "volcengine" not in KNOWN_ASR_PROVIDERS
+    assert "volcengine" not in KNOWN_TTS_PROVIDERS
+    # LLM 侧 volcengine 保留 (火山方舟 Ark)。
+    assert "volcengine" in KNOWN_LLM_PROVIDERS
+    assert "volcengine_speech" not in KNOWN_LLM_PROVIDERS
+
+
+def test_build_llm_volcengine_uses_ark_api_key_not_app_token() -> None:
+    """修 bug: build_llm('volcengine') 读 volcengine.api_key (ark key), 绝不读
+    app_token (语音旧版 token) —— 后者已搬到 volcengine_speech。"""
+    from isales_common.credentials import CredentialStore
+
+    from isales_engine.providers.llm_openai_compatible import (
+        OpenAICompatibleLLMProvider,
+    )
+
+    store = CredentialStore(
+        {
+            "volcengine": {"api_key": "ark-uuid-key", "default_model": "ep-xxx"},
+            # 语音 token 放在 volcengine_speech, build_llm 绝不该读到它。
+            "volcengine_speech": {"app_token": "speech-token-should-not-leak"},
+        }
+    )
+    provider = build_llm("volcengine", store=store)
+    assert isinstance(provider, OpenAICompatibleLLMProvider)
+    assert provider._api_key == "ark-uuid-key"
+
+    # 缺 ark api_key → 报错 (即便 volcengine_speech.app_token 存在也不兜底)。
+    no_ark = CredentialStore(
+        {"volcengine_speech": {"app_token": "speech-token"}}
+    )
+    with pytest.raises(NotImplementedError):
+        build_llm("volcengine", store=no_ark)
+
+
+def test_build_tts_reads_volcengine_speech_new_console() -> None:
+    """build_tts('volcengine_speech') 走 volcengine_speech 的 X-Api-Key。"""
+    from isales_common.credentials import CredentialStore
+
+    from isales_common.providers.tts_volcengine import VolcengineTTSProvider
+
+    store = CredentialStore(
+        {"volcengine_speech": {"api_key": "speech-xapi-key"}}
+    )
+    provider = build_tts("volcengine_speech", store=store)
+    assert isinstance(provider, VolcengineTTSProvider)
+    assert provider._api_key == "speech-xapi-key"
 
 
 def test_asr_partial_stable_s_default_and_override() -> None:
@@ -61,12 +121,12 @@ def test_asr_partial_stable_s_default_and_override() -> None:
     assert DEFAULT_PARTIAL_STABLE_S == 0.4
     assert VolcengineASRProvider(api_key="k")._partial_stable_s == 0.4
 
-    store = CredentialStore({"volcengine": {"api_key": "k"}})
-    default_provider = build_asr("volcengine", store=store)
+    store = CredentialStore({"volcengine_speech": {"api_key": "k"}})
+    default_provider = build_asr("volcengine_speech", store=store)
     assert isinstance(default_provider, VolcengineASRProvider)
     assert default_provider._partial_stable_s == 0.4
 
-    overridden = build_asr("volcengine", store=store, partial_stable_s=0.25)
+    overridden = build_asr("volcengine_speech", store=store, partial_stable_s=0.25)
     assert isinstance(overridden, VolcengineASRProvider)
     assert overridden._partial_stable_s == 0.25
 
