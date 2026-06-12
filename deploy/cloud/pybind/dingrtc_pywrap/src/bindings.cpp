@@ -125,6 +125,16 @@ public:
     void unregister_audio_observer() {
         std::lock_guard<std::mutex> lk(mu_);
         if (!engine_ || !registered_observer_) return;
+        // Release the GIL across the vendor unregister. Like
+        // SetEngineEventListener(nullptr) in destroy_unlocked() below,
+        // RegisterAudioFrameObserver(nullptr) may block until an in-flight
+        // observer callback drains on an SDK thread. The audio observer
+        // (audio_observer.cpp) does NOT acquire the GIL today, so this call is
+        // not itself the bug2 deadlock — but holding the GIL across a blocking
+        // vendor teardown call is the same hazard class, so keep all teardown
+        // uniformly GIL-free. (mu_ stays held: serializes against any concurrent
+        // EngineHandle method; SDK callbacks never take mu_, only EngineListener::mu_.)
+        py::gil_scoped_release nogil;
         engine_->RegisterAudioFrameObserver(nullptr);
         registered_observer_ = nullptr;
     }
@@ -295,13 +305,32 @@ private:
     }
     void destroy_unlocked() {
         if (engine_) {
+            // bug2 fix (gdb-confirmed 2026-06-12 on frozen PID 963515): the GIL
+            // MUST be released BEFORE the vendor unregister/destroy calls, not just
+            // around Destroy(). SetEngineEventListener(nullptr) blocks
+            // (std::condition_variable::wait inside libDingRTC) until any in-flight
+            // EngineListener callback returns, and every EngineListener callback
+            // (engine_listener.cpp) begins with py::gil_scoped_acquire. On a REMOTE
+            // hangup the SDK fires a terminal listener callback (OnBye /
+            // OnConnectionStatusChanged / OnLeaveChannelResult) on its event thread
+            // at the same instant the asyncio loop thread runs engine.destroy(). If
+            // we hold the GIL here, the loop thread waits for the callback thread
+            // while the callback thread is parked in take_gil waiting for the GIL we
+            // hold -> permanent deadlock that freezes the engine's single asyncio
+            // loop (all new gRPC connections hang; restart-only recovery).
+            //
+            // Releasing the GIL here is sufficient: the callbacks contend only on
+            // the GIL + EngineListener::mu_ (never EngineHandle::mu_), so keeping mu_
+            // held below serializes correctly without re-introducing the deadlock.
+            // Removal condition: only if DingRTC ever documents fire-and-forget
+            // listener unregister AND this binding stops being driven on the loop
+            // thread (i.e. teardown moves to a thread executor with a push barrier).
+            py::gil_scoped_release nogil;
             if (registered_observer_) {
                 engine_->RegisterAudioFrameObserver(nullptr);
                 registered_observer_ = nullptr;
             }
             engine_->SetEngineEventListener(nullptr);
-            // GIL release: Destroy can block on internal thread joining.
-            py::gil_scoped_release nogil;
             ding::rtc::RtcEngine::Destroy(engine_);
             engine_ = nullptr;
         }
@@ -318,8 +347,10 @@ PYBIND11_MODULE(dingrtc_pywrap, m) {
     m.doc() = "Project-internal pybind11 binding for the DingRTC Linux C++ "
               "SDK 3.x. See openspec/changes/engine-rtc-dingrtc-migration/.";
 
-    // Module version — bumped manually when binding ABI changes.
-    m.attr("__version__") = "0.1.0";
+    // Module version — bumped manually when binding ABI/behavior changes.
+    // 0.1.1: bug2 fix — release GIL across vendor unregister/destroy teardown
+    //        (see EngineHandle::destroy_unlocked / unregister_audio_observer).
+    m.attr("__version__") = "0.1.1";
 
     py::register_exception<DingRtcError>(m, "DingRtcError");
 
