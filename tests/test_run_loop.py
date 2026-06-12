@@ -428,91 +428,9 @@ async def test_assemble_interrupt_text_none_when_no_assistant():
     assert _assemble_interrupt_text(sess, "last_reply") is None
 
 
-# ---- restructure: end-to-end fires, no referee, caps (§4.4/4.6/4.7) --------
-
-_RESTRUCTURE_RULE = [
-    {
-        "referee": "main_judge",
-        "match": ["continue"],
-        "action": {"type": "restructure", "source": "last_reply"},
-    }
-]
-
-
-async def test_run_session_restructure_fires_and_records_trace() -> None:
-    """A continue→restructure rule re-voices the last reply with a
-    restructure-active trace. Under gate-first the gate SELECTS the restructure
-    route up front (no main-reply-first like the old speak-then-judge), so the
-    turn yields exactly one (restructure) ai_reply (§4.4 / §4.7)."""
-    session = _make_session()
-    config = _make_config(
-        enable_restructure=True,
-        routing_rules=_RESTRUCTURE_RULE,
-        silence_threshold_ms=3000,
-    )
-    asr = ScriptedMockASR(partial_step_ms=5)
-    providers = _make_providers(asr=asr)
-    tel = MockTelephonyClient(connect_delay_ms=0)
-
-    async def driver() -> None:
-        await asyncio.sleep(0.05)
-        await asr.feed_turn("随便聊聊")  # mock referee → category "continue"
-        await asyncio.sleep(0.2)
-        await tel.simulate_remote_hangup(1)
-
-    driver_task = asyncio.create_task(driver())
-    await run_session(
-        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
-    )
-    await driver_task
-
-    traces = session.pipeline_trace_records
-    assert traces, "expected at least one PROCESSING trace"
-    first = traces[0]
-    assert first["restructure_active"] is True
-    assert first["restructure_trigger"] == "last_reply"
-    assert first["restructure_source_text"]
-    # gate-first: the gate selects restructure directly, so the only reply is the
-    # re-voiced restructure (legacy played main first → 2 replies; now → 1).
-    ai_replies = [e for e in session.full_transcript if e["type"] == "ai_reply"]
-    assert len(ai_replies) >= 1
-    assert session.consecutive_restructure_count >= 1
-
-
-async def test_run_session_restructure_caps_then_plays_default() -> None:
-    """After max_continuous_restructure consecutive restructures, the engine
-    stops re-voicing and plays a default reply, resetting the counter (§4.6)."""
-    session = _make_session()
-    config = _make_config(
-        enable_restructure=True,
-        routing_rules=_RESTRUCTURE_RULE,
-        max_continuous_restructure=1,
-        silence_threshold_ms=3000,
-    )
-    asr = ScriptedMockASR(partial_step_ms=5)
-    providers = _make_providers(asr=asr)
-    tel = MockTelephonyClient(connect_delay_ms=0)
-
-    async def driver() -> None:
-        await asyncio.sleep(0.05)
-        await asr.feed_turn("第一轮随便说")
-        await asyncio.sleep(0.2)
-        await asr.feed_turn("第二轮还是随便")
-        await asyncio.sleep(0.2)
-        await tel.simulate_remote_hangup(1)
-
-    driver_task = asyncio.create_task(driver())
-    await run_session(
-        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
-    )
-    await driver_task
-
-    # First turn restructures (count→1); second turn is capped (count reset 0).
-    assert session.consecutive_restructure_count == 0
-    # Exactly one restructure actually fired (turn 1). The capped turn's trace
-    # has restructure_active=False even though the rule matched restructure.
-    active = [t for t in session.pipeline_trace_records if t["restructure_active"]]
-    assert len(active) == 1, "only the first (uncapped) turn should re-voice"
+# ---- restructure: now triggered ONLY by the auto_restructure_on_interrupt
+# switch (engine-auto-restructure-on-interrupt removed the restructure routing
+# action; the old rule-driven fires/caps tests went with it). -----------------
 
 
 async def test_auto_restructure_on_interrupt_fires_without_rule() -> None:

@@ -48,10 +48,14 @@ class DeciderAction:
 def decide(
     referee_results: Sequence[RefereeResult],
     routing_rules: Sequence[dict[str, Any]],
-    *,
-    restructure_enabled: bool = False,
 ) -> DeciderAction:
-    """Run first-match-wins over ``routing_rules`` → a single action."""
+    """Run first-match-wins over ``routing_rules`` → a single action.
+
+    ``decide()`` never returns ``kind="restructure"`` — restructure is no longer
+    a routing action (engine-auto-restructure-on-interrupt). It is produced only
+    by the ``campaign.auto_restructure_on_interrupt`` override at the run_loop
+    decide() call site, not here.
+    """
     categories = {r.label: r.effective_category() for r in referee_results}
 
     for rule in routing_rules:
@@ -68,18 +72,6 @@ def decide(
                 kind="transition",
                 to=action.get("to"),
                 goal_type=action.get("goal_type"),
-                matched_rule=rule,
-            )
-        if atype == "restructure":
-            if not restructure_enabled:
-                # D4: restructure action degrades to continue when no
-                # restructure slot is configured.
-                return DeciderAction(kind="continue", matched_rule=rule)
-            source = action.get("source")
-            return DeciderAction(
-                kind="restructure",
-                source=source,
-                restructure_trigger=source,
                 matched_rule=rule,
             )
         # engine-tools-multidialogue-gating: new action types. The action→route

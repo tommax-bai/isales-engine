@@ -1182,7 +1182,11 @@ def _select_gated_route(action: DeciderAction, config: RuntimeConfig) -> _GatedS
             closing_phrase=closing_phrase,
         )
 
-    _BUILTIN_THEN = {"closing": "WRAPPING_UP", "recovery": "ACTIVATING", "restructure": "LISTENING"}
+    # restructure removed as a route target (engine-auto-restructure-on-interrupt):
+    # restructure is reached only via the auto_restructure_on_interrupt switch,
+    # which produces DeciderAction(kind="restructure") handled below — never via a
+    # route action. closing/recovery remain the operator-routable builtin routes.
+    _BUILTIN_THEN = {"closing": "WRAPPING_UP", "recovery": "ACTIVATING"}
 
     if action.kind == "transition":
         if action.to == "goal_achieved":
@@ -1293,11 +1297,7 @@ async def _run_gated_turn(
     referee_results = await _await_referees(
         main_stream, timeout_s=config.pipeline.referee_timeout_ms / 1000.0
     )
-    action: DeciderAction = decide(
-        referee_results,
-        config.pipeline.routing_rules,
-        restructure_enabled=config.pipeline.restructure is not None,
-    )
+    action: DeciderAction = decide(referee_results, config.pipeline.routing_rules)
     # engine-auto-restructure-on-interrupt: when the prior turn was barge-in
     # interrupted (interrupt_remaining_text set) and NO explicit routing rule
     # vetoed (decide() fell through to continue), resume the cut-off line via

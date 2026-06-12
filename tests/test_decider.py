@@ -20,10 +20,12 @@ TRANSFER_RULE = {
     "match": ["OPERATOR"],
     "action": {"type": "transition", "to": "transfer"},
 }
-RESTRUCTURE_RULE = {
+# engine-auto-restructure-on-interrupt: the restructure routing action was
+# removed; a route-to-recovery rule stands in for the ordering tests.
+RECOVERY_RULE = {
     "referee": "intent",
     "match": ["NEGATIVE"],
-    "action": {"type": "restructure", "source": "last_reply"},
+    "action": {"type": "route", "to": "recovery"},
 }
 
 
@@ -34,21 +36,21 @@ def test_no_referees_continue():
 
 
 def test_first_match_wins():
-    # Both reject→transfer and intent→restructure would match; transfer is first.
+    # Both reject→transfer and intent→recovery would match; transfer is first.
     results = [_r("reject", "OPERATOR"), _r("intent", "NEGATIVE")]
-    rules = [TRANSFER_RULE, RESTRUCTURE_RULE]
-    action = decide(results, rules, restructure_enabled=True)
+    rules = [TRANSFER_RULE, RECOVERY_RULE]
+    action = decide(results, rules)
     assert action.kind == "transition"
     assert action.to == "transfer"
     assert action.matched_rule == TRANSFER_RULE
 
 
-def test_order_matters_restructure_first():
+def test_order_matters_recovery_first():
     results = [_r("reject", "OPERATOR"), _r("intent", "NEGATIVE")]
-    rules = [RESTRUCTURE_RULE, TRANSFER_RULE]
-    action = decide(results, rules, restructure_enabled=True)
-    assert action.kind == "restructure"
-    assert action.source == "last_reply"
+    rules = [RECOVERY_RULE, TRANSFER_RULE]
+    action = decide(results, rules)
+    assert action.kind == "route"
+    assert action.to == "recovery"
 
 
 def test_goal_achieved_carries_goal_type():
@@ -109,13 +111,6 @@ def test_failopen_referee_does_not_match():
     assert action.kind == "continue"
 
 
-def test_restructure_action_degrades_without_restructure_slot():
-    results = [_r("intent", "NEGATIVE")]
-    action = decide(results, [RESTRUCTURE_RULE], restructure_enabled=False)
-    assert action.kind == "continue"
-    assert action.matched_rule == RESTRUCTURE_RULE  # recorded for trace
-
-
 def test_low_confidence_no_longer_triggers_restructure():
     # engine-interruption-rule-tree D6: the low-confidence→restructure fallback
     # was removed (dead code — referees hardcode confidence=1.0). A referee whose
@@ -123,7 +118,7 @@ def test_low_confidence_no_longer_triggers_restructure():
     # restructure, and never a "low_confidence" trigger. (The confidence value is
     # now ignored entirely; only the bare category drives matching.)
     results = [_r("main_judge", "continue", confidence=0.4)]
-    action = decide(results, [GOAL_RULE], restructure_enabled=True)
+    action = decide(results, [GOAL_RULE])
     assert action.kind == "continue"
     assert action.restructure_trigger is None
 
@@ -131,7 +126,7 @@ def test_low_confidence_no_longer_triggers_restructure():
 def test_no_rule_match_falls_through_to_continue():
     # A hard fail-open (category None) on the only referee → continue.
     results = [RefereeResult.fail_open(label="main_judge", reason="invalid")]
-    action = decide(results, [], restructure_enabled=True)
+    action = decide(results, [])
     assert action.kind == "continue"
 
 
@@ -141,7 +136,7 @@ def test_decider_stays_pure_no_auto_restructure_knowledge():
     # The auto-restructure override lives ONLY at the run_loop call site, so
     # decide()'s contract is unchanged regardless of campaign switches.
     results = [_r("main_judge", "continue", confidence=1.0)]
-    action = decide(results, [], restructure_enabled=True)
+    action = decide(results, [])
     assert action.kind == "continue"
     assert action.matched_rule is None
 
