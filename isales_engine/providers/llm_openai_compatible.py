@@ -80,6 +80,35 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         """Release the persistent HTTP client (provider 弃用 / 进程退出)."""
         await self._http.aclose()
 
+    def _thinking_off_payload(self) -> dict[str, object]:
+        """Provider-specific request fields that DISABLE server-side 思考/推理.
+
+        Spec: provider-abc § Requirement: LLM 思考/推理模式默认关闭.
+
+        语音外呼要求低首字延迟，没有任何角色需要服务端思考链。思考模型
+        (DashScope qwen3.6-flash / qwen3.5-plus 等显式 qwen3 命名默认开思考;
+        Volcengine doubao-seed-1.6* 默认开) 会在首个 content token 之前生成
+        上千 reasoning_content token，期间流式 content 为空、首音频被迫等到
+        思考结束 (call 193 实测单轮 10-15s)。我们在 Provider 层统一注入关思考
+        参数，使所有角色 (main / referee / extractor / restructure) 默认不思考，
+        不依赖各模型的 vendor 默认值。
+
+        按 provider 分支 (非按模型名探测，避免多层兜底)。例外: 纯思考模型
+        (qwq-plus / qwen3-*-thinking-*) 无法关闭 —— 引擎默认配置不使用这类
+        模型。移除触发条件: 若未来某角色确需思考，改为读
+        role_config.ext_params["thinking"] 显式开启，再删本默认注入。
+        """
+        if self._provider == "dashscope":
+            # DashScope OpenAI-compat: enable_thinking 非 OpenAI 标准字段，作为
+            # 顶层 body 发送。对全部 qwen3 商业/flash 模型安全 (商业版本默认即
+            # 关，qwen3.6-flash 等默认开的靠它关掉); 非流式 chat() 调思考模型时
+            # vendor 亦要求显式 false 否则报错。
+            return {"enable_thinking": False}
+        if self._provider == "volcengine":
+            # Volcengine 方舟: thinking.type ∈ {enabled, disabled, auto}, 默认开。
+            return {"thinking": {"type": "disabled"}}
+        return {}
+
     async def chat(
         self,
         messages: list[Message],
@@ -101,6 +130,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             "temperature": temperature,
             "top_p": top_p,
         }
+        payload.update(self._thinking_off_payload())
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
         if json_mode:
@@ -150,6 +180,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        payload.update(self._thinking_off_payload())
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
 
