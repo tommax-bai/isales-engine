@@ -13,16 +13,32 @@ wrap-up modules all read and write it. Every ``CallSession`` is owned by the
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from isales_common.enums import CallStatus
+from isales_common.schemas.jsonb import TranscriptEvent
+from pydantic import TypeAdapter, ValidationError
 
 from isales_engine.eventbus import EventBus
 
 if TYPE_CHECKING:
     from isales_engine.state_machine import StateMachine
+
+logger = logging.getLogger(__name__)
+
+# Full-contract validator for transcript events. ``append_event`` checks this in
+# ADDITION to the ``TRANSCRIPT_EVENT_TYPES`` discriminator guard, so engine-vs-
+# schema field/literal/extra-key drift fails at the write site (strict mode /
+# CI) or at least screams in production logs — instead of being silently
+# persisted and 500-ing ``GET /calls`` on read (``CallRecordRead`` is
+# ``extra="forbid"``). This is a permanent write-time invariant, NOT a fallback:
+# it surfaces the error and never provides an alternative success path. See
+# transcript spec § "引擎写时校验 transcript 事件契约".
+_TRANSCRIPT_EVENT_ADAPTER: TypeAdapter[object] = TypeAdapter(TranscriptEvent)
 
 
 # Per transcript spec § Requirement: 事件类型枚举 + impl-engine spec delta.
@@ -202,6 +218,23 @@ class CallSession:
 
         ts_ms = int((time.monotonic() - self.call_started_at_monotonic) * 1000)
         event: dict[str, Any] = {"type": event_type, "ts": ts_ms, **fields}
+
+        try:
+            _TRANSCRIPT_EVENT_ADAPTER.validate_python(event)
+        except ValidationError as exc:
+            logger.error(
+                "transcript_event_schema_violation type=%s errors=%s",
+                event_type,
+                exc.errors(include_url=False),
+            )
+            # Strict mode (engine test suite) fails fast so any drift is caught
+            # in CI. Production (env unset) is fail-soft: a transcript logging-
+            # contract bug MUST NOT drop a live call, so log loudly and still
+            # persist the (slightly-wrong) event. Env read here (not at import)
+            # to avoid import-order fragility.
+            if os.getenv("ISALES_ENGINE_STRICT_TRANSCRIPT") == "1":
+                raise
+
         self.full_transcript.append(event)
 
         if event_type in DIALOG_EVENT_TYPES:

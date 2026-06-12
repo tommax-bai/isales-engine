@@ -21,6 +21,12 @@ DEFAULT_DB_URL = "postgresql+asyncpg://bears@localhost:5432/isales_engine_test"
 # db 2 — worker uses 0, scheduler uses 1.
 DEFAULT_REDIS_URL = "redis://localhost:6379/2"
 
+# Run the whole engine suite with transcript write-time validation in strict
+# mode, so any test that drives a flow producing an out-of-contract transcript
+# event fails loudly (engine-transcript-write-validation). setdefault lets an
+# individual test opt out via monkeypatch to exercise the prod fail-soft path.
+os.environ.setdefault("ISALES_ENGINE_STRICT_TRANSCRIPT", "1")
+
 
 def _resolve_db_url() -> str:
     return (
