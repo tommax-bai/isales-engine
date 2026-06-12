@@ -357,3 +357,75 @@ async def test_filler_played_on_slow_turn() -> None:
     assert [c.decode() for c in tel.outbound_log[session.call_record_id]] == [
         "你好。#0", "再见。#0",
     ]
+
+
+# ---- filler delay anchored on PROCESSING entry (engine-filler-delay-client- --
+# ---- anchor): the referee-gate wait BEFORE _play_streaming entry counts ------
+# ---- against filler_delay_s. Simulated by passing a processing_start in the --
+# ---- past (= gate already elapsed that much). --------------------------------
+
+
+async def test_gate_elapsed_counts_against_filler_budget() -> None:
+    """Time spent in the referee gate before _play_streaming entry counts
+    against filler_delay_ms. With 0.40s already elapsed and a 0.50s budget only
+    ~0.10s remains, so a first audio arriving at ~0.25s is too late to pre-empt
+    — the filler fires. Under the OLD anchor the 0.5s timer started fresh at
+    entry and the 0.25s audio would have cancelled it (start_called == 0)."""
+    session = _make_session()
+    tel = MockTelephonyClient(connect_delay_ms=0)
+    await _connected(tel, session.call_record_id)
+    tts = _RecordingTTS(chunks_per_sentence=1)
+    stream = _SlowFirstSentenceStream(["你好。", "再见。"], delay_s=0.25)
+    filler = _FakeFiller()
+
+    started = time.monotonic()
+    _first, played = await _play_streaming(
+        session, tel, tts, stream,  # type: ignore[arg-type]
+        voice_id="v", filler=filler, filler_delay_s=0.5,  # type: ignore[arg-type]
+        processing_start=started - 0.40,  # 0.40s gate already elapsed → ~0.10s left
+    )
+    assert played is True
+    assert filler.start_called == 1  # residual budget elapsed before audio → filler fired
+    assert filler.stop_called >= 1
+
+
+async def test_filler_immediate_when_gate_already_spent_budget() -> None:
+    """Gate/ASR burned MORE than filler_delay_ms before entry (remaining <= 0):
+    the filler plays at once on entry instead of waiting another full window."""
+    session = _make_session()
+    tel = MockTelephonyClient(connect_delay_ms=0)
+    await _connected(tel, session.call_record_id)
+    tts = _RecordingTTS(chunks_per_sentence=1)
+    # First real audio delayed so it can't pre-empt the immediate filler.
+    stream = _SlowFirstSentenceStream(["你好。", "再见。"], delay_s=0.12)
+    filler = _FakeFiller()
+
+    started = time.monotonic()
+    _first, played = await _play_streaming(
+        session, tel, tts, stream,  # type: ignore[arg-type]
+        voice_id="v", filler=filler, filler_delay_s=0.5,  # type: ignore[arg-type]
+        processing_start=started - 1.0,  # over budget → remaining <= 0
+    )
+    assert played is True
+    assert filler.start_called == 1  # immediate, no extra filler_delay_s wait
+    assert filler.stop_called >= 1
+
+
+async def test_fast_turn_no_filler_even_with_some_gate_elapsed() -> None:
+    """Some gate time elapsed but first audio still arrives within the residual
+    budget → filler is cancelled, never plays (fast-turn purity preserved)."""
+    session = _make_session()
+    tel = MockTelephonyClient(connect_delay_ms=0)
+    await _connected(tel, session.call_record_id)
+    tts = _RecordingTTS(chunks_per_sentence=1)
+    stream = _FakeStream(["你好。", "再见。"])  # first audio ~immediately
+    filler = _FakeFiller()
+
+    started = time.monotonic()
+    _first, played = await _play_streaming(
+        session, tel, tts, stream,  # type: ignore[arg-type]
+        voice_id="v", filler=filler, filler_delay_s=5.0,  # type: ignore[arg-type]
+        processing_start=started - 0.10,  # 0.10s gate elapsed, ~4.9s left
+    )
+    assert played is True
+    assert filler.start_called == 0  # fast audio pre-empts → no filler

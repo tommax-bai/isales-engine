@@ -927,14 +927,23 @@ async def _play_streaming(
 
     producer_task = asyncio.create_task(_producer(), name="tts_producer")
 
-    # Time-gated filler (tts-cache-and-gated-filler § B): only play a filler if
-    # the first real audio hasn't begun within ``filler_delay_s``. Fast turns
-    # never hear it; slow turns get a cached (zero-synth) filler masking the
-    # LLM TTFT. Cancelled + stopped the moment the first job plays.
+    # Time-gated filler (tts-cache-and-gated-filler § B; engine-filler-delay-
+    # client-anchor): play a filler only if the first real audio hasn't begun
+    # within ``filler_delay_s`` measured from PROCESSING entry
+    # (``processing_start`` ≈ the caller stopped speaking) — NOT from this
+    # _play_streaming entry. Gate-first runs the referee vote *before* playback,
+    # so anchoring on task-creation time would silently exclude the gate's
+    # silence from the budget (the drift this fixes). ASR-finalize + gate wait
+    # therefore counts against filler_delay_s: if the budget is already spent on
+    # entry (remaining <= 0) we play at once instead of waiting another window.
+    # Fast turns never hear it; slow turns get a cached (zero-synth) filler
+    # masking the LLM TTFT. Cancelled + stopped the moment the first job plays.
     filler_task: asyncio.Task[None] | None = None
     if filler is not None:
         async def _maybe_filler() -> None:
-            await asyncio.sleep(filler_delay_s)
+            remaining = filler_delay_s - (time.monotonic() - processing_start)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
             if first_audio_ms is None:
                 await filler.start()
         filler_task = asyncio.create_task(_maybe_filler(), name="filler_gate")
