@@ -433,11 +433,11 @@ async def test_assemble_interrupt_text_none_when_no_assistant():
 # action; the old rule-driven fires/caps tests went with it). -----------------
 
 
-async def test_auto_restructure_on_interrupt_fires_without_rule() -> None:
-    """auto_restructure_on_interrupt: when a prior barge-in left
-    interrupt_remaining_text and NO explicit routing rule matches, the turn
-    resumes the cut-off line (restructure source=interrupt_remaining) instead of
-    replying. (engine-auto-restructure-on-interrupt)"""
+async def test_auto_restructure_fires_when_gate_says_filler() -> None:
+    """engine-filler-gated-restructure: when a prior barge-in left
+    interrupt_remaining_text, NO explicit routing rule matches, AND the main gate
+    referee judged the interruption a no-substance FILLER, the turn resumes the
+    cut-off line (restructure source=interrupt_remaining) instead of replying."""
     session = _make_session()
     session.interrupt_remaining_text = "那我先帮您把套餐"  # leftover from a prior barge-in
     config = _make_config(
@@ -452,7 +452,7 @@ async def test_auto_restructure_on_interrupt_fires_without_rule() -> None:
 
     async def driver() -> None:
         await asyncio.sleep(0.05)
-        await asr.feed_turn("嗯你继续")  # trivial interjection, matches no rule
+        await asr.feed_turn("嗯你继续")  # mock referee → FILLER (no-substance) → fires restructure
         await asyncio.sleep(0.2)
         await tel.simulate_remote_hangup(1)
 
@@ -477,6 +477,42 @@ async def test_auto_restructure_on_interrupt_fires_without_rule() -> None:
     restr = [t for t in traces if t["restructure_active"]]
     assert len(restr) == 2, "decision row + output row"
     assert len({t["turn_id"] for t in restr}) == 2, "distinct turn_ids"
+
+
+async def test_auto_restructure_skipped_when_gate_says_substantive() -> None:
+    """engine-filler-gated-restructure: a barge-in the gate judged substantive
+    (non-FILLER, e.g. a price question) is answered normally, NOT restructured;
+    and the stale remainder is cleared so it can't leak into a later turn."""
+    session = _make_session()
+    session.interrupt_remaining_text = "那我先帮您把套餐"  # leftover from a prior barge-in
+    config = _make_config(
+        enable_restructure=True,
+        routing_rules=[],  # no explicit rule → decide() falls through to continue
+        auto_restructure_on_interrupt=True,
+        silence_threshold_ms=3000,
+    )
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    async def driver() -> None:
+        await asyncio.sleep(0.05)
+        await asr.feed_turn("这个一共要多少钱")  # mock referee → continue (substantive), not FILLER
+        await asyncio.sleep(0.2)
+        await tel.simulate_remote_hangup(1)
+
+    driver_task = asyncio.create_task(driver())
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await driver_task
+
+    # No restructure fired — substantive interruption is answered, not resumed.
+    assert all(
+        not t["restructure_active"] for t in session.pipeline_trace_records
+    ), "substantive interruption must be answered, not restructured"
+    # Cross-turn remainder hygiene: stale leftover cleared on the answer path (D6).
+    assert session.interrupt_remaining_text is None
 
 
 async def test_auto_restructure_vetoed_by_explicit_rule() -> None:

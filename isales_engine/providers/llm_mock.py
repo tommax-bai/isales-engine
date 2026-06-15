@@ -129,7 +129,9 @@ class KeywordDrivenMockLLM(LLMProvider):
     # engine-tools-multidialogue-gating: a referee emits a bare category token
     # (no JSON, no confidence). The categories below match the routing rules the
     # gating tests configure (goal_achieved / transfer / customer_decline;
-    # "continue" matches no rule).
+    # "continue" matches no rule). engine-filler-gated-restructure adds the
+    # reserved FILLER category (no-substance backchannel) — NOT in any routing
+    # rule; it drives auto_restructure via the run_loop override.
     def _referee(self, system: str) -> _Decision:
         if re.search(r"预约|成功|约见|appointment", system):
             category = "goal_achieved"
@@ -137,6 +139,8 @@ class KeywordDrivenMockLLM(LLMProvider):
             category = "transfer"
         elif re.search(r"拒绝|不需要|没兴趣|do_not_call", system):
             category = "customer_decline"
+        elif re.search(r"嗯你继续|嗯嗯|你继续|你说|对对对|继续说", system):
+            category = "FILLER"  # no-substance backchannel interjection
         else:
             category = "continue"
         return _Decision(content=category)

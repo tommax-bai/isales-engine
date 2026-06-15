@@ -87,6 +87,12 @@ class PipelineConfig:
     # falls through to restructure(interrupt_remaining) instead of continue. The
     # referee gate + explicit rules stay the veto (first-match-wins).
     auto_restructure_on_interrupt: bool = False
+    # engine-filler-gated-restructure: the reserved gate category signalling a
+    # "no-substance" barge-in (filler / backchannel). The auto_restructure override
+    # fires ONLY when the main gate referee emits this category, so a substantive
+    # interruption (question / objection) is answered instead of restructured.
+    # Engine default; v1 not surfaced as a campaign column (promotable later).
+    restructure_gate_category: str = "FILLER"
     last_call_summary: str | None = None
     follow_up_count: int = 0
     short_reply_active: bool = False

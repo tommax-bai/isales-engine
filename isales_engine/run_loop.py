@@ -1307,16 +1307,22 @@ async def _run_gated_turn(
         main_stream, timeout_s=config.pipeline.referee_timeout_ms / 1000.0
     )
     action: DeciderAction = decide(referee_results, config.pipeline.routing_rules)
-    # engine-auto-restructure-on-interrupt: when the prior turn was barge-in
-    # interrupted (interrupt_remaining_text set) and NO explicit routing rule
-    # vetoed (decide() fell through to continue), resume the cut-off line via
-    # restructure instead of replying. decide() stays pure — this is the only
-    # call-site override, and only takes the no-match fallback slot (referee +
-    # explicit rules are the veto via first-match-wins). Removal trigger: drop
-    # when restructure routing becomes first-class per-rule with a default
-    # template. (ai-pipeline § 被打断自动重组开关)
+    # engine-filler-gated-restructure: tighten auto_restructure so the cut-off line
+    # is resumed ONLY when the main gate referee judged this barge-in to be a
+    # no-substance filler (category == restructure_gate_category, default FILLER).
+    # A substantive interruption (question / objection) that fell through to
+    # `continue` is now answered, not restructured — fixing the case where a real
+    # question without a matching routing rule was wrongly resumed. FILLER is a
+    # reserved category, deliberately NOT in routing_rules, so decide() falls
+    # through to `continue` for it; the override still occupies only the no-match
+    # fallback slot and decide() stays pure. (ai-pipeline § 被打断自动重组开关)
+    gate_filler = any(
+        r.effective_category() == config.pipeline.restructure_gate_category
+        for r in referee_results
+    )
     if (
-        action.kind == "continue"
+        gate_filler
+        and action.kind == "continue"
         and config.pipeline.auto_restructure_on_interrupt
         and config.pipeline.restructure is not None
         and session.interrupt_remaining_text
@@ -1327,9 +1333,16 @@ async def _run_gated_turn(
             restructure_trigger="interrupt_remaining",
         )
         logger.info(
-            "auto_restructure_on_interrupt fired (call_record_id=%s)",
+            "filler-gated restructure fired (call_record_id=%s)",
             session.call_record_id,
         )
+    elif config.pipeline.auto_restructure_on_interrupt and session.interrupt_remaining_text:
+        # Cross-turn remainder hygiene: the barge-in was substantive (gate judged
+        # non-FILLER, answered normally) or no restructure slot exists — abandon
+        # the cut-off line and clear the remainder so it can't leak into a later
+        # turn and be restructured stale. The restructure path consumes the field
+        # via _assemble_interrupt_text's take-and-clear, never reaching here.
+        session.interrupt_remaining_text = None
     sel = _select_gated_route(action, config)
 
     async def _cancel_candidates(except_id: str | None = None) -> None:

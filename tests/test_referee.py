@@ -8,6 +8,8 @@ lowercased + stripped of trailing punctuation; confidence is fixed to 1.0.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from isales_common.providers._models import LLMResponse
 from isales_common.providers.testing.llm import MockLLMProvider
@@ -123,3 +125,49 @@ async def test_placeholder_substituted_into_prompt():
     assert "周三方便" in system_msg
     assert "{{user_last_utterance}}" not in system_msg
     assert "用户：嗯" in system_msg
+
+
+# ---- barge-in placeholders (engine-filler-gated-restructure) ----------------
+
+
+@pytest.mark.asyncio
+async def test_interrupt_placeholders_injected_when_barge_in():
+    """{{was_interrupted}} / {{interrupted_reply}} are filled from
+    session.interrupt_remaining_text so the gate can tell a filler barge-in from a
+    substantive one."""
+    spec = RefereeSpec(
+        role_config_id=2,
+        prompt_version_id=8,
+        system_prompt=(
+            "用户最后一句话：{{user_last_utterance}}\n"
+            "是否打断：{{was_interrupted}}\n被打断的话：{{interrupted_reply}}"
+        ),
+        model="qwen-turbo",
+        label="main_judge",
+    )
+    session = SimpleNamespace(interrupt_remaining_text="我们这个课分三个阶段")
+    llm = _raw_llm("FILLER")
+    await run_referee(session, "嗯你继续", [], spec, llm)
+    system_msg = llm.calls[0].messages[0].content
+    assert "是否打断：是" in system_msg
+    assert "被打断的话：我们这个课分三个阶段" in system_msg
+    assert "{{was_interrupted}}" not in system_msg
+    assert "{{interrupted_reply}}" not in system_msg
+
+
+@pytest.mark.asyncio
+async def test_interrupt_placeholders_blank_when_no_barge_in():
+    """No remainder → was_interrupted '否', interrupted_reply empty string."""
+    spec = RefereeSpec(
+        role_config_id=2,
+        prompt_version_id=8,
+        system_prompt="是否打断：{{was_interrupted}}\n被打断的话：[{{interrupted_reply}}]",
+        model="qwen-turbo",
+        label="main_judge",
+    )
+    session = SimpleNamespace(interrupt_remaining_text=None)
+    llm = _raw_llm("continue")
+    await run_referee(session, "你好", [], spec, llm)
+    system_msg = llm.calls[0].messages[0].content
+    assert "是否打断：否" in system_msg
+    assert "被打断的话：[]" in system_msg

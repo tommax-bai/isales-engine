@@ -84,9 +84,21 @@ async def run_referee(
     on any error.
     """
     rendered_history = _render_dialog_history_for_referee(recent_dialog_history)
-    system = referee_spec.system_prompt.replace(
-        "{{user_last_utterance}}", user_last_utterance or ""
-    ).replace("{{recent_dialog_history}}", rendered_history)
+    # engine-filler-gated-restructure: inject the barge-in signal so the gate can
+    # tell a filler interruption (resume the cut-off line) from a substantive one
+    # (answer it). interrupt_remaining_text = the not-yet-spoken remainder of the
+    # AI line the customer just interrupted; "是"/"否" + the remainder text. Read
+    # only here (cleared on the restructure / answer paths in run_loop). Prompts
+    # without these placeholders → no-op (old prompts unaffected).
+    remainder = getattr(session, "interrupt_remaining_text", None)
+    system = (
+        referee_spec.system_prompt.replace(
+            "{{user_last_utterance}}", user_last_utterance or ""
+        )
+        .replace("{{recent_dialog_history}}", rendered_history)
+        .replace("{{was_interrupted}}", "是" if remainder else "否")
+        .replace("{{interrupted_reply}}", remainder or "")
+    )
     messages = [
         Message(role="system", content=system),
         Message(role="user", content=_USER_PRIMER),
