@@ -470,6 +470,14 @@ async def test_auto_restructure_on_interrupt_fires_without_rule() -> None:
     assert first["restructure_source_text"]  # the captured leftover was re-voiced
     assert session.consecutive_restructure_count >= 1
 
+    # engine-turn-latency-and-tts-guard: the restructure OUTPUT turn now writes
+    # its own pipeline_trace row too (was missing → call 194 turn-3 gap). So the
+    # fired restructure produces a decision row + an output row with distinct
+    # turn_ids, both restructure_active.
+    restr = [t for t in traces if t["restructure_active"]]
+    assert len(restr) == 2, "decision row + output row"
+    assert len({t["turn_id"] for t in restr}) == 2, "distinct turn_ids"
+
 
 async def test_auto_restructure_vetoed_by_explicit_rule() -> None:
     """The auto fallback only takes the no-match slot: an explicit routing rule

@@ -5,6 +5,8 @@
       "first_audio_ms": "<volatile>",
       "main_duration_ms": "<volatile>",
       "main_fallback_used": false,
+      "main_first_sentence_ms": "<volatile>",
+      "main_first_token_ms": "<volatile>",
       "main_reply_text": "好的，我明白了。请问您还有什么需要？",
       "main_tokens_in": 16,
       "main_tokens_out": 9,

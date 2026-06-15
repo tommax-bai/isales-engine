@@ -15,6 +15,7 @@ multi-byte char because we accumulate already-decoded ``str`` chunks.
 
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import AsyncIterator
 
 # Sentence-ending punctuation (Chinese + ASCII). A trailing closing quote /
@@ -23,6 +24,20 @@ _TERMINATORS = "。？！?!."
 _TRAILING = "”’\"')）」』】"
 
 MAX_SENTENCE_CHARS = 50
+
+
+def _has_synthesizable_text(s: str) -> bool:
+    """True if ``s`` has ≥1 character TTS can voice (a letter or a digit).
+
+    Filters chunks that are punctuation / whitespace / symbol only — e.g. a
+    bare "." emitted when an ellipsis "..." is split on each dot, which the
+    Volcengine TTS vendor rejects with ``code=45002001 "No readable text!"``
+    (call 194 turn 4). Uses Unicode general categories rather than a hardcoded
+    punctuation table: any L* (letter, incl. CJK ideographs like 呃) or N*
+    (number) char makes the chunk synthesizable; P*/Z*/S*/C* on their own do
+    not. Spec: ai-pipeline § "TTS 不合成无可读内容的句".
+    """
+    return any(unicodedata.category(ch)[0] in ("L", "N") for ch in s)
 
 
 async def split_sentences(
@@ -52,12 +67,12 @@ async def split_sentences(
             )
             if should_emit:
                 out = buffer.strip()
-                if out:
+                if out and _has_synthesizable_text(out):
                     yield out
                 buffer = ""
 
     tail = buffer.strip()
-    if tail:
+    if tail and _has_synthesizable_text(tail):
         yield tail
 
 

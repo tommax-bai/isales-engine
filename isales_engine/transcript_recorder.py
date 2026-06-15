@@ -111,6 +111,8 @@ async def _write_in_transaction(
             user_input=trace_dict.get("user_input"),
             main_reply_text=trace_dict.get("main_reply_text"),
             main_duration_ms=trace_dict.get("main_duration_ms"),
+            main_first_token_ms=trace_dict.get("main_first_token_ms"),
+            main_first_sentence_ms=trace_dict.get("main_first_sentence_ms"),
             main_tokens_in=trace_dict.get("main_tokens_in"),
             main_tokens_out=trace_dict.get("main_tokens_out"),
             main_fallback_used=bool(trace_dict.get("main_fallback_used") or False),

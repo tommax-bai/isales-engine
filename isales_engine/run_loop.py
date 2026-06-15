@@ -1419,6 +1419,7 @@ async def _run_gated_turn(
             played_rs = await _run_restructure(
                 session, telephony, providers, config, restructure_text,
                 pipeline_timeout_ms=pipeline_timeout_ms,
+                restructure_trigger=sel.restructure_trigger,
             )
             session.consecutive_restructure_count += 1
             if not played_rs:
@@ -1649,6 +1650,8 @@ def _base_trace(
         "user_input": user_text,
         "main_reply_text": stream.result.reply_text,
         "main_duration_ms": stream.result.duration_ms,
+        "main_first_token_ms": stream.result.first_token_ms,
+        "main_first_sentence_ms": stream.result.first_sentence_ms,
         "main_tokens_in": stream.result.tokens_in,
         "main_tokens_out": stream.result.tokens_out,
         "main_fallback_used": stream.result.fallback_used,
@@ -1670,12 +1673,14 @@ async def _run_restructure(
     interrupt_text: str,
     *,
     pipeline_timeout_ms: int,
+    restructure_trigger: str | None = None,
 ) -> bool:
-    """Run + play the restructure stream and record its ai_reply.
+    """Run + play the restructure stream and record its ai_reply + trace.
 
     Re-voices ``interrupt_text`` via the restructure slot (no referees). Returns
     whether it fully played (False on barge-in). The caller drives state.
     """
+    rs_ts_start = now_utc()
     rs = run_restructure_stream(
         session,
         interrupt_text,
@@ -1684,7 +1689,7 @@ async def _run_restructure(
         pipeline_timeout_ms=pipeline_timeout_ms,
         llm_registry=providers.llm_registry,
     )
-    _first_audio, played = await _play_streaming(
+    first_audio_ms, played = await _play_streaming(
         session,
         telephony,
         providers.tts,
@@ -1706,6 +1711,18 @@ async def _run_restructure(
         goal_type="",
         extracted={},
         is_wrap_up=False,
+    )
+    # engine-turn-latency-and-tts-guard: the restructure OUTPUT turn (its own
+    # rs.turn_id) gets a pipeline_trace row of its own — mirrors the dialogue
+    # route. Without this the re-voiced reply emitted an ai_reply event but no
+    # trace, so its latency/tokens were unqueryable (call 194 turn 3 gap).
+    session.pipeline_trace_records.append(
+        {
+            **_base_trace(rs, rs_ts_start, interrupt_text, first_audio_ms),
+            "restructure_active": True,
+            "restructure_trigger": restructure_trigger,
+            "restructure_source_text": interrupt_text,
+        }
     )
     return played
 

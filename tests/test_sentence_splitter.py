@@ -71,3 +71,27 @@ async def test_empty_and_whitespace_tokens_skipped():
 async def test_ascii_punctuation():
     out = await _collect(split_sentences(_stream("Hello.", " World?")))
     assert out == ["Hello.", "World?"]
+
+
+# ---- engine-turn-latency-and-tts-guard: drop chunks with no synthesizable text
+# (Volcengine TTS rejects punctuation-only text with code=45002001). -----------
+
+
+@pytest.mark.asyncio
+async def test_ellipsis_punctuation_only_chunks_dropped():
+    # "呃...那个。" — the ellipsis splits on each "." into bare "." chunks the
+    # vendor can't voice; chunks keeping a readable char survive (call 194).
+    out = await _collect(split_sentences(_stream("呃...那个。")))
+    assert out == ["呃.", "那个。"]
+
+
+@pytest.mark.asyncio
+async def test_all_punctuation_yields_nothing():
+    out = await _collect(split_sentences(_stream("。。。", "！", "...", "   ")))
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_digit_is_synthesizable():
+    out = await _collect(split_sentences(_stream("3。")))
+    assert out == ["3。"]
