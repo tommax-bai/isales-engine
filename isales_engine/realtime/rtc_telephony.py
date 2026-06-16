@@ -100,6 +100,15 @@ logger = logging.getLogger(__name__)
 # implicit cross-module dependency between two TelephonyClient impls.
 _SENTINEL: Any = object()
 
+# Outbound playout jitter cushion (ambient-background-mix follow-up). The
+# mixing pump drains the playout queue at a strict 10 ms wall-clock pace and
+# substitutes a background-only SILENCE frame whenever the queue is empty. With
+# no cushion, any transient TTS underflow (bursty / slower-than-realtime vendor
+# delivery, worst on a turn's first sentence) is punched into the speech as a
+# silence gap → choppy / 生硬. Holding ~200 ms before releasing a burst to the
+# pump gives it a buffer that absorbs the stall. 20 frames × 10 ms = 200 ms.
+PLAYOUT_PREBUFFER_FRAMES = 20
+
 
 _HANGUP_CAUSE_DETAIL = {
     pb.HANGUP_CAUSE_UNSPECIFIED: "unspecified",
@@ -418,14 +427,40 @@ class _CallState:
         assert self.playout_q is not None
         q = self.playout_q
         leftover = b""
+        # Jitter cushion: hold the first PLAYOUT_PREBUFFER_FRAMES (~200 ms)
+        # before releasing any frame to the pump, so each burst starts with a
+        # buffer that absorbs a transient TTS underflow instead of letting the
+        # pump punch a silence gap into the speech (the choppy / 生硬 the
+        # pre-ambient direct-push path avoided via the RTC SDK's own jitter
+        # buffer). When the sentence is already pre-synthesized (_SynthJob, the
+        # common case for sentences ≥2) the cushion fills near-instantly →
+        # ~0 added latency; only a genuinely slow vendor pays up to 200 ms,
+        # which is exactly when the smoothing is needed. The cushion is flushed
+        # on stream end so a sentence shorter than the cushion still plays and
+        # ``q.join()`` cannot deadlock.
+        cushion: list[bytes] = []
+        primed = False
         try:
             async for chunk in chunks:
                 buf = leftover + chunk
                 off = 0
                 while off + FRAME_BYTES <= len(buf):
-                    await q.put(buf[off:off + FRAME_BYTES])
+                    frame = buf[off:off + FRAME_BYTES]
                     off += FRAME_BYTES
+                    if primed:
+                        await q.put(frame)
+                    else:
+                        cushion.append(frame)
+                        if len(cushion) >= PLAYOUT_PREBUFFER_FRAMES:
+                            for f in cushion:
+                                await q.put(f)
+                            cushion.clear()
+                            primed = True
                 leftover = buf[off:]
+            # Stream ended: release any held cushion (sentence shorter than the
+            # cushion), then pad + enqueue the final partial frame.
+            for f in cushion:
+                await q.put(f)
             if leftover:  # pad the final partial frame to a full 10 ms shape
                 await q.put(leftover + b"\x00" * (FRAME_BYTES - len(leftover)))
             await q.join()

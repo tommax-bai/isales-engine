@@ -27,7 +27,10 @@ from isales_engine.realtime.ambient import (
     get_ambient_loop,
     mix_frame,
 )
-from isales_engine.realtime.rtc_telephony import _CallState
+from isales_engine.realtime.rtc_telephony import (
+    PLAYOUT_PREBUFFER_FRAMES,
+    _CallState,
+)
 
 
 def _const_frame(value: int, n: int = FRAME_SAMPLES) -> bytes:
@@ -207,6 +210,42 @@ async def test_pump_mixes_queued_tts() -> None:
         await state.feed_playout(_chunks(tts, tts))  # returns after drain
         # at least one captured frame is the TTS+bg mix (1000 + 10*0.5 = 1005)
         assert any(struct.unpack("<h", pcm[:2])[0] == 1005 for pcm, _ in sess.pushed)
+    finally:
+        await state.stop_outbound_pump()
+
+
+@pytest.mark.asyncio
+async def test_prebuffer_releases_all_frames_in_order() -> None:
+    # The ~200ms jitter cushion must neither drop nor reorder TTS frames: every
+    # fed frame is eventually played, in order, for a burst longer than the
+    # cushion. gain 0 + reader 0 → pushed frame == TTS frame (silence == 0).
+    state, sess = await _make_state(reader_value=0, gain=0.0)
+    try:
+        n = PLAYOUT_PREBUFFER_FRAMES + 10  # exceed the cushion threshold
+        frames = [_const_frame(i + 1) for i in range(n)]  # distinct, non-zero
+        await state.feed_playout(_chunks(*frames))
+        played = [struct.unpack("<h", pcm[:2])[0] for pcm, _ in sess.pushed]
+        tts_values = [v for v in played if v != 0]  # drop background-only frames
+        assert tts_values == list(range(1, n + 1))
+    finally:
+        await state.stop_outbound_pump()
+
+
+@pytest.mark.asyncio
+async def test_prebuffer_plays_burst_shorter_than_cushion() -> None:
+    # A sentence shorter than the cushion must still play (cushion flushed on
+    # stream end) — guards against q.join() deadlocking on un-primed frames.
+    state, sess = await _make_state(reader_value=0, gain=0.0)
+    try:
+        n = PLAYOUT_PREBUFFER_FRAMES - 5  # never reaches the prime threshold
+        frames = [_const_frame(i + 1) for i in range(n)]
+        await state.feed_playout(_chunks(*frames))
+        tts_values = [
+            struct.unpack("<h", pcm[:2])[0]
+            for pcm, _ in sess.pushed
+            if struct.unpack("<h", pcm[:2])[0] != 0
+        ]
+        assert tts_values == list(range(1, n + 1))
     finally:
         await state.stop_outbound_pump()
 
