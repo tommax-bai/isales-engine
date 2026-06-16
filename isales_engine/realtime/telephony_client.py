@@ -69,6 +69,17 @@ class TelephonyClient(ABC):
     async def audio_out(self, call_id: int, chunks: AsyncIterator[bytes]) -> None:
         """Engine→caller audio (consume the iterator end-to-end before returning)."""
 
+    def configure_ambient(
+        self, call_id: int, asset: str | None, gain: float
+    ) -> None:
+        """Enable continuous outbound background-ambient mixing for this call.
+
+        Default no-op: telephony backends without a continuous outbound pump
+        (mock, modem) ignore background mixing. ``RtcTelephonyClient`` overrides
+        to start the per-call mixing pump when ``asset`` is non-empty.
+        ``ambient-background-mix``.
+        """
+
     @abstractmethod
     def events(self, call_id: int) -> AsyncIterator[TelephonyEvent]:
         """Per-call event stream — connected / hangup / device_error."""

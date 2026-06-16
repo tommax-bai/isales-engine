@@ -64,6 +64,12 @@ class RuntimeConfig:
     # campaign.filler_delay_ms; NULL → 600. Only play a filler when the main
     # reply's first audio hasn't started within this window.
     filler_delay_ms: int = 600
+    # ambient background mix (engine-ambient-background-mix). ambient_audio: a
+    # background-noise asset basename; None/empty → off (outbound stays the
+    # pull-driven direct-push, behavior unchanged). ambient_gain: linear mix
+    # level for the background relative to TTS (0.1 ≈ -20dB).
+    ambient_audio: str | None = None
+    ambient_gain: float = 0.1
     # Continuous-interruption protection (ai-pipeline spec delta). Read by
     # run_loop._decide_protection. Stored at RuntimeConfig level (not on
     # InterruptionConfig) because the strategy is a campaign-level policy,
@@ -336,6 +342,8 @@ async def load_runtime_config(
         asr_partial_stable_s=asr_partial_stable_s,
         filler_enabled=campaign.filler_enabled,
         filler_delay_ms=filler_delay_ms,
+        ambient_audio=campaign.ambient_audio,
+        ambient_gain=campaign.ambient_gain,
         _max_continuous_interruptions=campaign.max_continuous_interruptions,
         _continuous_interruption_strategy=strategy_value,
     )

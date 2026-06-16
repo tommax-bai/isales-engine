@@ -186,6 +186,13 @@ async def run_session(
         sm.transition_to(CallStatus.IN_CALL, reason="connected")
         _publish_status(publisher, session, "connected")
 
+        # ambient-background-mix: enable the continuous outbound mixing pump
+        # before the greeting so the customer hears persistent room tone from
+        # the first frame. No-op when config.ambient_audio is empty (default).
+        telephony.configure_ambient(
+            session.call_record_id, config.ambient_audio, config.ambient_gain
+        )
+
         # NOTE on greeting interruptibility: listen pumps start AFTER the
         # greeting, so the greeting cannot be barged in on. (An earlier
         # 2026-05-28 rationale attributing mid-greeting false-triggers to a

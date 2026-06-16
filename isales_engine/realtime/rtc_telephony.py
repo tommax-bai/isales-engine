@@ -65,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -75,6 +76,13 @@ from isales_common.transport.cloud_edge import (
     EdgeNotConnected,
 )
 
+from isales_engine.realtime.ambient import (
+    FRAME_BYTES,
+    SILENCE_FRAME,
+    AmbientReader,
+    get_ambient_loop,
+    mix_frame,
+)
 from isales_engine.realtime.telephony_client import (
     TelephonyClient,
     TelephonyEvent,
@@ -142,6 +150,20 @@ class _CallState:
         # local hangup) closes the iterators, so subsequent terminals
         # don't double-emit sentinels.
         self._closed = False
+
+        # ambient-background-mix: when enabled (campaign.ambient_audio set), the
+        # outbound path switches from pull-driven direct-push to a continuous
+        # mixing pump. ``audio_out`` feeds 10 ms TTS frames into ``playout_q``;
+        # the pump pushes one mixed (TTS + looped background) frame every 10 ms
+        # of wall-clock so the customer hears persistent room tone even between
+        # sentences. Disabled (default) → these stay unset and the original
+        # direct-push path runs byte-for-byte.
+        self.ambient_active = False
+        self.ambient_reader: AmbientReader | None = None
+        self.ambient_gain = 0.0
+        self.playout_q: asyncio.Queue[bytes] | None = None
+        self.outbound_pump: asyncio.Task[None] | None = None
+        self._pump_ts = 0
 
     # ----- timestamping for push_audio -----------------------------------
 
@@ -363,6 +385,121 @@ class _CallState:
             await self.inbound_q.put(_SENTINEL)
             await self.vad_q.put(_SENTINEL)
 
+    # ----- outbound ambient mixing pump ----------------------------------
+
+    def enable_ambient(self, reader: AmbientReader, gain: float) -> None:
+        """Switch the outbound path to continuous mixing and start the pump.
+
+        Idempotent — a second call is a no-op (the pump is per-call).
+        ``ambient-background-mix`` D1/D2.
+        """
+        if self.ambient_active:
+            return
+        self.ambient_reader = reader
+        self.ambient_gain = gain
+        # ~3 s of buffered TTS frames before back-pressuring audio_out. TTS
+        # arrives faster than real-time (a single chunk can be 250-400 ms);
+        # the pump drains at exactly real-time, so a bound is needed.
+        self.playout_q = asyncio.Queue(maxsize=300)
+        self.ambient_active = True
+        self.outbound_pump = asyncio.create_task(
+            self._outbound_loop(), name=f"rtc_outbound_pump_{self.sid}",
+        )
+
+    async def feed_playout(self, chunks: AsyncIterator[bytes]) -> None:
+        """Slice a TTS PCM stream into 10 ms frames and enqueue for the pump.
+
+        Returns once the pump has consumed (pushed) every enqueued frame, so the
+        caller's "playback complete" contract still holds. On ``CancelledError``
+        (barge-in) the queue is flushed — already-queued TTS frames are dropped
+        so the AI stops immediately — and the pump keeps running with background
+        only. ``ambient-background-mix`` D2/D5.
+        """
+        assert self.playout_q is not None
+        q = self.playout_q
+        leftover = b""
+        try:
+            async for chunk in chunks:
+                buf = leftover + chunk
+                off = 0
+                while off + FRAME_BYTES <= len(buf):
+                    await q.put(buf[off:off + FRAME_BYTES])
+                    off += FRAME_BYTES
+                leftover = buf[off:]
+            if leftover:  # pad the final partial frame to a full 10 ms shape
+                await q.put(leftover + b"\x00" * (FRAME_BYTES - len(leftover)))
+            await q.join()
+        except asyncio.CancelledError:
+            self._flush_playout()
+            raise
+
+    def _flush_playout(self) -> None:
+        q = self.playout_q
+        if q is None:
+            return
+        while True:
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            q.task_done()
+
+    async def _outbound_loop(self) -> None:
+        """Push one mixed 10 ms frame every 10 ms of wall-clock.
+
+        Monotonic absolute scheduling (target = start + idx·10ms) so jitter
+        doesn't accumulate drift — a frame that fires late is followed
+        immediately, not 10 ms later. ``ambient-background-mix`` D1/D4.
+        """
+        q = self.playout_q
+        reader = self.ambient_reader
+        gain = self.ambient_gain
+        frame_dt = 0.01
+        start = time.monotonic()
+        idx = 0
+        try:
+            while True:
+                idx += 1
+                target = start + idx * frame_dt
+                delay = target - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if q is not None:
+                    try:
+                        tts = q.get_nowait()
+                        has_tts = True
+                    except asyncio.QueueEmpty:
+                        tts = SILENCE_FRAME
+                        has_tts = False
+                else:  # pragma: no cover - enable_ambient always sets q
+                    tts = SILENCE_FRAME
+                    has_tts = False
+                bg = reader.next_frame() if reader is not None else SILENCE_FRAME
+                frame = mix_frame(tts, bg, gain)
+                try:
+                    await self.rtc_session.push_audio(frame, timestamp_ms=self._pump_ts)
+                except RtcNotJoined:
+                    if has_tts and q is not None:
+                        q.task_done()
+                    break
+                except Exception:  # noqa: BLE001 - one bad frame must not kill the pump
+                    logger.warning("ambient_pump_push_failed sid=%s", self.sid, exc_info=True)
+                else:
+                    self._pump_ts += 10
+                if has_tts and q is not None:
+                    q.task_done()
+        except asyncio.CancelledError:
+            raise
+
+    async def stop_outbound_pump(self) -> None:
+        pump = self.outbound_pump
+        if pump is None:
+            return
+        self.outbound_pump = None
+        pump.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await pump
+
     # ----- dispatcher-driven event handlers ------------------------------
 
     async def on_call_event(self, event: pb.CallEvent) -> None:
@@ -430,6 +567,9 @@ class _CallState:
             return
         self._closed = True
         await self.events_q.put(_SENTINEL)
+        # Stop the outbound mixing pump first so it stops pushing before the
+        # channel leaves (avoids RtcNotJoined spam from in-flight frames).
+        await self.stop_outbound_pump()
         # Leaving the channel terminates audio_frames(), which lets the
         # pump's finally block sentinel the inbound queue.
         if self.rtc_session.is_joined:
@@ -607,11 +747,41 @@ class RtcTelephonyClient(TelephonyClient):
 
     async def audio_out(self, call_id: int, chunks: AsyncIterator[bytes]) -> None:
         state = self._require_state(call_id)
+        if state.ambient_active:
+            # Continuous-pump path: feed frames to the pump, which mixes in the
+            # looped background and pushes at real-time. ambient-background-mix.
+            await state.feed_playout(chunks)
+            return
         async for chunk in chunks:
             await state.rtc_session.push_audio(
                 chunk,
                 timestamp_ms=state.next_timestamp_ms(),
             )
+
+    def configure_ambient(
+        self, call_id: int, asset: str | None, gain: float
+    ) -> None:
+        """Enable continuous outbound background mixing for this call.
+
+        Called by run_loop after the call connects, before the greeting. Empty
+        ``asset`` → no-op (background off, outbound stays direct-push). A
+        missing / unreadable asset logs and is also a no-op — the call proceeds
+        without background rather than failing. ``ambient-background-mix`` D6.
+        """
+        if not asset:
+            return
+        state = self._calls.get(call_id)
+        if state is None:
+            return
+        loop = get_ambient_loop(asset)
+        if loop is None:
+            logger.warning(
+                "ambient_disabled call=%s asset=%s reason=unavailable",
+                call_id, asset,
+            )
+            return
+        state.enable_ambient(loop.reader(), gain)
+        logger.info("ambient_enabled call=%s asset=%s gain=%.3f", call_id, asset, gain)
 
     def events(self, call_id: int) -> AsyncIterator[TelephonyEvent]:
         state = self._require_state(call_id)
