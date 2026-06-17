@@ -22,6 +22,10 @@ class WrapUpConfig:
     max_rounds: int
     max_seconds: int
     closing_phrases: tuple[str, ...]
+    # engine-wrap-up-bypass-referee: opt-in. When True the wrap-up turn runs a
+    # bypass (non-gating) done-detection referee. Default False keeps wrap-up
+    # referee-less (Slice-1 behavior).
+    referee_enabled: bool = False
 
 
 @dataclass

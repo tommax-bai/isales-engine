@@ -133,6 +133,17 @@ class KeywordDrivenMockLLM(LLMProvider):
     # reserved FILLER category (no-substance backchannel) — NOT in any routing
     # rule; it drives auto_restructure via the run_loop override.
     def _referee(self, system: str) -> _Decision:
+        # engine-wrap-up-bypass-referee: the wrap-up done-detection referee has a
+        # distinctive built-in prompt; classify on whether the customer's
+        # substituted utterance carries a substantive question keyword.
+        if "收尾阶段的判定助手" in system:
+            # Match keywords on the substituted customer utterance only — NOT the
+            # whole prompt (which lists 价格/细节… as examples and would always hit).
+            m = re.search(r"客户最后一句：(.*)", system)
+            utterance = m.group(1) if m else ""
+            if re.search(r"价格|多少钱|怎么|什么时候|地址|细节|为什么|能不能", utterance):
+                return _Decision(content="有问题")
+            return _Decision(content="无问题")
         if re.search(r"预约|成功|约见|appointment", system):
             category = "goal_achieved"
         elif re.search(r"转人工|人工", system):

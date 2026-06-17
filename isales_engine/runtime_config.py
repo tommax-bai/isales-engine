@@ -268,6 +268,8 @@ async def load_runtime_config(
         closing_phrases=tuple(
             str(p) for p in (campaign.wrap_up_closing_phrases or [])
         ),
+        # engine-wrap-up-bypass-referee: opt-in done-detection referee.
+        referee_enabled=campaign.wrap_up_referee_enabled,
     )
 
     _whitelist = [str(w) for w in (campaign.interruption_whitelist or [])]

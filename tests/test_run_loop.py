@@ -57,6 +57,7 @@ def _make_config(
     wrap_up_max_seconds: int = 30,
     silence_threshold_ms: int = 500,
     wrap_up_silence_hangup_ms: int = 6000,
+    wrap_up_referee_enabled: bool = False,
     filler_enabled: bool = False,
     enable_restructure: bool = False,
     routing_rules: list | None = None,
@@ -145,6 +146,7 @@ def _make_config(
             max_rounds=wrap_up_max_rounds,
             max_seconds=wrap_up_max_seconds,
             closing_phrases=("好的，再见。",),
+            referee_enabled=wrap_up_referee_enabled,
         ),
         interruption=InterruptionConfig(
             whitelist=("嗯", "好的"),
@@ -373,6 +375,146 @@ async def test_run_session_wrap_up_silence_hangs_up_without_reactivation() -> No
     assert hangups[0]["initiated_by"] == "ai"
     # The counter-exhaustion path did NOT fire.
     assert "wrap_up_completed" not in types
+
+
+# ---- engine-wrap-up-bypass-referee: done-detection referee ----------------
+
+
+async def _enter_wrap_up_then_say(
+    asr: ScriptedMockASR, second_utterance: str
+) -> None:
+    await asyncio.sleep(0.05)
+    await asr.feed_turn("我想预约一下")  # → goal_achieved → enters wrap-up
+    await asyncio.sleep(0.2)
+    await asr.feed_turn(second_utterance)  # → wrap-up turn → bypass referee
+    await asyncio.sleep(0.2)
+
+
+async def test_run_session_wrap_up_referee_hangs_up_when_no_substantive_question() -> None:
+    # Customer replies to the farewell with no substantive question ("嗯好的没事了")
+    # → bypass referee judges 无问题 → early hangup (reason wrap_up_referee_hangup),
+    # the closing reply still played, no extra phrase, counter did NOT fire.
+    session = _make_session()
+    config = _make_config(
+        wrap_up_referee_enabled=True,
+        wrap_up_max_rounds=5,  # high so the counter does NOT fire first
+        silence_threshold_ms=3000,
+        wrap_up_silence_hangup_ms=3000,
+    )
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    driver_task = asyncio.create_task(_enter_wrap_up_then_say(asr, "嗯好的没事了"))
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await driver_task
+
+    assert session.state.value == "end"
+    assert session.hangup_cause == "referee_hangup"
+    types = [e["type"] for e in session.full_transcript]
+    assert "wrap_up_started" in types
+    hangups = [e for e in session.full_transcript if e["type"] == "hangup"]
+    assert len(hangups) == 1
+    assert hangups[0]["reason"] == "wrap_up_referee_hangup"
+    assert hangups[0]["initiated_by"] == "ai"
+    # Counter exhaustion did NOT drive this end.
+    assert "wrap_up_completed" not in types
+    # The wrap-up referee result was recorded on the last trace.
+    assert session.pipeline_trace_records[-1]["referee_results"]
+
+
+async def test_run_session_wrap_up_referee_keeps_talking_on_substantive_question() -> None:
+    # Customer asks a real question ("价格是多少钱") → referee judges 有问题 → NO
+    # referee hangup; with max_rounds=1 the counter then ends the call instead.
+    session = _make_session()
+    config = _make_config(
+        wrap_up_referee_enabled=True,
+        wrap_up_max_rounds=1,
+        silence_threshold_ms=3000,
+        wrap_up_silence_hangup_ms=3000,
+    )
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    driver_task = asyncio.create_task(_enter_wrap_up_then_say(asr, "那个价格是多少钱"))
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await driver_task
+
+    assert session.state.value == "end"
+    # Ended via the counter, NOT the referee.
+    assert session.hangup_cause == "wrap_up_completed"
+    reasons = [e.get("reason") for e in session.full_transcript if e["type"] == "hangup"]
+    assert "wrap_up_referee_hangup" not in reasons
+
+
+async def test_run_session_wrap_up_referee_fail_open_on_timeout() -> None:
+    # A stalling referee LLM → wait_for times out → fail-open: NO referee hangup,
+    # falls through to the counter. Guards the "referee fault MUST NOT hang up" rule.
+    class _SlowRefereeLLM(KeywordDrivenMockLLM):
+        async def chat(self, messages, *, json_mode=False, **kw):
+            system = self._first_role(messages, "system")
+            if "收尾阶段的判定助手" in system:
+                await asyncio.sleep(0.5)  # stall past the wrap-up referee timeout
+            return await super().chat(messages, json_mode=json_mode, **kw)
+
+    session = _make_session()
+    config = _make_config(
+        wrap_up_referee_enabled=True,
+        wrap_up_max_rounds=1,
+        silence_threshold_ms=3000,
+        wrap_up_silence_hangup_ms=3000,
+    )
+    config.pipeline.referee_timeout_ms = 50  # << the 0.5s referee stall
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = Providers(
+        llm=_SlowRefereeLLM(), asr=asr, tts=_make_providers().tts
+    )
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    driver_task = asyncio.create_task(_enter_wrap_up_then_say(asr, "嗯好的没事了"))
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await driver_task
+
+    assert session.state.value == "end"
+    # Fail-open: referee timed out → no referee hangup → counter ended it.
+    assert session.hangup_cause == "wrap_up_completed"
+    reasons = [e.get("reason") for e in session.full_transcript if e["type"] == "hangup"]
+    assert "wrap_up_referee_hangup" not in reasons
+
+
+async def test_run_session_wrap_up_referee_disabled_by_default() -> None:
+    # Default (referee disabled): wrap-up turn spawns NO referee; same "无问题"
+    # utterance does NOT trigger a referee hangup — only the counter ends it.
+    session = _make_session()
+    config = _make_config(
+        wrap_up_referee_enabled=False,
+        wrap_up_max_rounds=1,
+        silence_threshold_ms=3000,
+        wrap_up_silence_hangup_ms=3000,
+    )
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    driver_task = asyncio.create_task(_enter_wrap_up_then_say(asr, "嗯好的没事了"))
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await driver_task
+
+    assert session.state.value == "end"
+    assert session.hangup_cause == "wrap_up_completed"
+    reasons = [e.get("reason") for e in session.full_transcript if e["type"] == "hangup"]
+    assert "wrap_up_referee_hangup" not in reasons
+    # No referee ran in the wrap-up turn → its trace referee_results stays empty.
+    assert session.pipeline_trace_records[-1]["referee_results"] == []
 
 
 # ---- silence: no user speech → activation → still nothing → hangup --------

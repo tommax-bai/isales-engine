@@ -47,7 +47,7 @@ from isales_common.schemas.messages.engine_event import (
     StatusChanged,
     TranscriptAppended,
 )
-from isales_common.schemas.pipeline import MainSpec
+from isales_common.schemas.pipeline import MainSpec, RefereeSpec
 
 from isales_engine.call_session import CallSession
 from isales_engine.event_publisher import EventPublisher
@@ -74,6 +74,7 @@ from isales_engine.realtime.interruption_detector import (
 )
 from isales_engine.realtime.silence_detector import SilenceConfig, evaluate_silence
 from isales_engine.realtime.telephony_client import TelephonyClient
+from isales_engine.referee import recent_dialog_rounds, run_referee
 from isales_engine.runtime_config import RuntimeConfig
 from isales_engine.state_machine import StateMachine
 from isales_engine.streaming.types import RefereeResult
@@ -1702,6 +1703,34 @@ async def _run_gated_turn(
     return Directive.CONTINUE
 
 
+# engine-wrap-up-bypass-referee: built-in done-detection referee for the wrap-up
+# phase (opt-in via campaign.wrap_up_referee_enabled). The prompt + category
+# vocabulary are engine constants (NOT routing_rules) — one referee, one action.
+# Scenario: after the farewell the customer speaks again; if they have no
+# substantive new question, hang up early instead of dragging on to the counter
+# cap. Hang up ONLY on the explicit "无问题" token — fail-open (None/timeout/other
+# → keep talking) so a referee error never cuts off a customer. Removal trigger:
+# drop these constants if wrap-up done-detection moves to an operator-configurable
+# wrap_up_routing_rules model.
+WRAP_UP_HANGUP_CATEGORIES: frozenset[str] = frozenset({"无问题"})
+WRAP_UP_REFEREE_PROMPT = (
+    "你是通话收尾阶段的判定助手。AI 刚对客户说完收尾/告别语。"
+    "请判断客户最后这句回复里，有没有需要 AI 继续回答的实质性新问题。\n"
+    "判定规则：\n"
+    "- 有需要 AI 回答的实质新问题（如追问价格、时间、产品细节、办理方式等）→ 输出：有问题\n"
+    "- 没有实质新问题（只是附和、客套、道别、表示同意结束、或无具体内容）→ 输出：无问题\n"
+    "只输出「有问题」或「无问题」其中一个词，不要输出任何别的内容。\n\n"
+    "客户最后一句：{{user_last_utterance}}\n"
+    "最近对话：\n{{recent_dialog_history}}"
+)
+_WRAP_UP_REFEREE_SPEC = RefereeSpec(
+    role_config_id=0,
+    prompt_version_id=0,
+    system_prompt=WRAP_UP_REFEREE_PROMPT,
+    label="wrap_up_referee",
+)
+
+
 async def _gated_wrap_up_turn(
     session: CallSession,
     sm: StateMachine,
@@ -1722,6 +1751,18 @@ async def _gated_wrap_up_turn(
         is_wrap_up=True, pipeline_timeout_ms=pipeline_timeout_ms,
         llm_registry=providers.llm_registry,
     )
+    # engine-wrap-up-bypass-referee: spawn the done-detection referee in PARALLEL
+    # with the closing reply (opt-in). The reply is NEVER gated by it — we only
+    # consume the verdict after `played`; a barge-in cancels it (see below).
+    ref_task: asyncio.Task[RefereeResult] | None = None
+    if config.wrap_up.referee_enabled:
+        ref_task = asyncio.create_task(
+            run_referee(
+                session, user_text,
+                recent_dialog_rounds(session.dialog_history),
+                _WRAP_UP_REFEREE_SPEC, providers.llm,
+            )
+        )
     sm.transition_to(CallStatus.IN_CALL, reason="main_stream_started")
     first_audio_ms, played = await _play_streaming(
         session, telephony, providers.tts, stream,
@@ -1746,9 +1787,40 @@ async def _gated_wrap_up_turn(
         is_wrap_up=True,
     )
     if not played:
+        # Barge-in mid-farewell: the customer may be asking a real question —
+        # cancel the referee so its verdict can never hang up an interrupting
+        # customer (and so the task + its LLM call don't leak).
+        if ref_task is not None:
+            ref_task.cancel()
         session.consecutive_interruption_count += 1
         session.interruption_signaled = False
         return Directive.CONTINUE
+
+    # engine-wrap-up-bypass-referee: the closing reply played in full — consume
+    # the bypass referee. Hang up ONLY on an explicit "无问题" token; any
+    # timeout/error/other token fails open to "keep talking" so a referee fault
+    # never cuts off the customer (the wrap-up counters remain the cap).
+    if ref_task is not None:
+        try:
+            ref_result: RefereeResult | None = await asyncio.wait_for(
+                ref_task, timeout=config.pipeline.referee_timeout_ms / 1000.0
+            )
+        except Exception:
+            ref_task.cancel()
+            ref_result = None
+        if ref_result is not None:
+            session.pipeline_trace_records[-1]["referee_results"] = [
+                ref_result.as_trace()
+            ]
+            if ref_result.category in WRAP_UP_HANGUP_CATEGORIES:
+                session.hangup_cause = HangupCause.REFEREE_HANGUP.value
+                sm.transition_to(
+                    CallStatus.END, reason="wrap_up_referee_hangup", force=True
+                )
+                session.append_event(
+                    "hangup", reason="wrap_up_referee_hangup", initiated_by="ai"
+                )
+                return Directive.RETURN
 
     session.wrap_up_round_count += 1
     wrap_decision = evaluate_wrap_up(
