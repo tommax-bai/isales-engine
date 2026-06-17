@@ -557,13 +557,20 @@ async def _main_turn_loop(
                         session, telephony, providers.tts, outcome.text,
                         voice_id=config.voice_id,
                     )
-                sm.transition_to(
-                    CallStatus.END, reason="silence_max_reached", force=True
+                # engine-wrap-up-silence-hangup: in WRAPPING_UP a silence hangup is
+                # the "customer went silent after the farewell" scenario (call-215),
+                # distinct from main-phase silence-max exhaustion — record it under a
+                # free-form HangupEvent reason so transcript/analytics can tell them
+                # apart, while REUSING HangupCause.SILENCE_MAX_REACHED to avoid an
+                # enum bump + the hangup_cause column-validation risk. Removal
+                # trigger: drop the branch if wrap-up silence ever needs its own
+                # HangupCause for retry-followup routing.
+                reason = (
+                    "wrap_up_silence" if session.in_wrap_up else "silence_max_reached"
                 )
+                sm.transition_to(CallStatus.END, reason=reason, force=True)
                 session.hangup_cause = HangupCause.SILENCE_MAX_REACHED.value
-                session.append_event(
-                    "hangup", reason="silence_max_reached", initiated_by="ai"
-                )
+                session.append_event("hangup", reason=reason, initiated_by="ai")
                 return
 
             if outcome.kind == "silence_activation":
@@ -751,7 +758,15 @@ async def _await_user_or_silence(
         return _UserAwait(kind="remote_hangup")
 
     listen_started = time.monotonic()
-    silence_s = silence_cfg.threshold_ms / 1000.0
+    # engine-wrap-up-silence-hangup: in WRAPPING_UP wait the (longer) wrap-up
+    # window so a single listening window actually reaches wrap_up_hangup_ms.
+    # Without this the window wakes at the shorter main threshold, elapsed < the
+    # wrap-up window, evaluate_silence returns "wait", and — the activate ladder
+    # being skipped in wrap-up — nothing accumulates, so the hangup would NEVER
+    # fire. Removal trigger: drop when wrap-up stops reusing the main silence loop.
+    silence_s = (
+        silence_cfg.wrap_up_hangup_ms if session.in_wrap_up else silence_cfg.threshold_ms
+    ) / 1000.0
 
     asr_get: asyncio.Task[ASRResult] = asyncio.create_task(asr_finals_q.get())
     hangup_wait: asyncio.Task[bool] = asyncio.create_task(hangup_event.wait())
@@ -810,6 +825,7 @@ async def _await_user_or_silence(
         silence_elapsed_ms=elapsed,
         activations_so_far=session.silence_activation_count,
         config=silence_cfg,
+        in_wrap_up=session.in_wrap_up,
     )
     if decision.decision == "activate":
         return _UserAwait(kind="silence_activation", text=decision.phrase)

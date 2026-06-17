@@ -298,6 +298,8 @@ async def load_runtime_config(
         # Preserve an empty phrase so silence-max can直接挂断不播话术 (§11);
         # only coerce a missing (NULL) value to empty, never to a default phrase.
         hangup_phrase=campaign.silence_hangup_phrase or "",
+        # engine-wrap-up-silence-hangup: WRAPPING_UP-phase silence hangup window.
+        wrap_up_hangup_ms=campaign.wrap_up_silence_hangup_ms,
     )
 
     _ = pipeline_default_timeout_ms  # carried in CallSession.run() args

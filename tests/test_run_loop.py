@@ -56,6 +56,7 @@ def _make_config(
     wrap_up_max_rounds: int = 1,
     wrap_up_max_seconds: int = 30,
     silence_threshold_ms: int = 500,
+    wrap_up_silence_hangup_ms: int = 6000,
     filler_enabled: bool = False,
     enable_restructure: bool = False,
     routing_rules: list | None = None,
@@ -154,6 +155,7 @@ def _make_config(
             max_activations=1,
             phrases=("您还在吗？",),
             hangup_phrase="再见。",
+            wrap_up_hangup_ms=wrap_up_silence_hangup_ms,
         ),
         voice_id="default",
         fixed_greeting="您好我是 AI 助手。",
@@ -319,6 +321,58 @@ async def test_run_session_goal_achieved_enters_wrap_up_then_exhausts() -> None:
     assert "wrap_up_completed" in types
     # 1 main pipeline + 1 wrap-up simplified pipeline = 2 traces.
     assert len(session.pipeline_trace_records) == 2
+
+
+# ---- engine-wrap-up-silence-hangup: call-215 regression -------------------
+
+
+async def test_run_session_wrap_up_silence_hangs_up_without_reactivation() -> None:
+    # call-215: goal achieved → enter wrap-up → customer goes silent after the
+    # farewell. The engine MUST hang up directly (reason=wrap_up_silence) and MUST
+    # NOT replay the "您还在吗？" reactivation. wrap_up window (300ms) is set LONGER
+    # than the main silence threshold (100ms) to also guard the asyncio.wait
+    # timing fix (D3): if the wait woke at 100ms and never accumulated to 300ms,
+    # the hangup would never fire and this test would hang/time out.
+    session = _make_session()
+    config = _make_config(
+        silence_threshold_ms=100,
+        wrap_up_silence_hangup_ms=300,
+        wrap_up_max_rounds=5,  # high so the counter does NOT fire first
+        wrap_up_max_seconds=30,
+    )
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = _make_providers(asr=asr)
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    async def driver() -> None:
+        await asyncio.sleep(0.05)
+        # "预约" → goal_achieved → enters wrap-up. Then the customer says nothing.
+        await asr.feed_turn("我想预约一下")
+        # No further turns: silence in wrap-up should drive the hangup.
+
+    driver_task = asyncio.create_task(driver())
+    await run_session(
+        session,
+        phone="+8613800000000",
+        config=config,
+        telephony=tel,
+        providers=providers,
+    )
+    await driver_task
+
+    assert session.state.value == "end"
+    assert session.hangup_cause == "silence_max_reached"
+    types = [e["type"] for e in session.full_transcript]
+    assert "wrap_up_started" in types  # confirms we entered wrap-up
+    # The reactivation ladder MUST be skipped in wrap-up.
+    assert "silence_activation" not in types
+    # Hangup recorded under the distinct free-form reason, initiated by the AI.
+    hangups = [e for e in session.full_transcript if e["type"] == "hangup"]
+    assert len(hangups) == 1
+    assert hangups[0]["reason"] == "wrap_up_silence"
+    assert hangups[0]["initiated_by"] == "ai"
+    # The counter-exhaustion path did NOT fire.
+    assert "wrap_up_completed" not in types
 
 
 # ---- silence: no user speech → activation → still nothing → hangup --------

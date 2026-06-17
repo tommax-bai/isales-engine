@@ -161,3 +161,60 @@ def test_silence_phrases_more_than_max_only_uses_first_n() -> None:
         ).decision
         == "hangup"
     )
+
+
+# ---- engine-wrap-up-silence-hangup: WRAPPING_UP-phase silence ------------
+
+
+def _wrap_up_cfg() -> SilenceConfig:
+    # Main-phase threshold 3000 (would normally activate), wrap-up window 6000.
+    return SilenceConfig(
+        threshold_ms=3000,
+        max_activations=2,
+        phrases=("您还在吗？",),
+        hangup_phrase="再见。",
+        wrap_up_hangup_ms=6000,
+    )
+
+
+def test_wrap_up_silence_below_window_waits() -> None:
+    # In wrap-up, even past the main threshold (3000) we do NOT activate — we
+    # wait until the longer wrap-up window.
+    d = evaluate_silence(
+        silence_elapsed_ms=3500, activations_so_far=0,
+        config=_wrap_up_cfg(), in_wrap_up=True,
+    )
+    assert d.decision == "wait"
+    assert d.phrase is None
+
+
+def test_wrap_up_silence_reaches_window_hangs_up_no_phrase() -> None:
+    d = evaluate_silence(
+        silence_elapsed_ms=6000, activations_so_far=0,
+        config=_wrap_up_cfg(), in_wrap_up=True,
+    )
+    assert d.decision == "hangup"
+    # Farewell already delivered → no reactivation/hangup phrase replayed.
+    assert d.phrase is None
+
+
+def test_wrap_up_silence_never_activates_regardless_of_activations() -> None:
+    # The activate ladder is skipped entirely in wrap-up — even with 0 activations
+    # so far and phrases configured, we never return "activate".
+    for elapsed in (3500, 6000, 9000):
+        d = evaluate_silence(
+            silence_elapsed_ms=elapsed, activations_so_far=0,
+            config=_wrap_up_cfg(), in_wrap_up=True,
+        )
+        assert d.decision in ("wait", "hangup")
+        assert d.decision != "activate"
+
+
+def test_main_phase_unchanged_when_not_in_wrap_up() -> None:
+    # Same cfg, in_wrap_up=False → the original activate-ladder behavior holds.
+    d = evaluate_silence(
+        silence_elapsed_ms=3500, activations_so_far=0,
+        config=_wrap_up_cfg(), in_wrap_up=False,
+    )
+    assert d.decision == "activate"
+    assert d.phrase == "您还在吗？"
