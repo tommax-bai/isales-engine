@@ -194,6 +194,14 @@ async def run_session(
             session.call_record_id, config.ambient_audio, config.ambient_gain
         )
 
+        # engine-barge-in-fade-out: per-campaign barge-in fade-out window. The
+        # outbound pump is now always-on (configure_ambient starts it even with
+        # no bed), so this just tunes how the still-buffered TTS trails off when
+        # a barge-in cancels it (0 = legacy hard cut).
+        telephony.set_barge_in_fadeout(
+            session.call_record_id, config.barge_in_fadeout_ms
+        )
+
         # NOTE on greeting interruptibility: the barge-in MONITORS start AFTER
         # the greeting (see _start_monitors below), so the greeting cannot be
         # barged in on. (An earlier 2026-05-28 rationale attributing

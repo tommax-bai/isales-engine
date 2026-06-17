@@ -205,6 +205,11 @@ async def _wired() -> AsyncIterator[
     try:
         yield client, sim_edge, cloud_rtc
     finally:
+        # engine-barge-in-fade-out: the outbound pump is now always-on (started
+        # by audio_out / configure_ambient), so stop any per-call pump before
+        # tearing down the loop to avoid a leaked background task.
+        for st in client._calls.values():  # noqa: SLF001 - test teardown
+            await st.stop_outbound_pump()
         await grpc_client.stop()
         await server.stop()
 
@@ -390,6 +395,18 @@ async def test_audio_out_pushes_through_cloud_rtc_with_monotonic_timestamps() ->
 
         # Sanity: 3 chunks were pulled (the async generator returned).
         # The implicit assertion is that the call completed without raising.
+
+
+@pytest.mark.asyncio
+async def test_set_barge_in_fadeout_updates_call_state() -> None:
+    # engine-barge-in-fade-out Slice 2: run_loop pushes the per-campaign value
+    # through this setter; it must land on the call state used by _flush_playout.
+    async with _wired() as (client, _edge, _cloud_rtc):
+        await client.dial(call_id=1, phone="1")
+        client.set_barge_in_fadeout(1, 40)
+        assert client._calls[1]._barge_in_fadeout_ms == 40  # noqa: SLF001
+        # unknown call_id is a safe no-op (no raise)
+        client.set_barge_in_fadeout(999, 40)
 
 
 # --------------------------------------------------------------------------

@@ -80,6 +80,14 @@ class TelephonyClient(ABC):
         ``ambient-background-mix``.
         """
 
+    def set_barge_in_fadeout(self, call_id: int, fadeout_ms: int) -> None:
+        """Set the barge-in fade-out window (ms) for this call.
+
+        Default no-op: backends without a buffered outbound pump can only hard
+        cut. ``RtcTelephonyClient`` overrides to ramp the still-buffered TTS down
+        instead of cutting to silence on barge-in. ``engine-barge-in-fade-out``.
+        """
+
     @abstractmethod
     def events(self, call_id: int) -> AsyncIterator[TelephonyEvent]:
         """Per-call event stream — connected / hangup / device_error."""

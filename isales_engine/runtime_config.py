@@ -70,6 +70,10 @@ class RuntimeConfig:
     # level for the background relative to TTS (0.1 ≈ -20dB).
     ambient_audio: str | None = None
     ambient_gain: float = 0.1
+    # barge-in fade-out window in ms (engine-barge-in-fade-out). Derived from
+    # campaign.barge_in_fadeout_ms. On a barge-in the still-buffered TTS is ramped
+    # down over this window instead of hard-cut to silence; 0 = legacy hard cut.
+    barge_in_fadeout_ms: int = 100
     # Continuous-interruption protection (ai-pipeline spec delta). Read by
     # run_loop._decide_protection. Stored at RuntimeConfig level (not on
     # InterruptionConfig) because the strategy is a campaign-level policy,
@@ -348,6 +352,7 @@ async def load_runtime_config(
         filler_delay_ms=filler_delay_ms,
         ambient_audio=campaign.ambient_audio,
         ambient_gain=campaign.ambient_gain,
+        barge_in_fadeout_ms=campaign.barge_in_fadeout_ms,
         _max_continuous_interruptions=campaign.max_continuous_interruptions,
         _continuous_interruption_strategy=strategy_value,
     )

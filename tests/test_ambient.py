@@ -24,10 +24,12 @@ from isales_engine.realtime.ambient import (
     FRAME_BYTES,
     FRAME_SAMPLES,
     AmbientLoop,
+    apply_fadeout,
     get_ambient_loop,
     mix_frame,
 )
 from isales_engine.realtime.rtc_telephony import (
+    DEFAULT_BARGE_IN_FADEOUT_MS,
     PLAYOUT_PREBUFFER_FRAMES,
     _CallState,
 )
@@ -69,6 +71,37 @@ def test_mix_gain_zero_is_passthrough() -> None:
 def test_mix_empty_bg_is_passthrough() -> None:
     tts = _const_frame(1234)
     assert mix_frame(tts, b"", 0.5) == tts
+
+
+# --------------------------------------------------------------------------
+# apply_fadeout (engine-barge-in-fade-out)
+# --------------------------------------------------------------------------
+
+
+def _samples(frame: bytes) -> list[int]:
+    return list(struct.unpack(f"<{len(frame) // 2}h", frame))
+
+
+def test_fadeout_starts_full_ends_silent() -> None:
+    out = apply_fadeout([_const_frame(1000) for _ in range(4)])
+    samples = [s for f in out for s in _samples(f)]
+    assert samples[0] == 1000  # first sample: gain 1.0, voice still at full level
+    assert samples[-1] == 0  # last sample: gain 0.0, exact silence (no click after)
+    # constant source → the per-sample gain ramp shows directly: non-increasing.
+    assert all(a >= b for a, b in zip(samples, samples[1:]))
+
+
+def test_fadeout_preserves_shape_and_does_not_mutate() -> None:
+    frames = [_const_frame(1000) for _ in range(3)]
+    original = [bytes(f) for f in frames]
+    out = apply_fadeout(frames)
+    assert len(out) == len(frames)
+    assert all(len(o) == FRAME_BYTES for o in out)
+    assert frames == original  # input buffers untouched
+
+
+def test_fadeout_empty_is_noop() -> None:
+    assert apply_fadeout([]) == []
 
 
 # --------------------------------------------------------------------------
@@ -176,7 +209,7 @@ async def _make_state(reader_value: int = 5, gain: float = 0.5) -> tuple[_CallSt
     await sess.join("c", "t", "engine-c")
     state = _CallState(
         call_id=1, rtc_session=sess, edge_uid="edge",
-        device_id=0, edge_device_id="edge", outbound_frame_ms=20,
+        device_id=0, edge_device_id="edge",
     )
     state.enable_ambient(_const_loop(reader_value).reader(), gain)
     return state, sess
@@ -263,7 +296,7 @@ async def test_feed_playout_pads_partial_final_frame() -> None:
 
 
 @pytest.mark.asyncio
-async def test_barge_in_flush_keeps_background() -> None:
+async def test_barge_in_fades_out_then_keeps_background() -> None:
     state, sess = await _make_state(reader_value=9, gain=1.0)
     try:
         # Fill the queue, then cancel feed mid-flight (barge-in).
@@ -271,17 +304,119 @@ async def test_barge_in_flush_keeps_background() -> None:
             state.feed_playout(_chunks(*[_const_frame(2000)] * 100))
         )
         await asyncio.sleep(0.02)
+        before = len(sess.pushed)
         feed.cancel()
         with pytest.raises(asyncio.CancelledError):
             await feed
-        assert state.playout_q is not None and state.playout_q.qsize() == 0  # flushed
-        before = len(sess.pushed)
-        await asyncio.sleep(0.04)
-        # pump still pushing background frames (value 9) after barge-in
-        assert len(sess.pushed) > before
-        assert struct.unpack("<h", sess.pushed[-1][0][:2])[0] == 9
+        # engine-barge-in-fade-out: the queue is NOT hard-cut to empty — the
+        # first ~fadeout_ms of still-queued TTS is re-queued ramped down to
+        # silence, so a short fade tail remains rather than ~all 100 frames.
+        q = state.playout_q
+        assert q is not None
+        n_fade = -(-state._barge_in_fadeout_ms // 10)  # ceil(fadeout_ms/10)
+        assert 0 < q.qsize() <= n_fade
+        # Let the fade tail drain, then settle on background. Pushed = mix(TTS, bg=9).
+        await asyncio.sleep(n_fade * 0.01 + 0.05)
+        post = [struct.unpack("<h", p[:2])[0] for p, _ in sess.pushed[before:]]
+        assert post, "pump pushed nothing after barge-in"
+        assert post[0] > post[-1]            # voice ramps DOWN, not a hard step
+        assert post[-1] == 9                 # settles on background-only (TTS→0)
+        assert any(v > 9 for v in post)      # at least one faded-TTS+bg frame
     finally:
         await state.stop_outbound_pump()
+
+
+@pytest.mark.asyncio
+async def test_flush_playout_zero_is_hard_cut() -> None:
+    # engine-barge-in-fade-out D5: fadeout_ms == 0 keeps the legacy hard cut
+    # (drop everything still queued). No pump → deterministic queue inspection.
+    sess = _CapSession()
+    state = _CallState(
+        call_id=1, rtc_session=sess, edge_uid="e", device_id=0, edge_device_id="e",
+    )
+    state.playout_q = asyncio.Queue(maxsize=300)
+    for _ in range(30):
+        state.playout_q.put_nowait(_const_frame(2000))
+    state._flush_playout(0)
+    assert state.playout_q.qsize() == 0
+
+
+async def _make_bare_state() -> tuple[_CallState, _CapSession]:
+    """A call with the outbound pump started but NO background bed — the default
+    production path (campaign.ambient_audio unset). engine-barge-in-fade-out D3."""
+    sess = _CapSession()
+    await sess.join("c", "t", "engine-c")
+    state = _CallState(
+        call_id=1, rtc_session=sess, edge_uid="edge", device_id=0, edge_device_id="edge",
+    )
+    state.start_outbound_pump()
+    return state, sess
+
+
+@pytest.mark.asyncio
+async def test_bare_pump_pushes_tts_unchanged() -> None:
+    # No ambient → mix_frame passthrough → pushed frames are the TTS bytes
+    # (or background-silence between), never a non-zero bed.
+    state, sess = await _make_bare_state()
+    try:
+        assert state.ambient_active is False
+        await state.feed_playout(_chunks(_const_frame(1234), _const_frame(1234)))
+        vals = [struct.unpack("<h", p[:2])[0] for p, _ in sess.pushed]
+        assert 1234 in vals  # TTS pushed through unmixed
+        assert all(v in (0, 1234) for v in vals)  # only TTS or silence, no bed
+    finally:
+        await state.stop_outbound_pump()
+
+
+@pytest.mark.asyncio
+async def test_bare_pump_no_cushion_first_audio_not_delayed() -> None:
+    # The ~200ms prebuffer cushion is skipped without ambient, so a short TTS
+    # burst reaches the pump without waiting for PLAYOUT_PREBUFFER_FRAMES.
+    state, sess = await _make_bare_state()
+    try:
+        # Fewer frames than the cushion would hold: with a cushion these would be
+        # stuck until stream end; without one they flow straight to the pump.
+        few = [_const_frame(777)] * (PLAYOUT_PREBUFFER_FRAMES // 2)
+        feed = asyncio.create_task(state.feed_playout(_chunks(*few)))
+        await asyncio.sleep(0.03)  # a few pump ticks
+        assert any(
+            struct.unpack("<h", p[:2])[0] == 777 for p, _ in sess.pushed
+        ), "bare TTS should reach the pump without the 200ms cushion"
+        await feed
+    finally:
+        await state.stop_outbound_pump()
+
+
+@pytest.mark.asyncio
+async def test_bare_pump_fades_out_on_barge_in() -> None:
+    # Fade-out works on the no-ambient path too (the unified pump path).
+    state, sess = await _make_bare_state()
+    try:
+        feed = asyncio.create_task(
+            state.feed_playout(_chunks(*[_const_frame(2000)] * 100))
+        )
+        await asyncio.sleep(0.02)
+        before = len(sess.pushed)
+        feed.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await feed
+        n_fade = -(-state._barge_in_fadeout_ms // 10)
+        assert state.playout_q is not None and 0 < state.playout_q.qsize() <= n_fade
+        await asyncio.sleep(n_fade * 0.01 + 0.05)
+        post = [struct.unpack("<h", p[:2])[0] for p, _ in sess.pushed[before:]]
+        assert post and post[0] > post[-1]  # ramps down
+        assert post[-1] == 0  # no ambient → settles on silence
+    finally:
+        await state.stop_outbound_pump()
+
+
+@pytest.mark.asyncio
+async def test_default_barge_in_fadeout_is_set() -> None:
+    sess = _CapSession()
+    state = _CallState(
+        call_id=1, rtc_session=sess, edge_uid="e", device_id=0, edge_device_id="e",
+    )
+    assert state._barge_in_fadeout_ms == DEFAULT_BARGE_IN_FADEOUT_MS
 
 
 @pytest.mark.asyncio

@@ -80,6 +80,7 @@ from isales_engine.realtime.ambient import (
     FRAME_BYTES,
     SILENCE_FRAME,
     AmbientReader,
+    apply_fadeout,
     get_ambient_loop,
     mix_frame,
 )
@@ -109,6 +110,14 @@ _SENTINEL: Any = object()
 # pump gives it a buffer that absorbs the stall. 20 frames × 10 ms = 200 ms.
 PLAYOUT_PREBUFFER_FRAMES = 20
 
+# engine-barge-in-fade-out: default fade-out window applied to the still-buffered
+# TTS when a barge-in cancels the AI mid-utterance, instead of a hard cut to
+# silence. ~100 ms reads as a natural human "trail-off" while staying well inside
+# the ~200 ms turn-gap floor; 15-30 ms would only declick. 0 = keep the old hard
+# cut. The per-campaign value (campaign.barge_in_fadeout_ms) overrides this via
+# set_barge_in_fadeout(); this constant is the default when none is set.
+DEFAULT_BARGE_IN_FADEOUT_MS = 100
+
 
 _HANGUP_CAUSE_DETAIL = {
     pb.HANGUP_CAUSE_UNSPECIFIED: "unspecified",
@@ -137,7 +146,6 @@ class _CallState:
         edge_uid: str,
         device_id: int,
         edge_device_id: str,
-        outbound_frame_ms: int,
     ) -> None:
         self.call_id = call_id
         self.sid = str(call_id)
@@ -153,33 +161,27 @@ class _CallState:
         # ``vad_q``. Both close on ``_SENTINEL``.
         self.vad_q: asyncio.Queue[bytes | object] = asyncio.Queue()
         self.inbound_pump: asyncio.Task[None] | None = None
-        self._outbound_ts: int = 0
-        self._outbound_frame_ms = outbound_frame_ms
         # Set the first time a terminal event (remote_hangup / device_error /
         # local hangup) closes the iterators, so subsequent terminals
         # don't double-emit sentinels.
         self._closed = False
 
-        # ambient-background-mix: when enabled (campaign.ambient_audio set), the
-        # outbound path switches from pull-driven direct-push to a continuous
-        # mixing pump. ``audio_out`` feeds 10 ms TTS frames into ``playout_q``;
-        # the pump pushes one mixed (TTS + looped background) frame every 10 ms
-        # of wall-clock so the customer hears persistent room tone even between
-        # sentences. Disabled (default) → these stay unset and the original
-        # direct-push path runs byte-for-byte.
+        # engine-barge-in-fade-out: outbound TTS ALWAYS flows through one queue +
+        # mixing pump (start_outbound_pump), regardless of ambient — so a barge-in
+        # has buffered audio to fade out in exactly one place (_flush_playout) and
+        # the old no-buffer direct-push path is gone. ``ambient_active`` now only
+        # selects whether a background bed is mixed in and whether the ~200 ms
+        # jitter cushion applies (it does not for the bare-TTS case, to preserve
+        # first-audio latency). ``_barge_in_fadeout_ms`` is the fade window
+        # applied on cancel (DEFAULT_BARGE_IN_FADEOUT_MS until a per-campaign
+        # value is wired in).
         self.ambient_active = False
         self.ambient_reader: AmbientReader | None = None
         self.ambient_gain = 0.0
         self.playout_q: asyncio.Queue[bytes] | None = None
         self.outbound_pump: asyncio.Task[None] | None = None
         self._pump_ts = 0
-
-    # ----- timestamping for push_audio -----------------------------------
-
-    def next_timestamp_ms(self) -> int:
-        ts = self._outbound_ts
-        self._outbound_ts += self._outbound_frame_ms
-        return ts
+        self._barge_in_fadeout_ms = DEFAULT_BARGE_IN_FADEOUT_MS
 
     # ----- inbound PCM pump ----------------------------------------------
 
@@ -394,35 +396,50 @@ class _CallState:
             await self.inbound_q.put(_SENTINEL)
             await self.vad_q.put(_SENTINEL)
 
-    # ----- outbound ambient mixing pump ----------------------------------
+    # ----- outbound mixing pump ------------------------------------------
 
-    def enable_ambient(self, reader: AmbientReader, gain: float) -> None:
-        """Switch the outbound path to continuous mixing and start the pump.
+    def start_outbound_pump(self) -> None:
+        """Start the always-on outbound playout buffer + mixing pump.
 
-        Idempotent — a second call is a no-op (the pump is per-call).
-        ``ambient-background-mix`` D1/D2.
+        engine-barge-in-fade-out D3: ALL outbound TTS flows through this queue +
+        pump whether or not a background bed is configured, so the barge-in
+        fade-out (_flush_playout) has buffered audio to ramp down in one place.
+        Idempotent — once started the pump is per-call. The pump reads
+        ``ambient_reader`` / ``ambient_gain`` per frame, so ``enable_ambient``
+        may flip the background on AFTER the pump is already running.
         """
-        if self.ambient_active:
+        if self.outbound_pump is not None:
             return
-        self.ambient_reader = reader
-        self.ambient_gain = gain
         # ~3 s of buffered TTS frames before back-pressuring audio_out. TTS
         # arrives faster than real-time (a single chunk can be 250-400 ms);
         # the pump drains at exactly real-time, so a bound is needed.
         self.playout_q = asyncio.Queue(maxsize=300)
-        self.ambient_active = True
         self.outbound_pump = asyncio.create_task(
             self._outbound_loop(), name=f"rtc_outbound_pump_{self.sid}",
         )
+
+    def enable_ambient(self, reader: AmbientReader, gain: float) -> None:
+        """Mix a continuous background bed into the outbound stream.
+
+        Only sets the background content + gain; the outbound pump itself is
+        started unconditionally by :meth:`start_outbound_pump`. Idempotent — a
+        second call is a no-op. ``ambient-background-mix`` D1/D2.
+        """
+        if self.ambient_active:
+            return
+        self.start_outbound_pump()
+        self.ambient_reader = reader
+        self.ambient_gain = gain
+        self.ambient_active = True
 
     async def feed_playout(self, chunks: AsyncIterator[bytes]) -> None:
         """Slice a TTS PCM stream into 10 ms frames and enqueue for the pump.
 
         Returns once the pump has consumed (pushed) every enqueued frame, so the
         caller's "playback complete" contract still holds. On ``CancelledError``
-        (barge-in) the queue is flushed — already-queued TTS frames are dropped
-        so the AI stops immediately — and the pump keeps running with background
-        only. ``ambient-background-mix`` D2/D5.
+        (barge-in) the still-buffered TTS is faded out rather than hard-cut
+        (engine-barge-in-fade-out) — the pump keeps running with background only.
+        ``ambient-background-mix`` D2/D5.
         """
         assert self.playout_q is not None
         q = self.playout_q
@@ -430,16 +447,16 @@ class _CallState:
         # Jitter cushion: hold the first PLAYOUT_PREBUFFER_FRAMES (~200 ms)
         # before releasing any frame to the pump, so each burst starts with a
         # buffer that absorbs a transient TTS underflow instead of letting the
-        # pump punch a silence gap into the speech (the choppy / 生硬 the
-        # pre-ambient direct-push path avoided via the RTC SDK's own jitter
-        # buffer). When the sentence is already pre-synthesized (_SynthJob, the
-        # common case for sentences ≥2) the cushion fills near-instantly →
-        # ~0 added latency; only a genuinely slow vendor pays up to 200 ms,
-        # which is exactly when the smoothing is needed. The cushion is flushed
-        # on stream end so a sentence shorter than the cushion still plays and
-        # ``q.join()`` cannot deadlock.
+        # pump punch a silence gap into the speech. ONLY applied when a
+        # background bed is mixed (ambient_active): the bed makes the pump's
+        # strict 10 ms grid audible across underflows, so smoothing earns its
+        # latency. For bare TTS (no ambient — the default) the cushion is
+        # skipped (primed from the start) so first-audio latency matches the old
+        # direct-push path; the natural queue backlog (TTS bursts ahead of
+        # real-time) still supplies frames for the barge-in fade-out.
+        # engine-barge-in-fade-out R1.
         cushion: list[bytes] = []
-        primed = False
+        primed = not self.ambient_active
         try:
             async for chunk in chunks:
                 buf = leftover + chunk
@@ -465,19 +482,36 @@ class _CallState:
                 await q.put(leftover + b"\x00" * (FRAME_BYTES - len(leftover)))
             await q.join()
         except asyncio.CancelledError:
-            self._flush_playout()
+            self._flush_playout(self._barge_in_fadeout_ms)
             raise
 
-    def _flush_playout(self) -> None:
+    def _flush_playout(self, fadeout_ms: int = 0) -> None:
+        """Stop buffered TTS playback on barge-in.
+
+        engine-barge-in-fade-out: drain everything still queued, then — when
+        ``fadeout_ms > 0`` — re-queue the first ``ceil(fadeout_ms/10)`` frames
+        ramped down to silence so the AI voice trails off instead of clicking to
+        zero. ``fadeout_ms == 0`` keeps the legacy hard cut (drop everything).
+        Synchronous, so the pump cannot interleave between the drain and the
+        re-queue. ``task_done`` accounting stays balanced: every drained frame is
+        marked done here; each re-queued faded frame is a fresh item the pump
+        marks done when it pushes it.
+        """
         q = self.playout_q
         if q is None:
             return
+        pending: list[bytes] = []
         while True:
             try:
-                q.get_nowait()
+                pending.append(q.get_nowait())
             except asyncio.QueueEmpty:
                 break
             q.task_done()
+        if fadeout_ms <= 0 or not pending:
+            return  # legacy hard cut, or nothing buffered to fade
+        n = min(-(-fadeout_ms // 10), len(pending))  # ceil(fadeout_ms/10), capped
+        for frame in apply_fadeout(pending[:n]):
+            q.put_nowait(frame)
 
     async def _outbound_loop(self) -> None:
         """Push one mixed 10 ms frame every 10 ms of wall-clock.
@@ -485,10 +519,14 @@ class _CallState:
         Monotonic absolute scheduling (target = start + idx·10ms) so jitter
         doesn't accumulate drift — a frame that fires late is followed
         immediately, not 10 ms later. ``ambient-background-mix`` D1/D4.
+
+        ``ambient_reader`` / ``ambient_gain`` are read PER FRAME (not captured at
+        task start) so a background bed enabled after the pump is already running
+        (engine-barge-in-fade-out always starts the pump up front) still takes
+        effect. With no bed (``reader is None`` / ``gain == 0``) ``mix_frame``
+        returns the TTS frame unchanged, i.e. bare-TTS playout.
         """
         q = self.playout_q
-        reader = self.ambient_reader
-        gain = self.ambient_gain
         frame_dt = 0.01
         start = time.monotonic()
         idx = 0
@@ -506,11 +544,12 @@ class _CallState:
                     except asyncio.QueueEmpty:
                         tts = SILENCE_FRAME
                         has_tts = False
-                else:  # pragma: no cover - enable_ambient always sets q
+                else:  # pragma: no cover - start_outbound_pump always sets q
                     tts = SILENCE_FRAME
                     has_tts = False
+                reader = self.ambient_reader
                 bg = reader.next_frame() if reader is not None else SILENCE_FRAME
-                frame = mix_frame(tts, bg, gain)
+                frame = mix_frame(tts, bg, self.ambient_gain)
                 try:
                     await self.rtc_session.push_audio(frame, timestamp_ms=self._pump_ts)
                 except RtcNotJoined:
@@ -632,14 +671,12 @@ class RtcTelephonyClient(TelephonyClient):
         dispatcher: EngineSessionDispatcher,
         token_issuer: RtcTokenIssuer,
         rtc_session_factory: Callable[[], RtcSession],
-        outbound_frame_ms: int = 20,
     ) -> None:
         self._legacy_edge_device_id = edge_device_id
         self._grpc = grpc_server
         self._dispatcher = dispatcher
         self._issuer = token_issuer
         self._rtc_session_factory = rtc_session_factory
-        self._outbound_frame_ms = outbound_frame_ms
 
         # Engine-side call_id (int) → state.
         self._calls: dict[int, _CallState] = {}
@@ -670,7 +707,6 @@ class RtcTelephonyClient(TelephonyClient):
             edge_uid=edge_creds.user_id,
             device_id=self._pending_devices.pop(call_id, 0),
             edge_device_id="",  # resolved below
-            outbound_frame_ms=self._outbound_frame_ms,
         )
 
         # Resolve the target edge: if a legacy edge_device_id was configured,
@@ -782,31 +818,30 @@ class RtcTelephonyClient(TelephonyClient):
 
     async def audio_out(self, call_id: int, chunks: AsyncIterator[bytes]) -> None:
         state = self._require_state(call_id)
-        if state.ambient_active:
-            # Continuous-pump path: feed frames to the pump, which mixes in the
-            # looped background and pushes at real-time. ambient-background-mix.
-            await state.feed_playout(chunks)
-            return
-        async for chunk in chunks:
-            await state.rtc_session.push_audio(
-                chunk,
-                timestamp_ms=state.next_timestamp_ms(),
-            )
+        # engine-barge-in-fade-out D3: unified outbound path — always feed the
+        # pump (started up front by configure_ambient; this guards any caller
+        # that reaches audio_out first). The pump mixes a background bed only
+        # when one is configured, otherwise pushes the TTS frames unchanged.
+        state.start_outbound_pump()
+        await state.feed_playout(chunks)
 
     def configure_ambient(
         self, call_id: int, asset: str | None, gain: float
     ) -> None:
-        """Enable continuous outbound background mixing for this call.
+        """Start the outbound pump and (optionally) enable background mixing.
 
-        Called by run_loop after the call connects, before the greeting. Empty
-        ``asset`` → no-op (background off, outbound stays direct-push). A
-        missing / unreadable asset logs and is also a no-op — the call proceeds
-        without background rather than failing. ``ambient-background-mix`` D6.
+        Called by run_loop after the call connects, before the greeting. The
+        outbound mixing pump is started unconditionally (engine-barge-in-fade-out
+        D3) so barge-in fade-out works whether or not a bed is configured. Empty
+        ``asset`` → pump on, no background. A missing / unreadable asset logs and
+        proceeds without background rather than failing. ``ambient-background-mix``
+        D6.
         """
-        if not asset:
-            return
         state = self._calls.get(call_id)
         if state is None:
+            return
+        state.start_outbound_pump()
+        if not asset:
             return
         loop = get_ambient_loop(asset)
         if loop is None:
@@ -817,6 +852,13 @@ class RtcTelephonyClient(TelephonyClient):
             return
         state.enable_ambient(loop.reader(), gain)
         logger.info("ambient_enabled call=%s asset=%s gain=%.3f", call_id, asset, gain)
+
+    def set_barge_in_fadeout(self, call_id: int, fadeout_ms: int) -> None:
+        """Set the per-call barge-in fade-out window. engine-barge-in-fade-out."""
+        state = self._calls.get(call_id)
+        if state is None:
+            return
+        state._barge_in_fadeout_ms = fadeout_ms
 
     def events(self, call_id: int) -> AsyncIterator[TelephonyEvent]:
         state = self._require_state(call_id)

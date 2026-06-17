@@ -80,6 +80,33 @@ def mix_frame(tts: bytes, bg: bytes, gain: float) -> bytes:
     return st.tobytes()
 
 
+def apply_fadeout(frames: list[bytes]) -> list[bytes]:
+    """Ramp ``frames`` down to silence with a per-sample linear gain fade.
+
+    engine-barge-in-fade-out: on barge-in the playout queue is no longer hard-
+    cut to zero (an amplitude step at a frame boundary = audible click + a
+    faster-than-human stop). Instead the first frames still buffered are ramped
+    from gain 1.0 (first sample) to 0.0 (last sample) across the whole supplied
+    span, then re-queued, so the AI voice trails off smoothly. The fade is
+    per-sample (not per-frame) so there is no inter-frame zipper, and it lands
+    on exact silence so nothing clicks after it. Pure ``array('h')`` like
+    :func:`mix_frame` (no audioop). Input is not mutated; new buffers returned.
+    """
+    total = sum(len(f) // SAMPLE_BYTES for f in frames)
+    if total <= 1:
+        return list(frames)
+    out: list[bytes] = []
+    idx = 0
+    for f in frames:
+        sa = array("h")
+        sa.frombytes(f)
+        for j in range(len(sa)):
+            sa[j] = _clip16(sa[j] * (1.0 - idx / (total - 1)))
+            idx += 1
+        out.append(sa.tobytes())
+    return out
+
+
 def _linear_crossfade(a: bytes, b: bytes) -> bytes:
     """Per-sample linear crossfade a→b (a fades out, b fades in)."""
     sa = array("h")
