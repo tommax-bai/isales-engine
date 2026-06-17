@@ -234,8 +234,12 @@ async def test_speaking_interruption_increments_counter_and_loops_to_processing(
     tel = MockTelephonyClient(connect_delay_ms=0)
 
     async def driver() -> None:
-        # Turn 1: user says hi → engine processes + speaks long reply.
-        await asyncio.sleep(0.05)
+        # Turn 1 is the first POST-greeting turn. The slow TTS here (chunk_delay
+        # 0.02s) makes the shared greeting playout ~0.2s; engine-greeting-window-
+        # prewarm now drains any ASR result produced DURING the greeting (the
+        # greeting is non-interruptible), so feed turn 1 only after the greeting
+        # has finished — otherwise "你好" is drained and no PROCESSING turn runs.
+        await asyncio.sleep(0.35)
         await asr.feed_turn("你好")
         # While engine speaks reply, user starts speaking again — partial
         # monitor should fire interruption.

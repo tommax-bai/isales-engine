@@ -37,7 +37,7 @@ from isales_common.enums import (
     HangupCause,
     TransferStatus,
 )
-from isales_common.providers._models import ASRResult
+from isales_common.providers._models import ASRResult, Message
 from isales_common.providers.asr import ASRProvider
 from isales_common.providers.llm import LLMProvider
 from isales_common.providers.tts import TTSProvider
@@ -193,20 +193,38 @@ async def run_session(
             session.call_record_id, config.ambient_audio, config.ambient_gain
         )
 
-        # NOTE on greeting interruptibility: listen pumps start AFTER the
-        # greeting, so the greeting cannot be barged in on. (An earlier
-        # 2026-05-28 rationale attributing mid-greeting false-triggers to a
-        # DingRTC POSITION_PLAYBACK self-loopback / mixed-playback echo was
-        # retracted 2026-06-04 — call 138 evidence does not support it. If
-        # mid-greeting barge-in is revisited, diagnose against the real ASR
-        # connection lifecycle first; do not reintroduce the loopback/AEC
-        # theory without fresh evidence.)
+        # NOTE on greeting interruptibility: the barge-in MONITORS start AFTER
+        # the greeting (see _start_monitors below), so the greeting cannot be
+        # barged in on. (An earlier 2026-05-28 rationale attributing
+        # mid-greeting false-triggers to a DingRTC POSITION_PLAYBACK
+        # self-loopback / mixed-playback echo was retracted 2026-06-04 — call
+        # 138 evidence does not support it. If mid-greeting barge-in is
+        # revisited, diagnose against the real ASR connection lifecycle first;
+        # do not reintroduce the loopback/AEC theory without fresh evidence.)
+
+        # engine-greeting-window-prewarm: warm the turn-1 downstream connections
+        # DURING the greeting's playout window (a few seconds of otherwise-idle
+        # wall-clock), so the first AI reply does not serially pay the one-time
+        # ASR WebSocket connect + main-LLM TLS handshake.
+        #   (a) ASR pumps (no monitors): advancing the ASR generator opens the
+        #       vendor WebSocket + sends the config frame now; real inbound audio
+        #       keeps it alive. Greeting-era results are drained after the
+        #       greeting so they are never consumed as the first user turn.
+        #   (b) main-LLM connection pre-warm: only the FIXED-template greeting
+        #       skips the LLM; an LLM greeting already warms the same main-slot
+        #       client via generate_greeting's chat() (no redundant probe).
+        listen_ctx = await _start_listen_pumps(
+            session, config, telephony, providers, start_monitors=False
+        )
+        prewarm_task = _kick_main_llm_prewarm(session, config, providers)
 
         await _do_greeting(session, config, providers, telephony)
         sm.transition_to(CallStatus.IN_CALL, reason="greeting_done")
         _publish_status(publisher, session, "greeting_done")
 
-        listen_ctx = await _start_listen_pumps(session, config, telephony, providers)
+        await _reap_main_llm_prewarm(prewarm_task)
+        _drain_greeting_era_asr(session, listen_ctx)
+        _start_monitors(session, config, telephony, listen_ctx)
 
         await _main_turn_loop(
             session,
@@ -343,14 +361,85 @@ async def _do_greeting(
     await _play_tts(session, telephony, providers.tts, text, voice_id=config.voice_id)
 
 
+def _kick_main_llm_prewarm(
+    session: CallSession,
+    config: RuntimeConfig,
+    providers: Providers,
+) -> asyncio.Task[None] | None:
+    """Warm the main-slot LLM keep-alive pool during the greeting window.
+
+    Returns a fire-and-forget task (or ``None`` when no probe is needed). The
+    main-slot ``OpenAICompatibleLLMProvider`` shares one persistent
+    ``httpx.AsyncClient`` between ``chat`` and ``chat_stream``; a minimal
+    ``chat`` here opens the TCP+TLS connection so turn-1's ``chat_stream`` reuses
+    a warm pool instead of paying ~100-200ms of handshake on the first token
+    (engine-greeting-window-prewarm).
+
+    Only the FIXED-template greeting needs this: an LLM greeting already issues a
+    ``chat`` on the SAME main-slot client via ``generate_greeting`` (no redundant
+    probe). The probe is pure optimization — it fail-softs on any error.
+    """
+    if not config.fixed_greeting:
+        # LLM greeting warms the main-slot client itself; nothing to do.
+        return None
+
+    llm = providers.llm_for(config.pipeline.main)
+
+    async def _probe() -> None:
+        try:
+            await llm.chat(
+                [Message(role="user", content="hi")],
+                temperature=config.pipeline.main.temperature,
+                top_p=config.pipeline.main.top_p,
+                max_tokens=1,
+            )
+        except Exception:  # noqa: BLE001 — pre-warm is best-effort; turn-1 retries
+            logger.debug(
+                "main_llm_prewarm_failed call_record_id=%s (falling back to "
+                "lazy connect on turn-1)",
+                session.call_record_id,
+            )
+
+    task = asyncio.create_task(_probe(), name="main_llm_prewarm")
+    session.tasks["main_llm_prewarm"] = task
+    return task
+
+
+async def _reap_main_llm_prewarm(task: asyncio.Task[None] | None) -> None:
+    """Await the pre-warm probe after the greeting (≈instant: greeting playout
+
+    is longer than the probe). Caps the worst case where a tiny greeting would
+    otherwise let the probe outlive it; the probe self-suppresses errors, so this
+    only reaps the task. Removal trigger for the whole pre-warm path: drop it if
+    a persistent cross-call connection pool ever makes turn-1 connections warm
+    by construction (engine-greeting-window-prewarm).
+    """
+    if task is None:
+        return
+    with contextlib.suppress(Exception):
+        await task
+
+
 @dataclass
 class _ListenContext:
     """Shared ASR / event / partial-monitor / VAD state owned by ``run_session``.
 
-    Created by :func:`_start_listen_pumps` BEFORE the greeting so user voice
-    during the greeting reaches ``_partial_monitor`` and ``_vad_monitor``
-    (both can cancel the in-flight greeting ``_play_tts``). Disposed of by
-    :func:`_stop_listen_pumps` in ``run_session``'s ``finally``.
+    Lifecycle is SPLIT across the greeting (engine-greeting-window-prewarm):
+
+    * The ASR + event pumps (``pump_asr`` / ``pump_ev``) start BEFORE the
+      greeting via ``_start_listen_pumps(..., start_monitors=False)`` so the ASR
+      vendor WebSocket connect + config-frame handshake overlaps the greeting
+      playout window instead of being serialized onto the first user turn. The
+      connection stays warm + alive (real inbound audio flows) for turn-1.
+    * The two barge-in monitors (``pump_partial_monitor`` / ``pump_vad_monitor``)
+      start AFTER the greeting via :func:`_start_monitors`, so the greeting stays
+      non-interruptible (a monitor could otherwise cancel the in-flight greeting
+      ``_play_tts``) — hence the monitor fields are ``None`` until then. Any
+      greeting-era ASR results are drained (:func:`_drain_greeting_era_asr`)
+      before the monitors + main loop start, so greeting-era audio is never
+      consumed as the first user turn.
+
+    Disposed of by :func:`_stop_listen_pumps` in ``run_session``'s ``finally``.
 
     change-1 Phase 1 (engine-eventbus-foundation): the ASR / event pumps now
     PRODUCE typed signals onto ``bus`` and a thin bridge subscriber feeds the
@@ -366,8 +455,9 @@ class _ListenContext:
     bus: EventBus
     pump_asr: asyncio.Task[None]
     pump_ev: asyncio.Task[None]
-    pump_partial_monitor: asyncio.Task[None]
-    pump_vad_monitor: asyncio.Task[None]
+    # None until _start_monitors() runs (after the greeting; see class docstring).
+    pump_partial_monitor: asyncio.Task[None] | None = None
+    pump_vad_monitor: asyncio.Task[None] | None = None
 
 
 async def _start_listen_pumps(
@@ -375,7 +465,19 @@ async def _start_listen_pumps(
     config: RuntimeConfig,
     telephony: TelephonyClient,
     providers: Providers,
+    *,
+    start_monitors: bool = True,
 ) -> _ListenContext:
+    """Start the ASR + event pumps; optionally also the barge-in monitors.
+
+    ``start_monitors=False`` (engine-greeting-window-prewarm) starts ONLY the ASR
+    + event pumps — the ASR pump advancing its generator triggers the vendor
+    WebSocket connect + config-frame handshake, so calling this BEFORE the
+    greeting warms that connection during the greeting playout window. The
+    barge-in monitors are then started separately by :func:`_start_monitors`
+    AFTER the greeting (greeting non-interruptible). ``start_monitors=True`` keeps
+    the original all-at-once behavior for any caller that does not pre-warm.
+    """
     asr_iter = providers.asr.stream_recognize(
         telephony.audio_in(session.call_record_id)
     )
@@ -457,10 +559,41 @@ async def _start_listen_pumps(
 
     pump_asr = asyncio.create_task(_asr_pump(), name="asr_pump")
     pump_ev = asyncio.create_task(_ev_pump(), name="ev_pump")
+    session.tasks["asr_pump"] = pump_asr
+    session.tasks["ev_pump"] = pump_ev
+
+    ctx = _ListenContext(
+        asr_finals_q=asr_finals_q,
+        asr_partials_q=asr_partials_q,
+        hangup_event=hangup_event,
+        asr_finished=asr_finished,
+        bus=bus,
+        pump_asr=pump_asr,
+        pump_ev=pump_ev,
+    )
+    if start_monitors:
+        _start_monitors(session, config, telephony, ctx)
+    return ctx
+
+
+def _start_monitors(
+    session: CallSession,
+    config: RuntimeConfig,
+    telephony: TelephonyClient,
+    ctx: _ListenContext,
+) -> None:
+    """Start the two barge-in monitors and attach them to ``ctx``.
+
+    Split out of :func:`_start_listen_pumps` (engine-greeting-window-prewarm) so
+    the monitors can start AFTER the greeting while the ASR connection is warmed
+    DURING it. Idempotent guard: a second call is a no-op (monitors already up).
+    """
+    if ctx.pump_partial_monitor is not None:
+        return
     pump_partial_monitor = asyncio.create_task(
         _partial_monitor(
             session,
-            asr_partials_q=asr_partials_q,
+            asr_partials_q=ctx.asr_partials_q,
             interruption_cfg=config.interruption,
         ),
         name="partial_monitor",
@@ -472,38 +605,57 @@ async def _start_listen_pumps(
         ),
         name="vad_monitor",
     )
-    session.tasks["asr_pump"] = pump_asr
-    session.tasks["ev_pump"] = pump_ev
     session.tasks["partial_monitor"] = pump_partial_monitor
     session.tasks["vad_monitor"] = pump_vad_monitor
+    ctx.pump_partial_monitor = pump_partial_monitor
+    ctx.pump_vad_monitor = pump_vad_monitor
 
-    return _ListenContext(
-        asr_finals_q=asr_finals_q,
-        asr_partials_q=asr_partials_q,
-        hangup_event=hangup_event,
-        asr_finished=asr_finished,
-        bus=bus,
-        pump_asr=pump_asr,
-        pump_ev=pump_ev,
-        pump_partial_monitor=pump_partial_monitor,
-        pump_vad_monitor=pump_vad_monitor,
-    )
+
+def _drain_greeting_era_asr(session: CallSession, ctx: _ListenContext) -> None:
+    """Discard ASR results produced while the greeting played.
+
+    The ASR connection is warmed DURING the greeting (engine-greeting-window-
+    prewarm), so the vendor may emit partials / finals for greeting-era audio
+    (acoustic echo, or a customer talking over the non-interruptible greeting).
+    Draining both queues here — after the greeting, before the monitors + main
+    loop start — guarantees that greeting-era audio is never consumed as the
+    first user turn nor triggers a (not-yet-running) barge-in.
+    """
+    drained = 0
+    for q in (ctx.asr_finals_q, ctx.asr_partials_q):
+        while not q.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                q.get_nowait()
+                drained += 1
+    # Reset the partial-monitor's speech-start anchor so a greeting-era partial
+    # cannot bias the first real utterance's barge-in timing.
+    session.current_user_speech_started_ms = None
+    if drained:
+        logger.info(
+            "greeting_era_asr_drained call_record_id=%s drained=%s",
+            session.call_record_id,
+            drained,
+        )
 
 
 async def _stop_listen_pumps(
     session: CallSession, ctx: _ListenContext
 ) -> None:
-    for t in (
-        ctx.pump_asr, ctx.pump_ev, ctx.pump_partial_monitor, ctx.pump_vad_monitor
-    ):
+    # Monitors are None if the call ended during the greeting window, before
+    # _start_monitors ran (engine-greeting-window-prewarm).
+    tasks = [
+        t
+        for t in (
+            ctx.pump_asr,
+            ctx.pump_ev,
+            ctx.pump_partial_monitor,
+            ctx.pump_vad_monitor,
+        )
+        if t is not None
+    ]
+    for t in tasks:
         t.cancel()
-    await asyncio.gather(
-        ctx.pump_asr,
-        ctx.pump_ev,
-        ctx.pump_partial_monitor,
-        ctx.pump_vad_monitor,
-        return_exceptions=True,
-    )
+    await asyncio.gather(*tasks, return_exceptions=True)
     # The bus is NOT closed here — it outlives the listen pumps (run_session
     # owns it and aclose()s it in its finally). The producers are now cancelled,
     # so the _asr_pump finally's AsrStreamEnded post lands on the still-open bus
