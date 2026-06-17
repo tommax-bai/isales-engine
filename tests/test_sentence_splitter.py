@@ -8,6 +8,7 @@ import pytest
 
 from isales_engine.streaming.sentence_splitter import (
     MAX_SENTENCE_CHARS,
+    SOFT_SENTENCE_CHARS,
     split_sentences,
 )
 
@@ -41,12 +42,41 @@ async def test_double_newline_splits():
 
 
 @pytest.mark.asyncio
-async def test_char_cap_forces_split():
-    long = "啊" * (MAX_SENTENCE_CHARS + 10)  # no terminator at all
-    out = await _collect(split_sentences(_stream(long)))
-    # First chunk is exactly the cap; remainder flushed at stream end.
-    assert out[0] == "啊" * MAX_SENTENCE_CHARS
-    assert "".join(out) == long
+async def test_no_punctuation_run_under_ceiling_stays_whole():
+    # engine-sentence-splitter-soft-boundary: a punctuation-less run that
+    # exceeds the soft threshold but stays under the hard ceiling is NOT cut
+    # mid-word anymore (the old behavior hard-cut at 50). It flushes whole.
+    run = "啊" * (SOFT_SENTENCE_CHARS + 10)  # past soft, no boundary char, < ceiling
+    out = await _collect(split_sentences(_stream(run)))
+    assert out == [run]
+
+
+@pytest.mark.asyncio
+async def test_hard_ceiling_forces_split_for_punctuationless_runon():
+    # Only a punctuation-less run reaching the hard ceiling falls back to a
+    # length cut (bounds first-audio latency for malformed output).
+    run = "啊" * (MAX_SENTENCE_CHARS + 10)  # no terminator / soft boundary at all
+    out = await _collect(split_sentences(_stream(run)))
+    assert out[0] == "啊" * MAX_SENTENCE_CHARS  # cut at the ceiling
+    assert "".join(out) == run  # remainder flushed at stream end
+
+
+@pytest.mark.asyncio
+async def test_long_sentence_splits_at_soft_boundary_not_mid_word():
+    # Past the soft threshold, the cut lands on the next pause punctuation
+    # (a natural clause break), keeping that punctuation in the emitted unit —
+    # never a mid-word hard cut.
+    long_clause = "啊" * SOFT_SENTENCE_CHARS  # reaches the soft threshold
+    out = await _collect(split_sentences(_stream(long_clause + "，", "好的。")))
+    assert out == [long_clause + "，", "好的。"]
+
+
+@pytest.mark.asyncio
+async def test_comma_below_soft_threshold_does_not_split():
+    # A short sentence with internal commas is untouched by length — it only
+    # splits on the real terminator (behavior unchanged from before).
+    out = await _collect(split_sentences(_stream("您好张总，我是小何，方便聊两句吗？")))
+    assert out == ["您好张总，我是小何，方便聊两句吗？"]
 
 
 @pytest.mark.asyncio
