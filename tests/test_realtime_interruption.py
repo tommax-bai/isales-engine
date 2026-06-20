@@ -379,3 +379,176 @@ async def test_partial_monitor_cancels_play_streaming_midflight() -> None:
     assert tts.active == 0  # no pre-synthesis left running after barge-in
 
 
+# ---- engine-interruption-cover-thinking-window ----------------------------
+# The barge-in monitor must ALSO fire during the THINKING window (a reply turn
+# is in progress / generating, but no TTS audio has played yet — so
+# current_speaking_task is still None). The judgment core (rule tree) is reused
+# verbatim; only the guard's coverage widens via session.in_processing_turn.
+
+
+async def test_partial_monitor_triggers_in_thinking_window() -> None:
+    """in_processing_turn=True + no playback task: a substantive second utterance
+    is run through the SAME rule tree and sets interruption_signaled (this is the
+    coverage that was previously a dead zone)."""
+    session = _make_session()
+    session.in_processing_turn = True  # THINKING: generating, not yet playing
+    session.current_speaking_task = None
+    interruption_cfg = InterruptionConfig(
+        whitelist=("嗯", "好的"),
+        rule=default_rule(whitelist=["嗯", "好的"], min_duration_ms=400),
+    )
+    asr_partials_q: asyncio.Queue[ASRResult] = asyncio.Queue()
+    monitor_task = asyncio.create_task(
+        _partial_monitor(
+            session, asr_partials_q=asr_partials_q, interruption_cfg=interruption_cfg
+        )
+    )
+
+    # Anchor the speech-start, then a long non-whitelist partial past the
+    # duration threshold (wall-clock, same as the SPEAKING trigger test).
+    await asr_partials_q.put(ASRResult(text="您看", is_final=False, timestamp_ms=100))
+    await asyncio.sleep(0.45)
+    await asr_partials_q.put(
+        ASRResult(text="您看这个我还想再问一句", is_final=False, timestamp_ms=600)
+    )
+
+    for _ in range(20):
+        if session.interruption_signaled:
+            break
+        await asyncio.sleep(0.01)
+
+    assert session.interruption_signaled is True
+    monitor_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await monitor_task
+
+
+async def test_partial_monitor_thinking_window_whitelist_ignored() -> None:
+    """Thinking-window backchannel ("嗯") is ignored by the SAME rule tree —
+    identical standard to SPEAKING; no new threshold."""
+    session = _make_session()
+    session.in_processing_turn = True
+    session.current_speaking_task = None
+    interruption_cfg = InterruptionConfig(
+        whitelist=("嗯", "好的"),
+        rule=default_rule(whitelist=["嗯", "好的"], min_duration_ms=400),
+    )
+    asr_partials_q: asyncio.Queue[ASRResult] = asyncio.Queue()
+    monitor_task = asyncio.create_task(
+        _partial_monitor(
+            session, asr_partials_q=asr_partials_q, interruption_cfg=interruption_cfg
+        )
+    )
+
+    await asr_partials_q.put(ASRResult(text="嗯", is_final=False, timestamp_ms=2000))
+    await asyncio.sleep(0.05)
+
+    assert session.interruption_signaled is False
+    monitor_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await monitor_task
+
+
+async def test_partial_monitor_ignored_in_listening_no_turn() -> None:
+    """LISTENING (no turn in progress AND no playback): partials stay status-only.
+    The widened guard MUST NOT treat the first utterance as a barge-in."""
+    session = _make_session()
+    session.in_processing_turn = False
+    session.current_speaking_task = None
+    interruption_cfg = InterruptionConfig(
+        whitelist=("嗯",),
+        rule=default_rule(whitelist=["嗯"], min_duration_ms=400),
+    )
+    asr_partials_q: asyncio.Queue[ASRResult] = asyncio.Queue()
+    monitor_task = asyncio.create_task(
+        _partial_monitor(
+            session, asr_partials_q=asr_partials_q, interruption_cfg=interruption_cfg
+        )
+    )
+
+    await asr_partials_q.put(ASRResult(text="您好", is_final=False, timestamp_ms=100))
+    await asyncio.sleep(0.45)
+    await asr_partials_q.put(
+        ASRResult(text="您好我想了解一下你们的产品", is_final=False, timestamp_ms=600)
+    )
+    await asyncio.sleep(0.05)
+
+    assert session.interruption_signaled is False
+    monitor_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await monitor_task
+
+
+async def test_thinking_window_second_utterance_aborts_turn() -> None:
+    """End-to-end: a substantive second utterance during the THINKING window (the
+    referee gate wait, before any audio) aborts the in-flight turn — an
+    interruption is recorded and the aborted turn leaves a pipeline_trace with no
+    audio released (first_audio_ms is None). The call then proceeds normally."""
+    from isales_engine.providers.llm_mock import KeywordDrivenMockLLM
+    from tests.test_run_loop import _make_config, _make_providers
+
+    class _SlowRefereeLLM(KeywordDrivenMockLLM):
+        async def chat(self, messages, *, json_mode=False, **kw):  # type: ignore[override]
+            # Stall the referee call (identified by its system prompt) so the gate
+            # wait — the THINKING window — is wide enough for the second utterance
+            # to land while no audio has played yet.
+            system = self._first_role(messages, "system")
+            if "判定对话状态" in system:
+                await asyncio.sleep(0.5)
+            return await super().chat(messages, json_mode=json_mode, **kw)
+
+    config = _make_config()
+    config.pipeline.referee_timeout_ms = 2000  # gate actually waits for the referee
+    # Tight duration so the second utterance clears the rule tree quickly while
+    # the gate is still stalling.
+    config.interruption = InterruptionConfig(
+        whitelist=("嗯",),
+        rule=default_rule(whitelist=["嗯"], min_duration_ms=20),
+    )
+
+    session = _make_session()
+    asr = ScriptedMockASR(partial_step_ms=5)
+    providers = Providers(
+        llm=_SlowRefereeLLM(), asr=asr, tts=_make_providers().tts
+    )
+    tel = MockTelephonyClient(connect_delay_ms=0)
+
+    async def driver() -> None:
+        await asyncio.sleep(0.35)  # past the (non-interruptible) greeting
+        await asr.feed_turn("第一个问题")  # turn A starts → gate stalls 0.5s
+        await asyncio.sleep(0.1)  # gate is stalling: THINKING window, no audio yet
+        # Second utterance B during the THINKING window. feed_turn() bursts all
+        # partials in one instant (partial_step_ms only stamps timestamp_ms, NOT
+        # wall-clock), so the rule tree's duration leaf would never accumulate;
+        # inject B's partials directly with REAL wall-clock gaps, the same way the
+        # SPEAKING barge-in tests above do, so the monitor actually triggers.
+        await asr._queue.put(ASRResult(text="第二个", is_final=False, timestamp_ms=0))
+        await asyncio.sleep(0.1)  # real elapsed clears min_duration_ms(20)
+        await asr._queue.put(
+            ASRResult(text="第二个问题我还想多问一句", is_final=False, timestamp_ms=0)
+        )
+        await asyncio.sleep(0.05)
+        await asr._queue.put(
+            ASRResult(text="第二个问题我还想多问一句", is_final=True, timestamp_ms=0)
+        )
+        await asyncio.sleep(1.2)  # let the abort + re-answer settle
+        await tel.simulate_remote_hangup(1)
+
+    task = asyncio.create_task(driver())
+    await run_session(
+        session, phone="+8613800000000", config=config, telephony=tel, providers=providers
+    )
+    await task
+
+    types = [e["type"] for e in session.full_transcript]
+    assert "interruption" in types  # barge-in fired during the THINKING window
+    # The aborted turn released no audio → its trace has first_audio_ms None.
+    assert any(t.get("first_audio_ms") is None for t in session.pipeline_trace_records)
+    # The first utterance is preserved as context (mirrored into dialog_history
+    # before the turn ran), so the re-answer covers it — A is not lost on abort.
+    user_turns = [t.text for t in session.dialog_history if t.role == "user"]
+    assert "第一个问题" in user_turns
+    # Thinking-window abort never captures an unspoken remainder → no restructure.
+    assert session.interrupt_remaining_text is None
+
+

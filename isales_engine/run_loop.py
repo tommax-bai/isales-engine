@@ -1462,34 +1462,73 @@ async def _run_gated_turn(
     # ---- eager candidates: main (carries the referees) + opt-in personas ----
     cap = max(1, min(3, config.pipeline.persona_fanout_cap))
     enabled_personas = config.pipeline.personas[: max(0, cap - 1)]
-    main_stream = run_pipeline_stream(
-        session, user_text, config.pipeline, providers.llm, providers.llm,
-        is_wrap_up=False, pipeline_timeout_ms=pipeline_timeout_ms,
-        llm_registry=providers.llm_registry,
-    )
-    main_stream.start_eager()
-    candidates: dict[str, PipelineStream] = {"main": main_stream}
+    candidates: dict[str, PipelineStream] = {}
     persona_specs: dict[str, Any] = {}
-    for persona in enabled_personas:
-        persona_cfg = replace(
-            config.pipeline, main=_persona_main_spec(persona), referees=[]
-        )
-        ps = PipelineStream(
-            session, user_text, persona_cfg, providers.llm, providers.llm,
+    # engine-interruption-cover-thinking-window: mark THINKING (generating but
+    # not yet playing) so the partial monitor's barge-in guard ALSO fires while
+    # we await the gate. Spawn + gate run inside try/finally so an exception
+    # can't leave the flag stuck on; it is cleared the instant the gate resolves
+    # — from here SPEAKING barge-in is covered by current_speaking_task as before
+    # (a second utterance landing in the brief [gate→first-audio] tail is caught
+    # by the existing playback barge-in once the reply starts).
+    session.in_processing_turn = True
+    try:
+        main_stream = run_pipeline_stream(
+            session, user_text, config.pipeline, providers.llm, providers.llm,
             is_wrap_up=False, pipeline_timeout_ms=pipeline_timeout_ms,
             llm_registry=providers.llm_registry,
         )
-        ps.turn_id = main_stream.turn_id  # one turn id; no extra referees/increment
-        ps.start_eager()
-        rid = f"persona:{persona.label}"
-        candidates[rid] = ps
-        persona_specs[rid] = persona
-    persona_candidates = list(candidates)
+        main_stream.start_eager()
+        candidates["main"] = main_stream
+        for persona in enabled_personas:
+            persona_cfg = replace(
+                config.pipeline, main=_persona_main_spec(persona), referees=[]
+            )
+            ps = PipelineStream(
+                session, user_text, persona_cfg, providers.llm, providers.llm,
+                is_wrap_up=False, pipeline_timeout_ms=pipeline_timeout_ms,
+                llm_registry=providers.llm_registry,
+            )
+            ps.turn_id = main_stream.turn_id  # one turn id; no extra referees/increment
+            ps.start_eager()
+            rid = f"persona:{persona.label}"
+            candidates[rid] = ps
+            persona_specs[rid] = persona
+        persona_candidates = list(candidates)
 
-    # ---- GATE: await the referees before releasing any audio ----
-    referee_results = await _await_referees(
-        main_stream, timeout_s=config.pipeline.referee_timeout_ms / 1000.0
-    )
+        # ---- GATE: await the referees before releasing any audio ----
+        referee_results = await _await_referees(
+            main_stream, timeout_s=config.pipeline.referee_timeout_ms / 1000.0
+        )
+    finally:
+        session.in_processing_turn = False
+
+    async def _cancel_candidates(except_id: str | None = None) -> None:
+        for rid, st in candidates.items():
+            if rid != except_id:
+                await st.cancel_eager()
+
+    # engine-interruption-cover-thinking-window: thinking-window barge-in. The
+    # partial monitor set interruption_signaled while we awaited the gate — a
+    # substantive second utterance during the silent generating window. Abort
+    # THIS turn before any audio: cancel all eager candidates (release vendor
+    # connections, same teardown as a playback barge-in), drop the signal, count
+    # it toward continuous-interruption protection, and return so the main loop's
+    # existing coalesce folds the pending utterance(s) into one fresh main-pipeline
+    # turn. NOTE no interrupt_remaining_text is captured (nothing was spoken) → the
+    # decider restructure override stays provably skipped → 新回答, never restructure.
+    if session.interruption_signaled:
+        await _cancel_candidates()
+        session.interruption_signaled = False
+        session.consecutive_interruption_count += 1
+        session.pipeline_trace_records.append(
+            {
+                **_base_trace(main_stream, ts_start, user_text, None),
+                "referee_results": [r.as_trace() for r in referee_results],
+            }
+        )
+        return Directive.CONTINUE
+
     action: DeciderAction = decide(referee_results, config.pipeline.routing_rules)
     # engine-filler-gated-restructure: tighten auto_restructure so the cut-off line
     # is resumed ONLY when the main gate referee judged this barge-in to be a
@@ -1528,11 +1567,6 @@ async def _run_gated_turn(
         # via _assemble_interrupt_text's take-and-clear, never reaching here.
         session.interrupt_remaining_text = None
     sel = _select_gated_route(action, config)
-
-    async def _cancel_candidates(except_id: str | None = None) -> None:
-        for rid, st in candidates.items():
-            if rid != except_id:
-                await st.cancel_eager()
 
     # ---- parallel transfer-LLM detector (campaigns with transfer_intent /
     # transfer_llm): the referee→tool:transfer route is the preferred path; only
@@ -2062,12 +2096,27 @@ async def _partial_monitor(
     asr_partials_q: asyncio.Queue[ASRResult],
     interruption_cfg: InterruptionConfig,
 ) -> None:
-    """Long-running task: watch ASR partials during SPEAKING / FILLER.
+    """Long-running task: watch ASR partials during SPEAKING / FILLER /
+    PROCESSING-pre-audio (the THINKING/generating window).
 
     On a verdict of ``triggered`` the monitor cancels the in-flight
     ``current_speaking_task`` (if any) and sets
     ``session.interruption_signaled``. Once signaled it stays True until the
     main loop reads + clears it (per spec § "打断判定不可撤销").
+
+    engine-interruption-cover-thinking-window: the guard below is WIDENED from
+    "audio is playing" (``current_speaking_task is not None``) to "a reply turn
+    is in progress (THINKING or SPEAKING) OR audio is playing" so a customer's
+    second utterance arriving in the THINKING window — after ASR-final of the
+    first, before any TTS audio (``current_speaking_task`` still None) — is run
+    through the SAME ``evaluate_partial`` rule tree instead of being dropped. The
+    judgment core (thresholds / whitelist) is unchanged; only coverage grows. In
+    the THINKING window there is no playback task to cancel, so the cancel below
+    is a no-op there — the abort is driven by ``_run_gated_turn`` observing
+    ``interruption_signaled`` (monitor stays the sole writer of the signal; the
+    gated turn owns candidate teardown). LISTENING (no turn in progress, no
+    playback) still does not trigger — the first user utterance is handled by the
+    normal PROCESSING entry, not as a barge-in.
     """
 
     while True:
@@ -2076,8 +2125,11 @@ async def _partial_monitor(
         except asyncio.CancelledError:
             return
 
-        if session.current_speaking_task is None or session.interruption_signaled:
-            # Not in SPEAKING / FILLER — partials are just status updates.
+        if (
+            not session.in_processing_turn and session.current_speaking_task is None
+        ) or session.interruption_signaled:
+            # Not in a reply turn (THINKING/SPEAKING) and not playing audio —
+            # partials are just status updates (e.g. LISTENING for the next turn).
             continue
 
         # Track the speech-start anchor on the first non-empty partial of an

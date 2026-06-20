@@ -167,6 +167,15 @@ class CallSession:
     # Set by the partial monitor right before cancelling current_speaking_task;
     # the main loop reads + clears it to drive INTERRUPTED→PROCESSING.
     interruption_signaled: bool = False
+    # engine-interruption-cover-thinking-window: True for the whole duration of a
+    # reply turn — from _run_gated_turn entry (THINKING/generating) through audio
+    # playback — and False during LISTENING. The partial monitor's barge-in guard
+    # reads this so a customer's second utterance arriving in the THINKING window
+    # (before any TTS audio, current_speaking_task still None) is evaluated by the
+    # SAME rule tree instead of being dropped as a status-only partial. This only
+    # WIDENS coverage; it is not a new detection mechanism (same class of in-flight
+    # state as current_speaking_task / in_wrap_up).
+    in_processing_turn: bool = False
     # Per-utterance speech-start timestamp (relative ms). Set when partial
     # monitor sees first non-whitelist partial; cleared on speech_end /
     # interruption.
